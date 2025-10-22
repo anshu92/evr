@@ -2,9 +2,9 @@ name: Weekly EVR Scanner
 
 on:
   schedule:
-    # Run weekly on Mondays at 9:30 AM ET (2:30 PM UTC during EST, 1:30 PM UTC during EDT)
-    # Using 13:30 UTC to cover both EST and EDT
-    - cron: '30 13 * * 1'  # Monday at 1:30 PM UTC
+    # Run weekly on Mondays at 9:15 AM ET (2:15 PM UTC during EST, 1:15 PM UTC during EDT)
+    # Using 13:15 UTC to cover both EST and EDT (will be 8:15 AM EST or 9:15 AM EDT)
+    - cron: '15 13 * * 1'  # Monday at 1:15 PM UTC
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
@@ -32,7 +32,7 @@ jobs:
         uv pip install pandas numpy pyarrow yfinance requests rich matplotlib jinja2 seaborn lxml html5lib
         uv pip install -e .
         
-    - name: Run Comprehensive EVR Scanner
+    - name: Run EVR Scanner
       run: |
         source .venv/bin/activate
         python official_scanner.py \
@@ -40,116 +40,24 @@ jobs:
           --output-prefix "weekly_$(date +%Y%m%d)" \
           --log-level INFO
         
-    - name: Generate Weekly Analysis Report
+    - name: Generate Weekly Summary Report
       run: |
         source .venv/bin/activate
-        python -c "
-        import pandas as pd
-        import glob
-        from datetime import datetime, timedelta
-        import os
-        
-        # Find the latest CSV file
-        files = glob.glob('scans/weekly_*.csv')
-        if files:
-            latest_file = max(files, key=lambda x: x.split('_')[-1])
-            df = pd.read_csv(latest_file)
-            
-            # Generate comprehensive weekly report
-            summary = f'''EVR Weekly Aggregated Trading Recommendations Report
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Week Ending: {datetime.now().strftime('%Y-%m-%d')}
-
-WEEKLY SUMMARY STATISTICS:
-==========================
-Total Recommendations: {len(df)}
-Long Positions: {len(df[df['primary_direction'] == 'LONG'])} ({len(df[df['primary_direction'] == 'LONG'])/len(df)*100:.1f}%)
-Short Positions: {len(df[df['primary_direction'] == 'SHORT'])} ({len(df[df['primary_direction'] == 'SHORT'])/len(df)*100:.1f}%)
-Average P(Win): {df['weighted_p_win'].mean():.1%}
-Average Expected Return: {df['weighted_expected_return'].mean():.2%}
-Average EVR Score: {df['evr_composite_score'].mean():.3f}
-Total Individual Signals: {df['total_signals'].sum()}
-
-RECOMMENDATION BREAKDOWN:
-========================'''
-            
-            # Signal count breakdown
-            signal_count_dist = df['total_signals'].value_counts().sort_index()
-            for signal_count, ticker_count in signal_count_dist.items():
-                percentage = ticker_count / len(df) * 100
-                summary += f'\nTickers with {signal_count} signals: {ticker_count} ({percentage:.1f}%)'
-            
-            summary += f'''
-
-TOP 20 RECOMMENDATIONS BY EVR SCORE:
-===================================='''
-            
-            # Top 20 recommendations
-            top_recommendations = df.nlargest(20, 'evr_composite_score')
-            for i, (_, rec) in enumerate(top_recommendations.iterrows(), 1):
-                summary += f'\n{i:2d}. {rec[\"ticker\"]:6s} {rec[\"primary_direction\"]:5s} {rec[\"total_signals\"]:2d} signals {rec[\"evr_composite_score\"]:6.3f} score {rec[\"weighted_expected_return\"]:6.2%} return ({rec[\"weighted_p_win\"]:5.1%})'
-            
-            summary += f'''
-
-RISK ANALYSIS:
-==============
-Average Risk: {df['risk_percentage'].mean():.1f}%
-Average Reward: {df['reward_percentage'].mean():.1f}%
-Risk Distribution:
-  High Risk (>8%): {len(df[df['risk_percentage'] > 8])} ({len(df[df['risk_percentage'] > 8])/len(df)*100:.1f}%)
-  Medium Risk (5-8%): {len(df[(df['risk_percentage'] >= 5) & (df['risk_percentage'] <= 8)])} ({len(df[(df['risk_percentage'] >= 5) & (df['risk_percentage'] <= 8)])/len(df)*100:.1f}%)
-  Low Risk (<5%): {len(df[df['risk_percentage'] < 5])} ({len(df[df['risk_percentage'] < 5])/len(df)*100:.1f}%)
-
-Reward Distribution:
-  High Reward (>12%): {len(df[df['reward_percentage'] > 12])} ({len(df[df['reward_percentage'] > 12])/len(df)*100:.1f}%)
-  Medium Reward (8-12%): {len(df[(df['reward_percentage'] >= 8) & (df['reward_percentage'] <= 12)])} ({len(df[(df['reward_percentage'] >= 8) & (df['reward_percentage'] <= 12)])/len(df)*100:.1f}%)
-  Low Reward (<8%): {len(df[df['reward_percentage'] < 8])} ({len(df[df['reward_percentage'] < 8])/len(df)*100:.1f}%)
-
-CONFIDENCE ANALYSIS:
-===================
-Confidence Distribution:
-  High Confidence (>70%): {len(df[df['confidence'] > 0.7])} ({len(df[df['confidence'] > 0.7])/len(df)*100:.1f}%)
-  Medium Confidence (50-70%): {len(df[(df['confidence'] >= 0.5) & (df['confidence'] <= 0.7)])} ({len(df[(df['confidence'] >= 0.5) & (df['confidence'] <= 0.7)])/len(df)*100:.1f}%)
-  Low Confidence (<50%): {len(df[df['confidence'] < 0.5])} ({len(df[df['confidence'] < 0.5])/len(df)*100:.1f}%)
-
-EXPECTED RETURN ANALYSIS:
-========================
-Return Distribution:
-  High Return (>8%): {len(df[df['expected_return'] > 0.08])} ({len(df[df['expected_return'] > 0.08])/len(df)*100:.1f}%)
-  Medium Return (5-8%): {len(df[(df['expected_return'] >= 0.05) & (df['expected_return'] <= 0.08)])} ({len(df[(df['expected_return'] >= 0.05) & (df['expected_return'] <= 0.08)])/len(df)*100:.1f}%)
-  Low Return (<5%): {len(df[df['expected_return'] < 0.05])} ({len(df[df['expected_return'] < 0.05])/len(df)*100:.1f}%)
-
-MARKET SENTIMENT:
-================
-Market Bias: {'Bullish' if len(df[df['direction'] == 'LONG']) > len(df[df['direction'] == 'SHORT']) else 'Bearish'}
-Long/Short Ratio: {len(df[df['direction'] == 'LONG'])}/{len(df[df['direction'] == 'SHORT'])} ({len(df[df['direction'] == 'LONG'])/len(df[df['direction'] == 'SHORT']):.2f}:1)
-
-Signal Quality Metrics:
-  Signals with R/R > 2.0: {len(df[df['risk_reward_ratio'] > 2.0])} ({len(df[df['risk_reward_ratio'] > 2.0])/len(df)*100:.1f}%)
-  Signals with R/R > 3.0: {len(df[df['risk_reward_ratio'] > 3.0])} ({len(df[df['risk_reward_ratio'] > 3.0])/len(df)*100:.1f}%)
-  High Confidence + High Return: {len(df[(df['confidence'] > 0.7) & (df['expected_return'] > 0.08)])} ({len(df[(df['confidence'] > 0.7) & (df['expected_return'] > 0.08)])/len(df)*100:.1f}%)
-
-FILES GENERATED:
-===============
-CSV: {latest_file}
-JSON: {latest_file.replace('.csv', '.json')}
-Summary: {latest_file.replace('.csv', '_summary.txt')}
-
----
-Generated by EVR Scanner GitHub Action
-Repository: https://github.com/anshuman264/evr
-'''
-            
-            # Write summary to file
-            with open('weekly_summary.txt', 'w') as f:
-                f.write(summary)
-                
-            print('Weekly summary report generated successfully')
-        else:
-            print('No scan results found')
-            with open('weekly_summary.txt', 'w') as f:
-                f.write('EVR Weekly Trading Signals Report\nGenerated: ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + '\n\nNo scan results found.\n\n---\nGenerated by EVR Scanner GitHub Action')
-        "
+        echo "EVR Weekly Aggregated Trading Recommendations Report" > weekly_summary.txt
+        echo "Generated: $(date)" >> weekly_summary.txt
+        echo "Week Ending: $(date +%Y-%m-%d)" >> weekly_summary.txt
+        echo "" >> weekly_summary.txt
+        echo "WEEKLY SUMMARY STATISTICS:" >> weekly_summary.txt
+        echo "==========================" >> weekly_summary.txt
+        echo "Weekly scan completed successfully." >> weekly_summary.txt
+        echo "" >> weekly_summary.txt
+        echo "Files generated:" >> weekly_summary.txt
+        echo "- CSV with all aggregated recommendations" >> weekly_summary.txt
+        echo "- JSON with detailed data" >> weekly_summary.txt
+        echo "- Summary text file" >> weekly_summary.txt
+        echo "" >> weekly_summary.txt
+        echo "---" >> weekly_summary.txt
+        echo "Generated by EVR Scanner GitHub Action (Weekly Schedule)" >> weekly_summary.txt
         
     - name: Upload weekly scan results
       uses: actions/upload-artifact@v4
@@ -160,7 +68,7 @@ Repository: https://github.com/anshuman264/evr
           scans/weekly_*.json
           scans/weekly_*.txt
           weekly_summary.txt
-        retention-days: 90
+        retention-days: 30
         
     - name: Send weekly email notification
       uses: dawidd6/action-send-mail@v3
@@ -175,19 +83,17 @@ Repository: https://github.com/anshuman264/evr
         body: |
           EVR Weekly Trading Signals Report
           
-          Weekly comprehensive scan completed successfully at ${{ github.run_number }}.
+          Weekly scan completed successfully at ${{ github.run_number }}.
           
-          This report includes:
-          - Comprehensive market analysis
-          - Top 20 signals by expected return
-          - Detailed risk and confidence analysis
-          - Market sentiment indicators
-          - Signal quality metrics
+          **Scan Details:**
+          - Week Ending: $(date +%Y-%m-%d)
+          - Top Recommendations: 50
+          - Log Level: INFO
           
           Please find the detailed report in the attached summary file.
           
           Files generated:
-          - CSV with all signals
+          - CSV with all aggregated recommendations
           - JSON with detailed data
           - Summary text file
           
@@ -195,7 +101,7 @@ Repository: https://github.com/anshuman264/evr
           Workflow: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           
           ---
-          Generated by EVR Scanner GitHub Action
+          Generated by EVR Scanner GitHub Action (Weekly Schedule)
         attachments: weekly_summary.txt
         content_type: text/html
         
