@@ -65,18 +65,18 @@ class RateLimiter:
             current_time = time.time()
             time_since_last = current_time - self.last_request_time
             
-            # Calculate delay based on consecutive failures
+            # Only apply delay if we have recent failures
+            # On success, allow parallel requests to proceed without delay
             if self.consecutive_failures > 0:
                 delay = min(self.base_delay * (self.backoff_factor ** self.consecutive_failures), self.max_delay)
                 # Add jitter to prevent thundering herd
                 jitter = random.uniform(0.1, 0.3) * delay
                 total_delay = delay + jitter
-            else:
-                total_delay = self.base_delay
-            
-            if time_since_last < total_delay:
-                sleep_time = total_delay - time_since_last
-                time.sleep(sleep_time)
+                
+                if time_since_last < total_delay:
+                    sleep_time = total_delay - time_since_last
+                    time.sleep(sleep_time)
+            # else: no delay on success - let threads proceed in parallel
             
             self.last_request_time = time.time()
     
@@ -125,8 +125,8 @@ class ParallelDataFetcher:
                 self.rate_limiter.record_failure()
                 
                 if "Too Many Requests" in str(e) or "Rate limited" in str(e):
-                    # Exponential backoff with jitter
-                    wait_time = min(2 ** attempt * 2, 30) + random.uniform(1, 3)
+                    # Exponential backoff with jitter (capped at 8s to prevent long stalls)
+                    wait_time = min(2 ** attempt * 2, 8) + random.uniform(0.5, 1.5)
                     time.sleep(wait_time)
                     continue
                 else:
@@ -184,6 +184,8 @@ class TradePlan:
     expectancy_r: float = 0.0
     min_win_rate: float = 0.0
     required_win_rate: float = 0.0
+    # Action: BUY/SHORT/NULL based on expectancy and win rate
+    action: str = "NULL"
 
 
 @dataclass
@@ -814,8 +816,8 @@ class OfficialTickerScanner:
         self.cache_dir.mkdir(exist_ok=True)
         
         # Initialize rate limiter and parallel data fetcher
-        self.rate_limiter = RateLimiter(base_delay=0.5, max_delay=30.0, backoff_factor=1.5)
-        self.data_fetcher = ParallelDataFetcher(max_workers=3, rate_limiter=self.rate_limiter)
+        self.rate_limiter = RateLimiter(base_delay=0.5, max_delay=10.0, backoff_factor=1.5)
+        self.data_fetcher = ParallelDataFetcher(max_workers=8, rate_limiter=self.rate_limiter)
         
         # Initialize EVR framework components
         self.prob_model = RollingBayes(
@@ -935,20 +937,123 @@ class OfficialTickerScanner:
         
         return ticker_list
     
-    def get_stock_data(self, ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
-        """Get stock data using parallel fetcher with advanced rate limiting.
+    def _get_cache_path(self, ticker: str, period: str) -> Path:
+        """Get cache file path for a ticker.
+        
+        Args:
+            ticker: Stock symbol
+            period: Data period
+            
+        Returns:
+            Path to cache file
+        """
+        cache_filename = f"{ticker}_{period}.parquet"
+        return self.cache_dir / cache_filename
+    
+    def _load_from_cache(self, ticker: str, period: str) -> Optional[pd.DataFrame]:
+        """Load ticker data from cache if available and fresh.
+        
+        Args:
+            ticker: Stock symbol
+            period: Data period
+            
+        Returns:
+            DataFrame if cache exists and is fresh, None otherwise
+        """
+        cache_file = self._get_cache_path(ticker, period)
+        
+        if not cache_file.exists():
+            return None
+        
+        try:
+            # Check if cache is fresh (less than 24 hours old for 1y data, 6 hours for shorter periods)
+            cache_age_hours = 24 if period == "1y" else 6
+            cache_age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+            
+            if cache_age < timedelta(hours=cache_age_hours):
+                data = pd.read_parquet(cache_file)
+                self.logger.debug(f"Loaded {ticker} from cache")
+                return data
+            else:
+                self.logger.debug(f"Cache expired for {ticker} (age: {cache_age})")
+                return None
+        except Exception as e:
+            self.logger.debug(f"Failed to load cache for {ticker}: {e}")
+            return None
+    
+    def _save_to_cache(self, ticker: str, period: str, data: pd.DataFrame) -> None:
+        """Save ticker data to cache.
+        
+        Args:
+            ticker: Stock symbol
+            period: Data period
+            data: DataFrame to cache
+        """
+        if data is None or data.empty:
+            return
+        
+        try:
+            cache_file = self._get_cache_path(ticker, period)
+            data.to_parquet(cache_file, compression='snappy')
+            self.logger.debug(f"Cached {ticker} data to {cache_file}")
+        except Exception as e:
+            self.logger.debug(f"Failed to cache {ticker}: {e}")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics.
+        
+        Returns:
+            Dictionary with cache statistics
+        """
+        try:
+            cache_files = list(self.cache_dir.glob("*.parquet"))
+            total_files = len(cache_files)
+            
+            if total_files == 0:
+                return {"total_files": 0, "total_size_mb": 0, "oldest_file": None, "newest_file": None}
+            
+            total_size = sum(f.stat().st_size for f in cache_files)
+            total_size_mb = total_size / (1024 * 1024)
+            
+            # Get file ages
+            file_ages = [(f, datetime.now() - datetime.fromtimestamp(f.stat().st_mtime)) for f in cache_files]
+            oldest_file = min(file_ages, key=lambda x: x[1])[0].name
+            newest_file = max(file_ages, key=lambda x: x[1])[0].name
+            
+            return {
+                "total_files": total_files,
+                "total_size_mb": round(total_size_mb, 2),
+                "oldest_file": oldest_file,
+                "newest_file": newest_file
+            }
+        except Exception as e:
+            self.logger.debug(f"Failed to get cache stats: {e}")
+            return {"error": str(e)}
+    
+    def get_stock_data(self, ticker: str, period: str = "1y", use_cache: bool = True) -> Optional[pd.DataFrame]:
+        """Get stock data using caching and parallel fetcher with advanced rate limiting.
         
         Args:
             ticker: Stock symbol
             period: Data period (1y, 6mo, 3mo, etc.)
+            use_cache: Whether to use cached data if available
             
         Returns:
             DataFrame with stock data or None if failed
         """
-        # Use parallel data fetcher
+        # Try cache first
+        if use_cache:
+            cached_data = self._load_from_cache(ticker, period)
+            if cached_data is not None:
+                return cached_data
+        
+        # Fetch from API
         data = self.data_fetcher.fetch_ticker_data(ticker, period)
         
         if data is not None and not data.empty:
+            # Save to cache for future use
+            if use_cache:
+                self._save_to_cache(ticker, period, data)
             return data
         
         # No fallback - return None if data unavailable
@@ -996,9 +1101,14 @@ class OfficialTickerScanner:
             else:
                 indicators['rsi'] = float(100 - (100 / (1 + rs_value)))
             
-            # MACD
-            macd_line = indicators['ema_12'] - indicators['ema_26']
-            signal_line = float(pd.Series([macd_line]).ewm(span=9).mean().iloc[-1])
+            # MACD - calculate from full EMA series for proper signal line
+            ema_12_series = close.ewm(span=12).mean()
+            ema_26_series = close.ewm(span=26).mean()
+            macd_series = ema_12_series - ema_26_series
+            signal_series = macd_series.ewm(span=9).mean()
+            
+            macd_line = float(macd_series.iloc[-1])
+            signal_line = float(signal_series.iloc[-1])
             indicators['macd'] = macd_line
             indicators['macd_signal'] = signal_line
             indicators['macd_histogram'] = macd_line - signal_line
@@ -1380,6 +1490,79 @@ class OfficialTickerScanner:
         
         return signals
     
+    def _compute_r_unit_metrics(self, trade_plan: TradePlan) -> None:
+        """Compute R-unit metrics for a trade plan.
+        
+        Args:
+            trade_plan: TradePlan to compute metrics for
+        """
+        try:
+            entry_price = trade_plan.entry
+            stop_price = trade_plan.stop
+            target_price = trade_plan.take_profit
+            
+            # Calculate R-unit values
+            r_unit = abs(entry_price - stop_price)  # 1R = |Entry - Stop|
+            if r_unit == 0:
+                return
+            
+            # Determine direction: LONG if entry > stop, SHORT otherwise
+            is_long = entry_price > stop_price
+            
+            # Calculate reward in R units (m)
+            if is_long:
+                # For long positions: reward = Target - Entry
+                reward_r = abs(target_price - entry_price) / r_unit
+            else:
+                # For short positions: reward = Entry - Target
+                reward_r = abs(entry_price - target_price) / r_unit
+            
+            # Calculate costs in R units
+            # Total costs = commission + slippage (in dollars)
+            total_costs_dollars = trade_plan.cost_bps * entry_price / 10000 + trade_plan.slippage_bps * entry_price / 10000
+            costs_r = total_costs_dollars / r_unit
+            
+            # R-unit expectancy: E[R] = p·m - (1-p) - costs_R
+            expectancy_r = trade_plan.p_win * reward_r - (1 - trade_plan.p_win) - costs_r
+            
+            # Calculate minimum win rate threshold
+            min_win_rate = (1 + costs_r) / (reward_r + 1)
+            
+            # Safety margin: require 5-10 percentage points above minimum
+            safety_margin = 0.075  # 7.5% safety margin
+            required_win_rate = min_win_rate + safety_margin
+            
+            # Store R-unit metrics
+            trade_plan.r_unit = r_unit
+            trade_plan.reward_r = reward_r
+            trade_plan.costs_r = costs_r
+            trade_plan.expectancy_r = expectancy_r
+            trade_plan.min_win_rate = min_win_rate
+            trade_plan.required_win_rate = required_win_rate
+            
+        except Exception as e:
+            self.logger.debug(f"Error computing R-unit metrics: {e}")
+    
+    def _assign_action(self, trade_plan: TradePlan) -> None:
+        """Assign BUY/SHORT/NULL action based on expectancy and win rate.
+        
+        Args:
+            trade_plan: TradePlan to assign action for
+        """
+        try:
+            # Determine direction: LONG if entry > stop, SHORT otherwise
+            is_long = trade_plan.entry > trade_plan.stop
+            
+            # Action only if expectancy > 0 and p_win >= required_win_rate
+            if trade_plan.expectancy_r > 0 and trade_plan.p_win >= trade_plan.required_win_rate:
+                trade_plan.action = "BUY" if is_long else "SHORT"
+            else:
+                trade_plan.action = "NULL"
+                
+        except Exception as e:
+            self.logger.debug(f"Error assigning action: {e}")
+            trade_plan.action = "NULL"
+    
     def create_trade_plan(self, signal: Signal, data: pd.DataFrame) -> Optional[TradePlan]:
         """Create TradePlan from EVR Signal.
         
@@ -1477,6 +1660,10 @@ class OfficialTickerScanner:
                 slippage_bps=slippage_bps
             )
             
+            # Compute R-unit metrics and assign action
+            self._compute_r_unit_metrics(trade_plan)
+            self._assign_action(trade_plan)
+            
             return trade_plan
             
         except Exception as e:
@@ -1484,12 +1671,13 @@ class OfficialTickerScanner:
             return None
     
     
-    def scan_tickers(self, tickers: List[str], max_tickers: int = 100) -> List[TradePlan]:
+    def scan_tickers(self, tickers: List[str], max_tickers: int = 100, use_cache: bool = True) -> List[TradePlan]:
         """Scan tickers for trading signals.
         
         Args:
             tickers: List of ticker symbols
             max_tickers: Maximum number of tickers to scan (None for all tickers)
+            use_cache: Whether to use cached data if available
             
         Returns:
             List of TradePlan objects
@@ -1526,15 +1714,15 @@ class OfficialTickerScanner:
             
             for batch in batches:
                 # Process batch in parallel
-                batch_results = self._process_ticker_batch(batch)
+                batch_results = self._process_ticker_batch(batch, use_cache=use_cache)
                 all_trade_plans.extend(batch_results)
                 
                 # Update progress
                 progress.advance(task, len(batch))
                 
-                # Small delay between batches to be respectful
+                # Minimal delay between batches (reduced from 0.5s to 0.1s for speed)
                 if len(batches) > 1:
-                    time.sleep(0.5)
+                    time.sleep(0.1)
         
         # Rank by R-unit expectancy: E[R] = p·m - (1-p) - costs_R
         def r_unit_expectancy_score(trade_plan: TradePlan) -> float:
@@ -1602,11 +1790,12 @@ class OfficialTickerScanner:
         self.logger.info(f"Scan completed: {len(all_trade_plans)} trade plans from {tickers_to_scan} tickers")
         return all_trade_plans
     
-    def _process_ticker_batch(self, tickers: List[str]) -> List[TradePlan]:
+    def _process_ticker_batch(self, tickers: List[str], use_cache: bool = True) -> List[TradePlan]:
         """Process a batch of tickers in parallel.
         
         Args:
             tickers: List of ticker symbols to process
+            use_cache: Whether to use cached data if available
             
         Returns:
             List of TradePlan objects
@@ -1615,7 +1804,7 @@ class OfficialTickerScanner:
             """Process a single ticker and return trade plans."""
             try:
                 # Get stock data
-                data = self.get_stock_data(ticker)
+                data = self.get_stock_data(ticker, use_cache=use_cache)
                 if data is None or len(data) < 50:
                     return []
                 
@@ -1646,7 +1835,7 @@ class OfficialTickerScanner:
         # Process tickers in parallel
         all_trade_plans = []
         
-        with ThreadPoolExecutor(max_workers=min(5, len(tickers))) as executor:
+        with ThreadPoolExecutor(max_workers=min(12, len(tickers))) as executor:
             # Submit all tasks
             future_to_ticker = {
                 executor.submit(process_single_ticker, ticker): ticker 
@@ -1733,7 +1922,7 @@ class OfficialTickerScanner:
         # Process tickers in parallel
         all_recommendations = []
         
-        with ThreadPoolExecutor(max_workers=min(3, len(tickers))) as executor:
+        with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as executor:
             # Submit all tasks
             future_to_ticker = {
                 executor.submit(process_single_backtest_ticker, ticker): ticker 
@@ -1834,6 +2023,7 @@ class OfficialTickerScanner:
         table.add_column("Ticker", style="magenta", width=8)
         table.add_column("Setup", style="blue", width=15)
         table.add_column("Direction", style="green", width=8)
+        table.add_column("Action", style="yellow", width=8)
         table.add_column("Entry", style="yellow", width=10)
         table.add_column("Stop", style="red", width=10)
         table.add_column("Target", style="green", width=10)
@@ -1845,16 +2035,22 @@ class OfficialTickerScanner:
         table.add_column("Score", style="magenta", width=8)
         
         for i, plan in enumerate(trade_plans[:top_n], 1):
-            direction = "LONG" if plan.entry < plan.stop else "SHORT"
+            # LONG: stop < entry (stop below entry, buy to profit from upward move)
+            # SHORT: stop > entry (stop above entry, sell to profit from downward move)
+            direction = "LONG" if plan.entry > plan.stop else "SHORT"
             # Color code based on safety margin
             p_win_color = "green" if plan.p_win >= plan.required_win_rate else "red"
             expectancy_color = "green" if plan.expectancy_r > 0 else "red"
+            
+            # Color code action: green for BUY/SHORT, yellow for NULL
+            action_color = "green" if plan.action in ["BUY", "SHORT"] else "yellow"
             
             table.add_row(
                 str(i),
                 plan.ticker,
                 plan.setup,
                 direction,
+                f"[{action_color}]{plan.action}[/{action_color}]",
                 f"${plan.entry:.2f}",
                 f"${plan.stop:.2f}",
                 f"${plan.targets[0]:.2f}",
@@ -1870,8 +2066,10 @@ class OfficialTickerScanner:
         
         # Display summary statistics
         total_plans = len(trade_plans)
-        long_plans = len([p for p in trade_plans if p.entry < p.stop])
-        short_plans = len([p for p in trade_plans if p.entry > p.stop])
+        # LONG: stop < entry (stop below entry)
+        # SHORT: stop > entry (stop above entry)
+        long_plans = len([p for p in trade_plans if p.entry > p.stop])
+        short_plans = len([p for p in trade_plans if p.entry < p.stop])
         
         avg_p_win = sum(p.p_win for p in trade_plans) / total_plans
         avg_expected_return = sum(p.expected_return for p in trade_plans) / total_plans
@@ -1923,7 +2121,14 @@ EVR Trade Plan Summary:
                 'confidence': plan.confidence,
                 'take_profit': plan.take_profit,
                 'cost_bps': plan.cost_bps,
-                'slippage_bps': plan.slippage_bps
+                'slippage_bps': plan.slippage_bps,
+                'r_unit': plan.r_unit,
+                'reward_r': plan.reward_r,
+                'costs_r': plan.costs_r,
+                'expectancy_r': plan.expectancy_r,
+                'min_win_rate': plan.min_win_rate,
+                'required_win_rate': plan.required_win_rate,
+                'action': plan.action
             }
             trade_plan_dicts.append(plan_dict)
         
@@ -1948,8 +2153,13 @@ EVR Trade Plan Summary:
             
             # Calculate statistics
             total_plans = len(trade_plans)
-            long_plans = len([p for p in trade_plans if p.entry < p.stop])
-            short_plans = len([p for p in trade_plans if p.entry > p.stop])
+            # LONG: stop < entry (stop below entry)
+            # SHORT: stop > entry (stop above entry)
+            long_plans = len([p for p in trade_plans if p.entry > p.stop])
+            short_plans = len([p for p in trade_plans if p.entry < p.stop])
+            buy_actions = len([p for p in trade_plans if p.action == "BUY"])
+            short_actions = len([p for p in trade_plans if p.action == "SHORT"])
+            null_actions = len([p for p in trade_plans if p.action == "NULL"])
             avg_p_win = sum(p.p_win for p in trade_plans) / total_plans
             avg_expected_return = sum(p.expected_return for p in trade_plans) / total_plans
             avg_kelly = sum(p.kelly_fraction for p in trade_plans) / total_plans
@@ -1958,6 +2168,9 @@ EVR Trade Plan Summary:
             f.write(f"Summary Statistics:\n")
             f.write(f"  Long Positions: {long_plans} ({long_plans/total_plans:.1%})\n")
             f.write(f"  Short Positions: {short_plans} ({short_plans/total_plans:.1%})\n")
+            f.write(f"  BUY Actions: {buy_actions} ({buy_actions/total_plans:.1%})\n")
+            f.write(f"  SHORT Actions: {short_actions} ({short_actions/total_plans:.1%})\n")
+            f.write(f"  NULL Actions: {null_actions} ({null_actions/total_plans:.1%})\n")
             f.write(f"  Average P(Win): {avg_p_win:.1%}\n")
             f.write(f"  Average Expected Return: {avg_expected_return:.2%}\n")
             f.write(f"  Average Kelly Fraction: {avg_kelly:.1%}\n")
@@ -1966,8 +2179,10 @@ EVR Trade Plan Summary:
             
             f.write(f"Top 15 Trade Plans:\n")
             for i, plan in enumerate(trade_plans[:15], 1):
-                direction = "LONG" if plan.entry < plan.stop else "SHORT"
-                f.write(f"{i:2d}. {plan.ticker:6s} {plan.setup:15s} {direction:5s} "
+                # LONG: stop < entry (stop below entry, buy to profit from upward move)
+                # SHORT: stop > entry (stop above entry, sell to profit from downward move)
+                direction = "LONG" if plan.entry > plan.stop else "SHORT"
+                f.write(f"{i:2d}. {plan.ticker:6s} {plan.setup:15s} {direction:5s} {plan.action:5s} "
                        f"P(Win): {plan.p_win:5.1%} E[R]: {plan.expected_return:6.2%} "
                        f"Kelly: {plan.kelly_fraction:5.1%} Risk: ${plan.risk_dollars:8,.0f}\n")
         
@@ -2046,12 +2261,20 @@ EVR Trade Plan Summary:
                 signal_type = plan.setup
                 signal_type_counts[signal_type] = signal_type_counts.get(signal_type, 0) + 1
             
+            # Compute aggregated action based on best plan's expectancy and required win rate
+            # Action only if expectancy > 0 and p_win >= required_win_rate
+            if best_plan.expectancy_r > 0 and weighted_p_win >= best_plan.required_win_rate:
+                aggregated_action = "BUY" if primary_direction == "LONG" else "SHORT"
+            else:
+                aggregated_action = "NULL"
+            
             # Create aggregated recommendation
             aggregated_recommendation = {
                 'ticker': ticker,
                 'total_signals': total_plans,
                 'signal_types': signal_type_counts,
                 'primary_direction': primary_direction,
+                'action': aggregated_action,
                 'entry_price': best_plan.entry,
                 'stop_loss': best_plan.stop,
                 'take_profit': best_plan.take_profit,
@@ -2154,6 +2377,7 @@ EVR Trade Plan Summary:
         table.add_column("Ticker", style="magenta", width=8)
         table.add_column("Signals", style="blue", width=8)
         table.add_column("Direction", style="green", width=8)
+        table.add_column("Action", style="yellow", width=8)
         table.add_column("Entry", style="yellow", width=10)
         table.add_column("Stop", style="red", width=10)
         table.add_column("Target", style="green", width=10)
@@ -2164,11 +2388,16 @@ EVR Trade Plan Summary:
         table.add_column("Risk $", style="red", width=10)
         
         for i, rec in enumerate(aggregated_recommendations[:top_n], 1):
+            # Color code action: green for BUY/SHORT, yellow for NULL
+            action_color = "green" if rec.get('action', 'NULL') in ["BUY", "SHORT"] else "yellow"
+            action = rec.get('action', 'NULL')
+            
             table.add_row(
                 str(i),
                 rec['ticker'],
                 str(rec['total_signals']),
                 rec['primary_direction'],
+                f"[{action_color}]{action}[/{action_color}]",
                 f"${rec['entry_price']:.2f}",
                 f"${rec['stop_loss']:.2f}",
                 f"${rec['take_profit']:.2f}",
@@ -2185,6 +2414,9 @@ EVR Trade Plan Summary:
         total_recommendations = len(aggregated_recommendations)
         long_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'LONG'])
         short_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'SHORT'])
+        buy_actions = len([r for r in aggregated_recommendations if r.get('action') == 'BUY'])
+        short_actions = len([r for r in aggregated_recommendations if r.get('action') == 'SHORT'])
+        null_actions = len([r for r in aggregated_recommendations if r.get('action') == 'NULL'])
         
         avg_p_win = sum(r['weighted_p_win'] for r in aggregated_recommendations) / total_recommendations
         avg_expected_return = sum(r['weighted_expected_return'] for r in aggregated_recommendations) / total_recommendations
@@ -2197,6 +2429,9 @@ EVR Aggregated Summary:
   Total Recommendations: {total_recommendations}
   Long Positions: {long_recommendations} ({long_recommendations/total_recommendations:.1%})
   Short Positions: {short_recommendations} ({short_recommendations/total_recommendations:.1%})
+  BUY Actions: {buy_actions} ({buy_actions/total_recommendations:.1%})
+  SHORT Actions: {short_actions} ({short_actions/total_recommendations:.1%})
+  NULL Actions: {null_actions} ({null_actions/total_recommendations:.1%})
   Average P(Win): {avg_p_win:.1%}
   Average Expected Return: {avg_expected_return:.2%}
   Average Kelly Fraction: {avg_kelly:.1%}
@@ -2238,6 +2473,11 @@ EVR Aggregated Summary:
             
             # Calculate statistics
             total_recommendations = len(aggregated_recommendations)
+            
+            if total_recommendations == 0:
+                f.write("\nNo recommendations found.\n")
+                return
+            
             long_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'LONG'])
             short_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'SHORT'])
             avg_p_win = sum(r['weighted_p_win'] for r in aggregated_recommendations) / total_recommendations
@@ -2338,6 +2578,12 @@ EVR Aggregated Summary:
         for ticker in list(portfolio['positions'].keys()):
             self._close_position(portfolio, ticker, end_dt)
         
+        # Update final portfolio value after closing all positions
+        # At this point, all positions are closed, so total value = cash
+        portfolio['total_value'] = portfolio['cash']
+        portfolio['daily_values'].append(portfolio['cash'])
+        portfolio['dates'].append(end_dt.strftime('%Y-%m-%d'))
+        
         # Calculate final metrics
         metrics = self._calculate_backtest_metrics(portfolio, start_date, end_date)
         
@@ -2378,7 +2624,7 @@ EVR Aggregated Summary:
             for ticker in sample_tickers:
                 try:
                     # Get historical data up to the date
-                    data = self.get_stock_data(ticker, period="2y")
+                    data = self.get_stock_data(ticker, period="2y", use_cache=True)
                     if data is None or len(data) < 50:
                         self.logger.debug(f"No data for {ticker} (got {len(data) if data is not None else 0} rows)")
                         continue
@@ -2545,7 +2791,13 @@ EVR Aggregated Summary:
                 'direction': direction
             }
             
-            portfolio['cash'] -= actual_cost
+            # For LONG: pay cash for shares
+            # For SHORT: receive cash from short sale (plus margin requirement - simplified here)
+            if direction == 'LONG':
+                portfolio['cash'] -= actual_cost
+            else:  # SHORT
+                # SHORT: receive proceeds from sale, but need to hold margin (simplified as 50% collateral)
+                portfolio['cash'] += actual_cost - (actual_cost * 0.5)  # Net: 50% cash increase, 50% as margin
             
             self.logger.debug(f"Opened position: {ticker} {shares} shares @ ${entry_price:.2f}")
         
@@ -2605,8 +2857,15 @@ EVR Aggregated Summary:
             
             portfolio['trades'].append(trade)
             
-            # Update portfolio
-            portfolio['cash'] += trade_value - total_cost
+            # Update portfolio cash based on direction
+            if direction == 'LONG':
+                # LONG: receive cash from sale, minus costs
+                portfolio['cash'] += trade_value - total_cost
+            else:  # SHORT
+                # SHORT: pay cash to buy back shares (cover short), minus costs
+                # Add back the margin we held initially
+                portfolio['cash'] -= trade_value - total_cost + (trade_value * 0.5)  # Pay buyback + return margin
+            
             del portfolio['positions'][ticker]
             
             self.logger.debug(f"Closed position: {ticker} {shares} shares @ ${current_price:.2f}, P&L: ${pnl:.2f}, Net: ${pnl - total_cost:.2f}")
@@ -2701,7 +2960,13 @@ EVR Aggregated Summary:
                     # If no price data, use entry price as fallback
                     current_price = position['entry_price']
                 
-                position_value = shares * current_price
+                # For LONG: position value is shares * price
+                # For SHORT: position value is -(shares * price) since we owe shares
+                if direction == 'LONG':
+                    position_value = shares * current_price
+                else:  # SHORT
+                    position_value = -(shares * current_price)  # Negative value for shorts
+                
                 total_value += position_value
             
             portfolio['total_value'] = total_value
@@ -2813,7 +3078,7 @@ EVR Aggregated Summary:
         """
         try:
             # Get SPY data for the period
-            spy_data = self.get_stock_data("SPY", period="2y")
+            spy_data = self.get_stock_data("SPY", period="2y", use_cache=True)
             if spy_data is None:
                 return {}
             
@@ -3184,7 +3449,8 @@ def main():
     parser.add_argument('--max-tickers', type=int, default=None, help='Maximum number of tickers to scan (default: all tickers)')
     parser.add_argument('--top', type=int, default=20, help='Number of top trade plans to display')
     parser.add_argument('--output-prefix', type=str, default='evr_aggregated', help='Prefix for output files')
-    parser.add_argument('--no-cache', action='store_true', help='Force fresh ticker list fetch')
+    parser.add_argument('--no-cache', action='store_true', help='Disable caching for ticker data')
+    parser.add_argument('--clear-cache', action='store_true', help='Clear all cached ticker data before scanning')
     parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--use-ml', action='store_true', help='Use ML classifier for probability estimation')
     parser.add_argument('--initial-capital', type=float, default=100000, help='Initial capital for risk management')
@@ -3223,6 +3489,16 @@ This scanner implements the complete EVR framework with:
     console.print(panel)
     
     try:
+        # Clear cache if requested
+        if args.clear_cache:
+            cache_dir = Path("cache")
+            if cache_dir.exists():
+                console.print(f"[yellow]Clearing cache directory...[/yellow]")
+                import shutil
+                shutil.rmtree(cache_dir)
+                cache_dir.mkdir(exist_ok=True)
+                console.print(f"[green]Cache cleared successfully[/green]")
+        
         # Initialize scanner with EVR framework
         scanner = OfficialTickerScanner(
             log_level=args.log_level,
@@ -3325,10 +3601,16 @@ This scanner implements the complete EVR framework with:
                     console.print(f"[green]Outperformance: {outperformance:+.2%}[/green]")
             
         else:
+            # Show cache stats if not clearing cache
+            if not args.clear_cache:
+                cache_stats = scanner.get_cache_stats()
+                if cache_stats.get("total_files", 0) > 0:
+                    console.print(f"\n[blue]Cache: {cache_stats['total_files']} files, {cache_stats['total_size_mb']} MB[/blue]")
+            
             # Scan for trade plans
             console.print("\n[blue]Scanning for EVR trade plans...[/blue]")
             max_tickers = args.max_tickers if args.max_tickers is not None else len(tickers)
-            trade_plans = scanner.scan_tickers(tickers, max_tickers=max_tickers)
+            trade_plans = scanner.scan_tickers(tickers, max_tickers=max_tickers, use_cache=not args.no_cache)
             
             if not args.no_aggregate:
                 # Aggregate signals by ticker
@@ -3349,8 +3631,10 @@ This scanner implements the complete EVR framework with:
                 # Show top aggregated recommendation details
                 if aggregated_recommendations:
                     top_rec = aggregated_recommendations[0]
+                    action = top_rec.get('action', 'NULL')
+                    action_color = "green" if action in ["BUY", "SHORT"] else "yellow"
                     console.print(f"\n[cyan]Top Aggregated Recommendation: {top_rec['ticker']}[/cyan]")
-                    console.print(f"[cyan]Signals: {top_rec['total_signals']} | Direction: {top_rec['primary_direction']}[/cyan]")
+                    console.print(f"[cyan]Signals: {top_rec['total_signals']} | Direction: {top_rec['primary_direction']} | Action: [{action_color}]{action}[/{action_color}][/cyan]")
                     console.print(f"[cyan]P(Win): {top_rec['weighted_p_win']:.1%} | Expected Return: {top_rec['weighted_expected_return']:.2%} | Kelly: {top_rec['weighted_kelly_fraction']:.1%}[/cyan]")
                     console.print(f"[cyan]Entry: ${top_rec['entry_price']:.2f} | Stop: ${top_rec['stop_loss']:.2f} | Target: ${top_rec['take_profit']:.2f}[/cyan]")
                     console.print(f"[cyan]EVR Score: {top_rec['evr_composite_score']:.3f} | Risk: ${top_rec['total_risk_dollars']:,.0f}[/cyan]")
@@ -3372,9 +3656,12 @@ This scanner implements the complete EVR framework with:
                 # Show top recommendation details
                 if trade_plans:
                     top_plan = trade_plans[0]
-                    direction = "LONG" if top_plan.entry < top_plan.stop else "SHORT"
+                    # LONG: stop < entry (stop below entry, buy to profit from upward move)
+                    # SHORT: stop > entry (stop above entry, sell to profit from downward move)
+                    direction = "LONG" if top_plan.entry > top_plan.stop else "SHORT"
+                    action_color = "green" if top_plan.action in ["BUY", "SHORT"] else "yellow"
                     console.print(f"\n[cyan]Top Trade Plan: {top_plan.ticker}[/cyan]")
-                    console.print(f"[cyan]Setup: {top_plan.setup} | Direction: {direction}[/cyan]")
+                    console.print(f"[cyan]Setup: {top_plan.setup} | Direction: {direction} | Action: [{action_color}]{top_plan.action}[/{action_color}][/cyan]")
                     console.print(f"[cyan]P(Win): {top_plan.p_win:.1%} | Expected Return: {top_plan.expected_return:.2%} | Kelly: {top_plan.kelly_fraction:.1%}[/cyan]")
                     console.print(f"[cyan]Entry: ${top_plan.entry:.2f} | Stop: ${top_plan.stop:.2f} | Target: ${top_plan.targets[0]:.2f}[/cyan]")
                     console.print(f"[cyan]Position Size: ${top_plan.position_size:,.0f} | Risk: ${top_plan.risk_dollars:,.0f}[/cyan]")
