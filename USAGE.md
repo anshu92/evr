@@ -7,10 +7,11 @@ This guide provides practical examples and use cases for the EVR NYSE & NASDAQ T
 1. [Quick Start](#quick-start)
 2. [Basic Usage](#basic-usage)
 3. [Advanced Usage](#advanced-usage)
-4. [Output Formats](#output-formats)
-5. [Performance Tips](#performance-tips)
-6. [Common Use Cases](#common-use-cases)
-7. [Troubleshooting](#troubleshooting)
+4. [Backtesting](#backtesting)
+5. [Output Formats](#output-formats)
+6. [Performance Tips](#performance-tips)
+7. [Common Use Cases](#common-use-cases)
+8. [Troubleshooting](#troubleshooting)
 
 ## Quick Start
 
@@ -23,7 +24,7 @@ cd evr
 # Install dependencies
 uv venv
 source .venv/bin/activate
-uv pip install pandas numpy pyarrow yfinance requests rich matplotlib jinja2 seaborn lxml html5lib
+uv pip install pandas numpy pyarrow yfinance requests rich lxml html5lib
 uv pip install -e .
 ```
 
@@ -34,6 +35,9 @@ python official_scanner.py
 
 # Individual signals mode
 python official_scanner.py --no-aggregate
+
+# Quick backtest
+python official_scanner.py --backtest --start-date 2023-06-01 --end-date 2023-08-01 --max-tickers 10
 ```
 
 ## Basic Usage
@@ -95,6 +99,360 @@ for i in {1..5}; do
     python official_scanner.py --max-tickers 200 --output-prefix "batch_$i"
     sleep 60  # Wait 1 minute between batches
 done
+```
+
+## Backtesting
+
+The EVR scanner includes a comprehensive backtesting engine that validates strategy performance using real historical data, transaction costs, and statistical metrics.
+
+### Basic Backtesting
+
+#### Single Backtest
+```bash
+# Basic backtest with default parameters
+python official_scanner.py --backtest --start-date 2023-06-01 --end-date 2023-08-01
+
+# Custom capital and positions
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --backtest-capital 100000 \
+  --max-positions 5
+
+# Different rebalancing frequency
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --rebalance-frequency daily
+```
+
+#### Walk-Forward Analysis
+```bash
+# Walk-forward analysis with rolling windows
+python official_scanner.py --backtest --walk-forward \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --training-window 30 \
+  --testing-window 15 \
+  --backtest-capital 100000
+
+# Longer training window for more stable results
+python official_scanner.py --backtest --walk-forward \
+  --start-date 2023-01-01 \
+  --end-date 2023-12-31 \
+  --training-window 90 \
+  --testing-window 30
+```
+
+### Backtest Parameters
+
+#### Core Parameters
+- `--backtest`: Enable backtesting mode
+- `--start-date`: Start date for backtest (YYYY-MM-DD)
+- `--end-date`: End date for backtest (YYYY-MM-DD)
+- `--backtest-capital`: Initial capital (default: $100,000)
+- `--max-positions`: Maximum concurrent positions (default: 10)
+- `--rebalance-frequency`: Rebalancing frequency (daily/weekly/monthly)
+
+#### Walk-Forward Parameters
+- `--walk-forward`: Enable walk-forward analysis
+- `--training-window`: Training window in days (default: 90)
+- `--testing-window`: Testing window in days (default: 30)
+
+### Backtest Results
+
+#### Performance Metrics
+The backtest generates comprehensive performance metrics:
+
+**Core Metrics:**
+- **Total Return**: Overall portfolio return
+- **Annualized Return**: Yearly return rate
+- **Maximum Drawdown**: Largest peak-to-trough decline
+- **Sharpe Ratio**: Risk-adjusted return
+- **Win Rate**: Percentage of profitable trades
+- **Total Trades**: Number of trades executed
+
+**Transaction Costs:**
+- **Total Costs**: Commission + slippage costs
+- **Cost Ratio**: Costs as percentage of initial capital
+
+**Benchmark Comparison:**
+- **Benchmark Return**: S&P 500 (SPY) performance
+- **Outperformance**: Strategy vs benchmark excess return
+
+#### Statistical Validation Metrics
+- **Calmar Ratio**: Annualized return / maximum drawdown
+- **Information Ratio**: Excess return / tracking error
+- **Sortino Ratio**: Return / downside deviation
+- **Value at Risk (VaR)**: 95% and 99% VaR calculations
+- **Volatility**: Daily return volatility
+- **Downside Deviation**: Downside volatility
+
+### Backtest Examples
+
+#### 1. Strategy Validation
+```bash
+# Validate strategy over 6 months
+python official_scanner.py --backtest \
+  --start-date 2023-01-01 \
+  --end-date 2023-06-30 \
+  --backtest-capital 50000 \
+  --max-positions 3 \
+  --output-prefix "strategy_validation"
+
+# Review results
+python -c "
+import json
+with open('scans/strategy_validation_backtest_*.json') as f:
+    results = json.load(f)
+    metrics = results['metrics']
+    print(f'Total Return: {metrics[\"total_return\"]:.2%}')
+    print(f'Sharpe Ratio: {metrics[\"sharpe_ratio\"]:.3f}')
+    print(f'Max Drawdown: {metrics[\"max_drawdown\"]:.2%}')
+    print(f'Win Rate: {metrics[\"win_rate\"]:.2%}')
+"
+```
+
+#### 2. Parameter Optimization
+```bash
+# Test different position sizes
+for positions in 3 5 10 15; do
+    python official_scanner.py --backtest \
+      --start-date 2023-06-01 \
+      --end-date 2023-08-01 \
+      --max-positions $positions \
+      --output-prefix "positions_${positions}"
+done
+
+# Compare results
+python -c "
+import glob
+import json
+import pandas as pd
+
+results = []
+for file in glob.glob('scans/positions_*_backtest_*.json'):
+    with open(file) as f:
+        data = json.load(f)
+        metrics = data['metrics']
+        positions = file.split('positions_')[1].split('_')[0]
+        results.append({
+            'positions': int(positions),
+            'return': metrics['total_return'],
+            'sharpe': metrics['sharpe_ratio'],
+            'drawdown': metrics['max_drawdown']
+        })
+
+df = pd.DataFrame(results)
+print('Position Size Optimization:')
+print(df.sort_values('sharpe', ascending=False))
+"
+```
+
+#### 3. Market Regime Analysis
+```bash
+# Test during different market conditions
+python official_scanner.py --backtest \
+  --start-date 2023-01-01 \
+  --end-date 2023-03-31 \
+  --output-prefix "q1_2023"
+
+python official_scanner.py --backtest \
+  --start-date 2023-04-01 \
+  --end-date 2023-06-30 \
+  --output-prefix "q2_2023"
+
+python official_scanner.py --backtest \
+  --start-date 2023-07-01 \
+  --end-date 2023-09-30 \
+  --output-prefix "q3_2023"
+
+# Analyze performance across quarters
+python -c "
+import glob
+import json
+import pandas as pd
+
+quarters = []
+for file in glob.glob('scans/q*_2023_backtest_*.json'):
+    with open(file) as f:
+        data = json.load(f)
+        metrics = data['metrics']
+        quarter = file.split('_')[0].split('/')[-1]
+        quarters.append({
+            'quarter': quarter,
+            'return': metrics['total_return'],
+            'sharpe': metrics['sharpe_ratio'],
+            'drawdown': metrics['max_drawdown'],
+            'trades': metrics['total_trades']
+        })
+
+df = pd.DataFrame(quarters)
+print('Quarterly Performance:')
+print(df)
+"
+```
+
+#### 4. Walk-Forward Validation
+```bash
+# Comprehensive walk-forward analysis
+python official_scanner.py --backtest --walk-forward \
+  --start-date 2023-01-01 \
+  --end-date 2023-12-31 \
+  --training-window 60 \
+  --testing-window 20 \
+  --backtest-capital 100000 \
+  --output-prefix "walkforward_2023"
+
+# Analyze walk-forward results
+python -c "
+import json
+with open('scans/walkforward_2023_walkforward_*.json') as f:
+    results = json.load(f)
+    aggregate = results['aggregate_metrics']
+    
+    print('Walk-Forward Analysis Results:')
+    print(f'Total Periods: {aggregate[\"total_periods\"]}')
+    print(f'Average Return: {aggregate[\"avg_return\"]:.2%}')
+    print(f'Return Volatility: {aggregate[\"return_std\"]:.2%}')
+    print(f'Average Sharpe: {aggregate[\"avg_sharpe\"]:.3f}')
+    print(f'Consistency: {aggregate[\"consistency\"]:.2%}')
+    print(f'Positive Periods: {aggregate[\"positive_periods\"]}')
+"
+```
+
+### Backtest Output Files
+
+#### JSON Results
+```bash
+# Detailed backtest results in JSON format
+python official_scanner.py --backtest --output-prefix "detailed_backtest"
+
+# Parse JSON results
+python -c "
+import json
+with open('scans/detailed_backtest_backtest_*.json') as f:
+    results = json.load(f)
+    
+    # Portfolio details
+    portfolio = results['portfolio']
+    print(f'Final Value: ${portfolio[\"total_value\"]:,.0f}')
+    print(f'Cash: ${portfolio[\"cash\"]:,.0f}')
+    print(f'Positions: {len(portfolio[\"positions\"])}')
+    
+    # Trade details
+    trades = portfolio['trades']
+    print(f'\\nTrade Summary:')
+    for trade in trades[-5:]:  # Last 5 trades
+        print(f'{trade[\"date\"]}: {trade[\"ticker\"]} {trade[\"action\"]} - P&L: ${trade.get(\"net_pnl\", 0):.2f}')
+"
+```
+
+#### Summary Reports
+```bash
+# Generate summary report
+python official_scanner.py --backtest --output-prefix "summary_backtest"
+
+# View summary
+cat scans/summary_backtest_backtest_*_summary.txt
+```
+
+### Backtest Best Practices
+
+#### 1. Realistic Parameters
+```bash
+# Use realistic capital and position sizes
+python official_scanner.py --backtest \
+  --backtest-capital 100000 \
+  --max-positions 5 \
+  --rebalance-frequency weekly
+```
+
+#### 2. Multiple Time Periods
+```bash
+# Test across different market conditions
+python official_scanner.py --backtest \
+  --start-date 2022-01-01 \
+  --end-date 2022-12-31 \
+  --output-prefix "backtest_2022"
+
+python official_scanner.py --backtest \
+  --start-date 2023-01-01 \
+  --end-date 2023-12-31 \
+  --output-prefix "backtest_2023"
+```
+
+#### 3. Walk-Forward Validation
+```bash
+# Always validate with walk-forward analysis
+python official_scanner.py --backtest --walk-forward \
+  --start-date 2022-01-01 \
+  --end-date 2023-12-31 \
+  --training-window 90 \
+  --testing-window 30
+```
+
+#### 4. Benchmark Comparison
+```bash
+# Compare against market benchmark
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01
+
+# Results will show SPY benchmark comparison automatically
+```
+
+### Backtest Troubleshooting
+
+#### Common Issues
+
+**1. No Trades Generated**
+```bash
+# Debug with verbose logging
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --max-tickers 10 \
+  --log-level DEBUG
+```
+
+**2. Historical Data Issues**
+```bash
+# Test with known good tickers
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --max-tickers 5 \
+  --backtest-capital 10000
+```
+
+**3. Performance Issues**
+```bash
+# Use smaller date ranges for testing
+python official_scanner.py --backtest \
+  --start-date 2023-07-01 \
+  --end-date 2023-07-31 \
+  --max-tickers 10
+```
+
+#### Debug Commands
+```bash
+# Full debug backtest
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --max-tickers 3 \
+  --log-level DEBUG \
+  --output-prefix "debug_backtest"
+
+# Check historical data availability
+python -c "
+import yfinance as yf
+ticker = yf.Ticker('AAPL')
+data = ticker.history(start='2023-06-01', end='2023-08-01')
+print(f'AAPL data points: {len(data)}')
+print(f'Date range: {data.index[0]} to {data.index[-1]}')
+"
 ```
 
 ## Output Formats
@@ -357,7 +715,7 @@ print(f'Memory usage: {psutil.virtual_memory().percent:.1f}%')
 
 ### With EVR Backtesting
 ```bash
-# Generate signals
+# Generate signals for backtesting
 python official_scanner.py --max-tickers 50 --output-prefix "backtest_signals"
 
 # Extract tickers for backtesting
@@ -368,8 +726,31 @@ tickers = df['ticker'].tolist()
 print(' '.join(tickers))
 " > tickers.txt
 
-# Run backtest (if EVR CLI is available)
-# evr backtest --symbols $(cat tickers.txt)
+# Run backtest with extracted tickers
+python official_scanner.py --backtest \
+  --start-date 2023-06-01 \
+  --end-date 2023-08-01 \
+  --max-tickers 50 \
+  --output-prefix "extracted_backtest"
+
+# Compare signal generation vs backtest results
+python -c "
+import pandas as pd
+import json
+import glob
+
+# Load signals
+signals_df = pd.read_csv('scans/backtest_signals_*.csv')
+print(f'Generated {len(signals_df)} signals')
+
+# Load backtest results
+backtest_file = glob.glob('scans/extracted_backtest_backtest_*.json')[0]
+with open(backtest_file) as f:
+    backtest_results = json.load(f)
+    
+print(f'Backtest trades: {backtest_results[\"metrics\"][\"total_trades\"]}')
+print(f'Backtest return: {backtest_results[\"metrics\"][\"total_return\"]:.2%}')
+"
 ```
 
 ### With Trading Platforms
@@ -446,4 +827,70 @@ else:
 tar -czf scan_backup_$(date +%Y%m%d).tar.gz scans/
 ```
 
-This usage guide provides practical examples and workflows for using the EVR scanner effectively in various scenarios.
+### 5. Backtesting Workflow
+```bash
+# Regular backtesting schedule
+# Weekly backtest validation
+python official_scanner.py --backtest \
+  --start-date $(date -d '1 week ago' +%Y-%m-%d) \
+  --end-date $(date +%Y-%m-%d) \
+  --output-prefix "weekly_validation_$(date +%Y%m%d)"
+
+# Monthly comprehensive backtest
+python official_scanner.py --backtest --walk-forward \
+  --start-date $(date -d '3 months ago' +%Y-%m-%d) \
+  --end-date $(date +%Y-%m-%d) \
+  --training-window 60 \
+  --testing-window 20 \
+  --output-prefix "monthly_walkforward_$(date +%Y%m%d)"
+```
+
+### 6. Performance Monitoring
+```bash
+# Monitor backtest performance over time
+python -c "
+import glob
+import json
+import pandas as pd
+from datetime import datetime
+
+# Collect all backtest results
+results = []
+for file in glob.glob('scans/*_backtest_*.json'):
+    try:
+        with open(file) as f:
+            data = json.load(f)
+            metrics = data['metrics']
+            # Extract date from filename
+            date_str = file.split('_')[-1].split('.')[0][:8]
+            date = datetime.strptime(date_str, '%Y%m%d')
+            
+            results.append({
+                'date': date,
+                'return': metrics['total_return'],
+                'sharpe': metrics['sharpe_ratio'],
+                'drawdown': metrics['max_drawdown'],
+                'trades': metrics['total_trades']
+            })
+    except:
+        continue
+
+if results:
+    df = pd.DataFrame(results)
+    df = df.sort_values('date')
+    
+    print('Backtest Performance Over Time:')
+    print(f'Average Return: {df[\"return\"].mean():.2%}')
+    print(f'Average Sharpe: {df[\"sharpe\"].mean():.3f}')
+    print(f'Average Drawdown: {df[\"drawdown\"].mean():.2%}')
+    print(f'Total Backtests: {len(df)}')
+    
+    # Show recent performance
+    print('\\nRecent Performance (Last 5):')
+    print(df.tail()[['date', 'return', 'sharpe', 'drawdown']].to_string(index=False))
+else:
+    print('No backtest results found')
+"
+```
+
+This usage guide provides practical examples and workflows for using the EVR scanner effectively in various scenarios, including comprehensive backtesting capabilities.
