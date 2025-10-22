@@ -18,14 +18,19 @@ This scanner implements the complete EVR framework with:
 import json
 import logging
 import time
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from queue import Queue
 
 import pandas as pd
 import numpy as np
+import requests
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn, TaskProgressColumn
 from rich.table import Table
@@ -41,6 +46,114 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+
+
+class RateLimiter:
+    """Advanced rate limiter with exponential backoff and jitter."""
+    
+    def __init__(self, base_delay: float = 1.0, max_delay: float = 60.0, backoff_factor: float = 2.0):
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.backoff_factor = backoff_factor
+        self.last_request_time = 0.0
+        self.consecutive_failures = 0
+        self.lock = threading.Lock()
+    
+    def wait_if_needed(self):
+        """Wait if needed to respect rate limits."""
+        with self.lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            
+            # Calculate delay based on consecutive failures
+            if self.consecutive_failures > 0:
+                delay = min(self.base_delay * (self.backoff_factor ** self.consecutive_failures), self.max_delay)
+                # Add jitter to prevent thundering herd
+                jitter = random.uniform(0.1, 0.3) * delay
+                total_delay = delay + jitter
+            else:
+                total_delay = self.base_delay
+            
+            if time_since_last < total_delay:
+                sleep_time = total_delay - time_since_last
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
+    
+    def record_success(self):
+        """Record a successful request."""
+        with self.lock:
+            self.consecutive_failures = 0
+    
+    def record_failure(self):
+        """Record a failed request."""
+        with self.lock:
+            self.consecutive_failures += 1
+
+
+class ParallelDataFetcher:
+    """Parallel data fetcher with rate limiting and retry logic."""
+    
+    def __init__(self, max_workers: int = 5, rate_limiter: Optional[RateLimiter] = None):
+        self.max_workers = max_workers
+        self.rate_limiter = rate_limiter or RateLimiter()
+        self.session = requests.Session()
+        # Configure session for better performance
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def fetch_ticker_data(self, ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
+        """Fetch data for a single ticker with retry logic."""
+        import yfinance as yf
+        
+        for attempt in range(3):
+            try:
+                self.rate_limiter.wait_if_needed()
+                
+                stock = yf.Ticker(ticker)
+                data = stock.history(period=period)
+                
+                if not data.empty:
+                    self.rate_limiter.record_success()
+                    return data
+                else:
+                    self.rate_limiter.record_failure()
+                    return None
+                    
+            except Exception as e:
+                self.rate_limiter.record_failure()
+                
+                if "Too Many Requests" in str(e) or "Rate limited" in str(e):
+                    # Exponential backoff with jitter
+                    wait_time = min(2 ** attempt * 2, 30) + random.uniform(1, 3)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return None
+        
+        return None
+    
+    def fetch_multiple_tickers(self, tickers: List[str], period: str = "1y") -> Dict[str, Optional[pd.DataFrame]]:
+        """Fetch data for multiple tickers in parallel."""
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_ticker = {
+                executor.submit(self.fetch_ticker_data, ticker, period): ticker 
+                for ticker in tickers
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    results[ticker] = future.result()
+                except Exception as e:
+                    results[ticker] = None
+        
+        return results
 
 
 @dataclass
@@ -700,6 +813,10 @@ class OfficialTickerScanner:
         self.cache_dir = Path("cache")
         self.cache_dir.mkdir(exist_ok=True)
         
+        # Initialize rate limiter and parallel data fetcher
+        self.rate_limiter = RateLimiter(base_delay=0.5, max_delay=30.0, backoff_factor=1.5)
+        self.data_fetcher = ParallelDataFetcher(max_workers=3, rate_limiter=self.rate_limiter)
+        
         # Initialize EVR framework components
         self.prob_model = RollingBayes(
             window_size=252,
@@ -819,7 +936,7 @@ class OfficialTickerScanner:
         return ticker_list
     
     def get_stock_data(self, ticker: str, period: str = "1y") -> Optional[pd.DataFrame]:
-        """Get stock data using yfinance with retry logic, fallback to simulated data.
+        """Get stock data using parallel fetcher with advanced rate limiting.
         
         Args:
             ticker: Stock symbol
@@ -828,87 +945,16 @@ class OfficialTickerScanner:
         Returns:
             DataFrame with stock data or None if failed
         """
-        import yfinance as yf
+        # Use parallel data fetcher
+        data = self.data_fetcher.fetch_ticker_data(ticker, period)
         
-        # Try to get real data first
-        for attempt in range(2):  # Reduced attempts to avoid long waits
-            try:
-                stock = yf.Ticker(ticker)
-                data = stock.history(period=period)
-                if not data.empty:
-                    time.sleep(1.0)  # Increased rate limiting
-                    return data
-                else:
-                    self.logger.debug(f"No data for {ticker} (got {len(data)} rows)")
-                    break
-            except Exception as e:
-                if "Too Many Requests" in str(e) or "Rate limited" in str(e):
-                    wait_time = (2 ** attempt) * 3  # Longer waits: 3, 6 seconds
-                    self.logger.debug(f"Rate limited for {ticker}, waiting {wait_time}s (attempt {attempt + 1}/2)")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    self.logger.debug(f"Error fetching data for {ticker}: {e}")
-                    break
+        if data is not None and not data.empty:
+            return data
         
-        # Fallback to simulated data for testing
-        self.logger.info(f"Using simulated data for {ticker} due to rate limiting")
-        return self._generate_simulated_data(ticker, period)
+        # No fallback - return None if data unavailable
+        self.logger.debug(f"No data available for {ticker}")
+        return None
     
-    def _generate_simulated_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        """Generate simulated stock data for testing when real data is unavailable.
-        
-        Args:
-            ticker: Stock symbol
-            period: Data period
-            
-        Returns:
-            DataFrame with simulated stock data
-        """
-        import numpy as np
-        
-        # Determine number of days based on period
-        if period == "1y":
-            days = 252
-        elif period == "6mo":
-            days = 126
-        elif period == "3mo":
-            days = 63
-        elif period == "2y":
-            days = 504
-        else:
-            days = 252
-        
-        # Generate dates
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-        dates = pd.date_range(start=start_date, end=end_date, freq='D')
-        
-        # Use ticker hash for consistent but different data per ticker
-        np.random.seed(hash(ticker) % 2**32)
-        
-        # Generate realistic price data
-        base_price = 50 + (hash(ticker) % 200)  # Base price between 50-250
-        returns = np.random.normal(0.0008, 0.02, len(dates))  # Slight upward bias
-        prices = [base_price]
-        
-        for ret in returns[1:]:
-            prices.append(max(prices[-1] * (1 + ret), 1.0))  # Prevent negative prices
-        
-        # Generate OHLCV data
-        data = pd.DataFrame({
-            'Open': [p * (1 + np.random.normal(0, 0.003)) for p in prices],
-            'High': [max(p * (1 + abs(np.random.normal(0, 0.008))), p) for p in prices],
-            'Low': [min(p * (1 - abs(np.random.normal(0, 0.008))), p) for p in prices],
-            'Close': prices,
-            'Volume': np.random.randint(1000000, 10000000, len(dates))
-        }, index=dates)
-        
-        # Ensure High >= max(Open, Close) and Low <= min(Open, Close)
-        data['High'] = data[['Open', 'Close']].max(axis=1) + np.random.uniform(0, 2, len(data))
-        data['Low'] = data[['Open', 'Close']].min(axis=1) - np.random.uniform(0, 2, len(data))
-        
-        return data
     
     def calculate_technical_indicators(self, data: pd.DataFrame) -> Dict[str, float]:
         """Calculate technical indicators.
@@ -1461,6 +1507,10 @@ class OfficialTickerScanner:
             processed_tickers = random.sample(tickers, tickers_to_scan)
             self.logger.info(f"Starting scan of {tickers_to_scan} randomly selected tickers from {len(tickers)} total")
         
+        # Process tickers in parallel batches
+        batch_size = min(10, tickers_to_scan)  # Process in batches of 10
+        batches = [processed_tickers[i:i + batch_size] for i in range(0, len(processed_tickers), batch_size)]
+        
         all_trade_plans = []
         
         with Progress(
@@ -1474,44 +1524,232 @@ class OfficialTickerScanner:
         ) as progress:
             task = progress.add_task("Scanning tickers...", total=tickers_to_scan)
             
-            for i, ticker in enumerate(processed_tickers):
+            for batch in batches:
+                # Process batch in parallel
+                batch_results = self._process_ticker_batch(batch)
+                all_trade_plans.extend(batch_results)
+                
+                # Update progress
+                progress.advance(task, len(batch))
+                
+                # Small delay between batches to be respectful
+                if len(batches) > 1:
+                    time.sleep(0.5)
+        
+        # Rank by R-unit expectancy: E[R] = p·m - (1-p) - costs_R
+        def r_unit_expectancy_score(trade_plan: TradePlan) -> float:
+            """Calculate R-unit expectancy score for ranking."""
+            try:
+                # Extract trade plan parameters
+                entry_price = trade_plan.entry
+                stop_price = trade_plan.stop
+                target_price = trade_plan.take_profit
+                p_win = trade_plan.p_win
+                
+                # Calculate R-unit values
+                r_unit = abs(entry_price - stop_price)  # 1R = |Entry - Stop|
+                if r_unit == 0:
+                    return 0.0
+                
+                # Calculate reward in R units (m)
+                if trade_plan.signal_type and 'SHORT' in str(trade_plan.signal_type):
+                    # For short positions: reward = Stop - Target
+                    reward_r = abs(stop_price - target_price) / r_unit
+                else:
+                    # For long positions: reward = Target - Entry
+                    reward_r = abs(target_price - entry_price) / r_unit
+                
+                # Calculate costs in R units
+                # Total costs = commission + slippage (in dollars)
+                total_costs_dollars = trade_plan.cost_bps * entry_price / 10000 + trade_plan.slippage_bps * entry_price / 10000
+                costs_r = total_costs_dollars / r_unit
+                
+                # R-unit expectancy: E[R] = p·m - (1-p) - costs_R
+                expectancy_r = p_win * reward_r - (1 - p_win) - costs_r
+                
+                # Calculate minimum win rate threshold
+                min_win_rate = (1 + costs_r) / (reward_r + 1)
+                
+                # Safety margin: require 5-10 percentage points above minimum
+                safety_margin = 0.075  # 7.5% safety margin
+                required_win_rate = min_win_rate + safety_margin
+                
+                # Bonus for meeting safety margin
+                safety_bonus = 0.0
+                if p_win >= required_win_rate:
+                    safety_bonus = 0.1  # 10% bonus for meeting safety margin
+                
+                # Final score: expectancy + safety bonus
+                final_score = expectancy_r + safety_bonus
+                
+                # Store R-unit metrics in trade plan for display
+                trade_plan.r_unit = r_unit
+                trade_plan.reward_r = reward_r
+                trade_plan.costs_r = costs_r
+                trade_plan.expectancy_r = expectancy_r
+                trade_plan.min_win_rate = min_win_rate
+                trade_plan.required_win_rate = required_win_rate
+                
+                return final_score
+                
+            except Exception as e:
+                self.logger.debug(f"Error calculating R-unit expectancy score: {e}")
+                return 0.0
+        
+        # Sort by R-unit expectancy score (descending)
+        all_trade_plans.sort(key=r_unit_expectancy_score, reverse=True)
+        
+        self.logger.info(f"Scan completed: {len(all_trade_plans)} trade plans from {tickers_to_scan} tickers")
+        return all_trade_plans
+    
+    def _process_ticker_batch(self, tickers: List[str]) -> List[TradePlan]:
+        """Process a batch of tickers in parallel.
+        
+        Args:
+            tickers: List of ticker symbols to process
+            
+        Returns:
+            List of TradePlan objects
+        """
+        def process_single_ticker(ticker: str) -> List[TradePlan]:
+            """Process a single ticker and return trade plans."""
+            try:
+                # Get stock data
+                data = self.get_stock_data(ticker)
+                if data is None or len(data) < 50:
+                    return []
+                
+                # Calculate indicators
+                indicators = self.calculate_technical_indicators(data)
+                if not indicators:
+                    return []
+                
+                # Generate signals
+                signals = self.generate_signals(ticker, data, indicators)
+                
+                # Convert signals to trade plans
+                trade_plans = []
+                for signal in signals:
+                    trade_plan = self.create_trade_plan(signal, data)
+                    if trade_plan is not None:
+                        # Check risk guards
+                        risk_checks = self.risk_guards.check_trade_plan(trade_plan)
+                        if risk_checks['all_checks_passed']:
+                            trade_plans.append(trade_plan)
+                
+                return trade_plans
+                
+            except Exception as e:
+                self.logger.debug(f"Error processing {ticker}: {e}")
+                return []
+        
+        # Process tickers in parallel
+        all_trade_plans = []
+        
+        with ThreadPoolExecutor(max_workers=min(5, len(tickers))) as executor:
+            # Submit all tasks
+            future_to_ticker = {
+                executor.submit(process_single_ticker, ticker): ticker 
+                for ticker in tickers
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
                 try:
-                    # Get stock data
-                    data = self.get_stock_data(ticker)
-                    if data is None or len(data) < 50:
-                        self.logger.debug(f"Insufficient data for {ticker}")
-                        progress.advance(task)
-                        continue
-                    
-                    # Calculate indicators
-                    indicators = self.calculate_technical_indicators(data)
-                    if not indicators:
-                        self.logger.debug(f"Failed to calculate indicators for {ticker}")
-                        progress.advance(task)
-                        continue
-                    
-                    # Generate signals
-                    signals = self.generate_signals(ticker, data, indicators)
-                    
-                    # Convert signals to trade plans
-                    for signal in signals:
-                        trade_plan = self.create_trade_plan(signal, data)
-                        if trade_plan is not None:
-                            # Check risk guards
-                            risk_checks = self.risk_guards.check_trade_plan(trade_plan)
-                            if risk_checks['all_checks_passed']:
-                                all_trade_plans.append(trade_plan)
-                    
-                    if signals:
-                        self.logger.debug(f"Generated {len(signals)} signals for {ticker}")
-                    
-                    progress.advance(task)
-                    time.sleep(1.0)  # Increased rate limiting to avoid Yahoo Finance limits
-                    
+                    trade_plans = future.result()
+                    all_trade_plans.extend(trade_plans)
                 except Exception as e:
-                    self.logger.warning(f"Error processing {ticker}: {e}")
-                    progress.advance(task)
-                    continue
+                    self.logger.debug(f"Failed to process {ticker}: {e}")
+        
+        return all_trade_plans
+    
+    def _process_backtest_batch(self, tickers: List[str], date: str) -> List[Dict[str, Any]]:
+        """Process a batch of tickers for backtesting in parallel.
+        
+        Args:
+            tickers: List of ticker symbols to process
+            date: Date to get recommendations for
+            
+        Returns:
+            List of recommendations
+        """
+        def process_single_backtest_ticker(ticker: str) -> List[Dict[str, Any]]:
+            """Process a single ticker for backtesting."""
+            try:
+                # Get historical data up to the specific date
+                import yfinance as yf
+                
+                # Calculate start date to ensure we have enough data for indicators
+                start_date = (datetime.strptime(date, '%Y-%m-%d') - timedelta(days=365)).strftime('%Y-%m-%d')
+                
+                # Get historical data up to the backtest date
+                hist_data = None
+                for attempt in range(2):  # Reduced attempts for parallel processing
+                    try:
+                        ticker_obj = yf.Ticker(ticker)
+                        hist_data = ticker_obj.history(start=start_date, end=date)
+                        if not hist_data.empty:
+                            break
+                    except Exception as e:
+                        if "Too Many Requests" in str(e) or "Rate limited" in str(e):
+                            wait_time = (2 ** attempt) * 1.5 + random.uniform(0.5, 1.5)
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            break
+                
+                if hist_data is None or hist_data.empty or len(hist_data) < 50:
+                    return []
+                
+                # Calculate indicators
+                indicators = self.calculate_technical_indicators(hist_data)
+                if not indicators:
+                    return []
+                
+                # Generate signals
+                signals = self.generate_signals(ticker, hist_data, indicators)
+                if not signals:
+                    return []
+                
+                # Create trade plans
+                trade_plans = []
+                for signal in signals:
+                    trade_plan = self.create_trade_plan(signal, hist_data)
+                    if trade_plan:
+                        trade_plans.append(trade_plan)
+                
+                if trade_plans:
+                    # Aggregate trade plans for this ticker
+                    aggregated = self.aggregate_trade_plans(trade_plans)
+                    return aggregated
+                
+                return []
+                
+            except Exception as e:
+                self.logger.debug(f"Error processing {ticker} for {date}: {e}")
+                return []
+        
+        # Process tickers in parallel
+        all_recommendations = []
+        
+        with ThreadPoolExecutor(max_workers=min(3, len(tickers))) as executor:
+            # Submit all tasks
+            future_to_ticker = {
+                executor.submit(process_single_backtest_ticker, ticker): ticker 
+                for ticker in tickers
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    recommendations = future.result()
+                    all_recommendations.extend(recommendations)
+                except Exception as e:
+                    self.logger.debug(f"Failed to process {ticker} for {date}: {e}")
+        
+        return all_recommendations
         
         # Rank by R-unit expectancy: E[R] = p·m - (1-p) - costs_R
         def r_unit_expectancy_score(trade_plan: TradePlan) -> float:
