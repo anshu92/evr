@@ -129,10 +129,10 @@ jobs:
           Manual scan completed successfully at ${{ github.run_number }}.
           
           **Scan Parameters:**
-          - Max Tickers: ${{{{ github.event.inputs.max_tickers }}}}
-          - Top Signals: ${{{{ github.event.inputs.top_signals }}}}
-          - Log Level: ${{{{ github.event.inputs.log_level }}}}
-          - Use Cache: ${{{{ github.event.inputs.use_cache }}}}
+          - Max Tickers: ${{ github.event.inputs.max_tickers }}
+          - Top Signals: ${{ github.event.inputs.top_signals }}
+          - Log Level: ${{ github.event.inputs.log_level }}
+          - Use Cache: ${{ github.event.inputs.use_cache }}
           
           Please find the detailed report in the attached summary file.
           
@@ -167,10 +167,10 @@ jobs:
             - Branch: ${context.ref}
             
             **Scan Parameters:**
-            - Max Tickers: ${{{{ github.event.inputs.max_tickers }}}}
-            - Top Signals: ${{{{ github.event.inputs.top_signals }}}}
-            - Log Level: ${{{{ github.event.inputs.log_level }}}}
-            - Use Cache: ${{{{ github.event.inputs.use_cache }}}}
+            - Max Tickers: ${{ github.event.inputs.max_tickers }}
+            - Top Signals: ${{ github.event.inputs.top_signals }}
+            - Log Level: ${{ github.event.inputs.log_level }}
+            - Use Cache: ${{ github.event.inputs.use_cache }}
             
             **Please check:**
             1. Scanner dependencies
@@ -209,10 +209,10 @@ jobs:
           - Branch: ${{ github.ref }}
           
           **Scan Parameters:**
-          - Max Tickers: ${{{{ github.event.inputs.max_tickers }}}}
-          - Top Signals: ${{{{ github.event.inputs.top_signals }}}}
-          - Log Level: ${{{{ github.event.inputs.log_level }}}}
-          - Use Cache: ${{{{ github.event.inputs.use_cache }}}}
+          - Max Tickers: ${{ github.event.inputs.max_tickers }}
+          - Top Signals: ${{ github.event.inputs.top_signals }}
+          - Log Level: ${{ github.event.inputs.log_level }}
+          - Use Cache: ${{ github.event.inputs.use_cache }}
           
           **Please check:**
           1. Scanner dependencies
