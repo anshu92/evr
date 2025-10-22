@@ -29,43 +29,43 @@ uv pip install -e .
 
 ### 2. First Run
 ```bash
-# Basic scan
+# Basic scan with aggregated recommendations (scans all tickers by default)
 python official_scanner.py
 
-# CLI interface
-python cli_official_scanner.py
+# Individual signals mode
+python official_scanner.py --no-aggregate
 ```
 
 ## Basic Usage
 
 ### Default Scan
 ```bash
-# Scan 100 tickers, show top 20 signals
-python cli_official_scanner.py
+# Scan all tickers, show top 20 aggregated recommendations
+python official_scanner.py
 ```
 
 ### Custom Parameters
 ```bash
-# Scan more tickers
-python cli_official_scanner.py --max-tickers 200
+# Limit to specific number of tickers
+python official_scanner.py --max-tickers 200
 
 # Show more results
-python cli_official_scanner.py --top 50
+python official_scanner.py --top 50
 
 # Custom output name
-python cli_official_scanner.py --output-prefix "my_scan"
+python official_scanner.py --output-prefix "my_scan"
 ```
 
 ### Logging Levels
 ```bash
 # Quiet mode (errors only)
-python cli_official_scanner.py --log-level ERROR
+python official_scanner.py --log-level ERROR
 
 # Normal mode (default)
-python cli_official_scanner.py --log-level INFO
+python official_scanner.py --log-level INFO
 
 # Verbose mode (debug info)
-python cli_official_scanner.py --log-level DEBUG
+python official_scanner.py --log-level DEBUG
 ```
 
 ## Advanced Usage
@@ -73,26 +73,26 @@ python cli_official_scanner.py --log-level DEBUG
 ### Production Scans
 ```bash
 # Large comprehensive scan
-python cli_official_scanner.py --max-tickers 500 --log-level INFO --output-prefix "production_scan"
+python official_scanner.py --max-tickers 500 --log-level INFO --output-prefix "production_scan"
 
 # Daily automated scan
-python cli_official_scanner.py --max-tickers 300 --output-prefix "daily_$(date +%Y%m%d)"
+python official_scanner.py --max-tickers 300 --output-prefix "daily_$(date +%Y%m%d)"
 ```
 
 ### Testing and Development
 ```bash
 # Quick test scan
-python cli_official_scanner.py --max-tickers 25 --top 10 --log-level DEBUG --output-prefix "test"
+python official_scanner.py --max-tickers 25 --top 10 --log-level DEBUG --output-prefix "test"
 
 # Fresh data scan
-python cli_official_scanner.py --no-cache --max-tickers 50 --output-prefix "fresh_data"
+python official_scanner.py --no-cache --max-tickers 50 --output-prefix "fresh_data"
 ```
 
 ### Batch Processing
 ```bash
 # Process in batches
 for i in {1..5}; do
-    python cli_official_scanner.py --max-tickers 200 --output-prefix "batch_$i"
+    python official_scanner.py --max-tickers 200 --output-prefix "batch_$i"
     sleep 60  # Wait 1 minute between batches
 done
 ```
@@ -102,7 +102,7 @@ done
 ### CSV Output
 ```bash
 # Generate CSV for spreadsheet analysis
-python cli_official_scanner.py --output-prefix "spreadsheet_data"
+python official_scanner.py --output-prefix "spreadsheet_data"
 
 # View top 10 signals
 head -11 scans/spreadsheet_data_*.csv
@@ -111,7 +111,7 @@ head -11 scans/spreadsheet_data_*.csv
 ### JSON Output
 ```bash
 # Generate JSON for API integration
-python cli_official_scanner.py --output-prefix "api_data"
+python official_scanner.py --output-prefix "api_data"
 
 # Parse JSON output
 python -c "
@@ -127,7 +127,7 @@ with open('scans/api_data_*.json') as f:
 ### Summary Output
 ```bash
 # Generate summary for quick review
-python cli_official_scanner.py --output-prefix "summary"
+python official_scanner.py --output-prefix "summary"
 
 # View summary
 cat scans/summary_*_summary.txt
@@ -138,34 +138,34 @@ cat scans/summary_*_summary.txt
 ### Optimize Scanning Speed
 ```bash
 # Faster scanning (fewer tickers)
-python cli_official_scanner.py --max-tickers 50 --log-level WARNING
+python official_scanner.py --max-tickers 50 --log-level WARNING
 
 # Balanced approach
-python cli_official_scanner.py --max-tickers 100 --log-level INFO
+python official_scanner.py --max-tickers 100 --log-level INFO
 
 # Comprehensive but slower
-python cli_official_scanner.py --max-tickers 500 --log-level INFO
+python official_scanner.py --max-tickers 500 --log-level INFO
 ```
 
 ### Memory Management
 ```bash
 # Small batches for limited memory
-python cli_official_scanner.py --max-tickers 25
+python official_scanner.py --max-tickers 25
 
 # Medium batches
-python cli_official_scanner.py --max-tickers 100
+python official_scanner.py --max-tickers 100
 
 # Large batches (requires more memory)
-python cli_official_scanner.py --max-tickers 500
+python official_scanner.py --max-tickers 500
 ```
 
 ### Network Optimization
 ```bash
 # Use cached data when possible
-python cli_official_scanner.py  # Uses cache by default
+python official_scanner.py  # Uses cache by default
 
 # Force fresh data only when needed
-python cli_official_scanner.py --no-cache
+python official_scanner.py --no-cache
 ```
 
 ## Common Use Cases
@@ -178,7 +178,7 @@ cd /path/to/evr
 source .venv/bin/activate
 
 # Generate daily signals
-python cli_official_scanner.py \
+python official_scanner.py \
     --max-tickers 200 \
     --top 30 \
     --output-prefix "daily_$(date +%Y%m%d)" \
@@ -191,7 +191,7 @@ python cli_official_scanner.py \
 ### 2. Portfolio Screening
 ```bash
 # Screen for long opportunities
-python cli_official_scanner.py --max-tickers 300 --output-prefix "long_screen"
+python official_scanner.py --max-tickers 300 --output-prefix "long_screen"
 
 # Filter for high-confidence signals
 python -c "
@@ -206,7 +206,7 @@ print(high_conf[['ticker', 'signal_type', 'confidence', 'expected_return']].head
 ### 3. Risk Assessment
 ```bash
 # Generate signals for risk analysis
-python cli_official_scanner.py --max-tickers 150 --output-prefix "risk_analysis"
+python official_scanner.py --max-tickers 150 --output-prefix "risk_analysis"
 
 # Analyze risk-reward ratios
 python -c "
@@ -223,7 +223,7 @@ print(f'Signals with R/R > 2.0: {len(df[df[\"risk_reward_ratio\"] > 2.0])}')
 ### 4. Signal Validation
 ```bash
 # Generate signals for validation
-python cli_official_scanner.py --max-tickers 100 --log-level DEBUG --output-prefix "validation"
+python official_scanner.py --max-tickers 100 --log-level DEBUG --output-prefix "validation"
 
 # Check signal distribution
 python -c "
@@ -242,7 +242,7 @@ print(f'Std: {df[\"confidence\"].std():.3f}')
 ### 5. Market Analysis
 ```bash
 # Generate comprehensive market signals
-python cli_official_scanner.py --max-tickers 500 --output-prefix "market_analysis"
+python official_scanner.py --max-tickers 500 --output-prefix "market_analysis"
 
 # Analyze market sentiment
 python -c "
@@ -267,7 +267,7 @@ print(f'Bullish Bias: {long_signals/total_signals:.1%}')
 #### 1. No Signals Generated
 ```bash
 # Debug mode to see what's happening
-python cli_official_scanner.py --max-tickers 10 --log-level DEBUG
+python official_scanner.py --max-tickers 10 --log-level DEBUG
 
 # Check if tickers have data
 python -c "
@@ -282,10 +282,10 @@ print(f'Last price: {data[\"Close\"].iloc[-1]:.2f}')
 #### 2. Slow Performance
 ```bash
 # Reduce ticker count
-python cli_official_scanner.py --max-tickers 50
+python official_scanner.py --max-tickers 50
 
 # Use warning level logging
-python cli_official_scanner.py --log-level WARNING
+python official_scanner.py --log-level WARNING
 
 # Check system resources
 top -l 1 | grep python
@@ -294,7 +294,7 @@ top -l 1 | grep python
 #### 3. Memory Issues
 ```bash
 # Use smaller batches
-python cli_official_scanner.py --max-tickers 25
+python official_scanner.py --max-tickers 25
 
 # Clear cache if needed
 rm cache/official_tickers.json
@@ -313,7 +313,7 @@ print(f'Available memory: {psutil.virtual_memory().available / 1024**3:.1f} GB')
 ping ftp.nasdaqtrader.com
 
 # Use cached data
-python cli_official_scanner.py  # Uses cache by default
+python official_scanner.py  # Uses cache by default
 
 # Check if cache exists
 ls -la cache/official_tickers.json
@@ -322,7 +322,7 @@ ls -la cache/official_tickers.json
 ### Debug Commands
 ```bash
 # Full debug scan
-python cli_official_scanner.py --max-tickers 5 --log-level DEBUG --output-prefix "debug"
+python official_scanner.py --max-tickers 5 --log-level DEBUG --output-prefix "debug"
 
 # Test specific ticker
 python -c "
@@ -338,7 +338,7 @@ print(f'Date range: {data.index[0]} to {data.index[-1]}')
 ### Performance Monitoring
 ```bash
 # Time the scan
-time python cli_official_scanner.py --max-tickers 100
+time python official_scanner.py --max-tickers 100
 
 # Monitor system resources
 python -c "
@@ -358,7 +358,7 @@ print(f'Memory usage: {psutil.virtual_memory().percent:.1f}%')
 ### With EVR Backtesting
 ```bash
 # Generate signals
-python cli_official_scanner.py --max-tickers 50 --output-prefix "backtest_signals"
+python official_scanner.py --max-tickers 50 --output-prefix "backtest_signals"
 
 # Extract tickers for backtesting
 python -c "
@@ -375,7 +375,7 @@ print(' '.join(tickers))
 ### With Trading Platforms
 ```bash
 # Generate signals for trading platform
-python cli_official_scanner.py --max-tickers 100 --output-prefix "trading_signals"
+python official_scanner.py --max-tickers 100 --output-prefix "trading_signals"
 
 # Convert to trading platform format
 python -c "
@@ -392,7 +392,7 @@ print(f'Exported {len(high_conf)} high-confidence signals')
 ### With Alert Systems
 ```bash
 # Generate signals for alerts
-python cli_official_scanner.py --max-tickers 200 --output-prefix "alerts"
+python official_scanner.py --max-tickers 200 --output-prefix "alerts"
 
 # Create alert list
 python -c "
@@ -411,7 +411,7 @@ for _, signal in high_return.iterrows():
 ### 1. Regular Scans
 ```bash
 # Set up cron job for daily scans
-# 0 9 * * 1-5 cd /path/to/evr && source .venv/bin/activate && python cli_official_scanner.py --max-tickers 200 --output-prefix "daily_$(date +%Y%m%d)"
+# 0 9 * * 1-5 cd /path/to/evr && source .venv/bin/activate && python official_scanner.py --max-tickers 200 --output-prefix "daily_$(date +%Y%m%d)"
 ```
 
 ### 2. Data Management

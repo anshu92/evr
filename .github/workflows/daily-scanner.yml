@@ -35,8 +35,7 @@ jobs:
     - name: Run EVR Scanner
       run: |
         source .venv/bin/activate
-        python cli_official_scanner.py \
-          --max-tickers 200 \
+        python official_scanner.py \
           --top 30 \
           --output-prefix "daily_$(date +%Y%m%d)" \
           --log-level INFO
@@ -50,71 +49,78 @@ jobs:
         from datetime import datetime
         import os
         
-        # Find the latest CSV file
+        # Find the latest aggregated CSV file
         files = glob.glob('scans/daily_*.csv')
         if files:
             latest_file = max(files, key=lambda x: x.split('_')[-1])
             df = pd.read_csv(latest_file)
             
-            # Generate summary
-            summary = f'''EVR Daily Trading Signals Report
+            # Generate summary for aggregated results
+            summary = f'''EVR Daily Aggregated Trading Recommendations Report
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Scan Date: {datetime.now().strftime('%Y-%m-%d')}
 
 SUMMARY STATISTICS:
 ==================
-Total Signals: {len(df)}
-Long Positions: {len(df[df['direction'] == 'LONG'])} ({len(df[df['direction'] == 'LONG'])/len(df)*100:.1f}%)
-Short Positions: {len(df[df['direction'] == 'SHORT'])} ({len(df[df['direction'] == 'SHORT'])/len(df)*100:.1f}%)
-Average Confidence: {df['confidence'].mean():.1%}
-Average Expected Return: {df['expected_return'].mean():.2%}
-Average Risk/Reward Ratio: {df['risk_reward_ratio'].mean():.2f}
+Total Ticker Recommendations: {len(df)}
+Long Positions: {len(df[df['primary_direction'] == 'LONG'])} ({len(df[df['primary_direction'] == 'LONG'])/len(df)*100:.1f}%)
+Short Positions: {len(df[df['primary_direction'] == 'SHORT'])} ({len(df[df['primary_direction'] == 'SHORT'])/len(df)*100:.1f}%)
+Average P(Win): {df['weighted_p_win'].mean():.1%}
+Average Expected Return: {df['weighted_expected_return'].mean():.2%}
+Average EVR Score: {df['evr_composite_score'].mean():.3f}
+Total Individual Signals: {df['total_signals'].sum()}
 
-SIGNAL BREAKDOWN:
-================'''
+RECOMMENDATION BREAKDOWN:
+========================'''
             
-            # Signal type breakdown
-            signal_counts = df['signal_type'].value_counts()
-            for signal_type, count in signal_counts.items():
-                percentage = count / len(df) * 100
-                summary += f'\n{signal_type}: {count} ({percentage:.1f}%)'
+            # Signal count breakdown
+            signal_count_dist = df['total_signals'].value_counts().sort_index()
+            for signal_count, ticker_count in signal_count_dist.items():
+                percentage = ticker_count / len(df) * 100
+                summary += f'\nTickers with {signal_count} signals: {ticker_count} ({percentage:.1f}%)'
             
             summary += f'''
 
-TOP 10 SIGNALS BY EXPECTED RETURN:
-=================================='''
+TOP 10 RECOMMENDATIONS BY EVR SCORE:
+===================================='''
             
-            # Top 10 signals
-            top_signals = df.nlargest(10, 'expected_return')
-            for i, (_, signal) in enumerate(top_signals.iterrows(), 1):
-                summary += f'\n{i:2d}. {signal[\"ticker\"]:6s} {signal[\"signal_type\"]:15s} {signal[\"direction\"]:5s} {signal[\"expected_return\"]:6.2%} ({signal[\"confidence\"]:5.1%})'
+            # Top 10 recommendations
+            top_recommendations = df.nlargest(10, 'evr_composite_score')
+            for i, (_, rec) in enumerate(top_recommendations.iterrows(), 1):
+                summary += f'\n{i:2d}. {rec[\"ticker\"]:6s} {rec[\"primary_direction\"]:5s} {rec[\"total_signals\"]:2d} signals {rec[\"evr_composite_score\"]:6.3f} score {rec[\"weighted_expected_return\"]:6.2%} return ({rec[\"weighted_p_win\"]:5.1%})'
             
             summary += f'''
 
 RISK ANALYSIS:
 ==============
-Average Risk: {df['risk_percentage'].mean():.1f}%
-Average Reward: {df['reward_percentage'].mean():.1f}%
-High Risk Signals (>8%): {len(df[df['risk_percentage'] > 8])}
-Medium Risk Signals (5-8%): {len(df[(df['risk_percentage'] >= 5) & (df['risk_percentage'] <= 8)])}
-Low Risk Signals (<5%): {len(df[df['risk_percentage'] < 5])}
+Total Risk: ${df['total_risk_dollars'].sum():,.0f}
+Average Risk per Recommendation: ${df['total_risk_dollars'].mean():,.0f}
+High Risk Recommendations (>$100): {len(df[df['total_risk_dollars'] > 100])}
+Medium Risk Recommendations ($50-$100): {len(df[(df['total_risk_dollars'] >= 50) & (df['total_risk_dollars'] <= 100)])}
+Low Risk Recommendations (<$50): {len(df[df['total_risk_dollars'] < 50])}
 
-CONFIDENCE ANALYSIS:
-===================
-High Confidence (>70%): {len(df[df['confidence'] > 0.7])} ({len(df[df['confidence'] > 0.7])/len(df)*100:.1f}%)
-Medium Confidence (50-70%): {len(df[(df['confidence'] >= 0.5) & (df['confidence'] <= 0.7)])} ({len(df[(df['confidence'] >= 0.5) & (df['confidence'] <= 0.7)])/len(df)*100:.1f}%)
-Low Confidence (<50%): {len(df[df['confidence'] < 0.5])} ({len(df[df['confidence'] < 0.5])/len(df)*100:.1f}%)
+PROBABILITY ANALYSIS:
+====================
+High P(Win) (>60%): {len(df[df['weighted_p_win'] > 0.6])} ({len(df[df['weighted_p_win'] > 0.6])/len(df)*100:.1f}%)
+Medium P(Win) (50-60%): {len(df[(df['weighted_p_win'] >= 0.5) & (df['weighted_p_win'] <= 0.6)])} ({len(df[(df['weighted_p_win'] >= 0.5) & (df['weighted_p_win'] <= 0.6)])/len(df)*100:.1f}%)
+Low P(Win) (<50%): {len(df[df['weighted_p_win'] < 0.5])} ({len(df[df['weighted_p_win'] < 0.5])/len(df)*100:.1f}%)
 
 EXPECTED RETURN ANALYSIS:
 ========================
-High Return (>8%): {len(df[df['expected_return'] > 0.08])} ({len(df[df['expected_return'] > 0.08])/len(df)*100:.1f}%)
-Medium Return (5-8%): {len(df[(df['expected_return'] >= 0.05) & (df['expected_return'] <= 0.08)])} ({len(df[(df['expected_return'] >= 0.05) & (df['expected_return'] <= 0.08)])/len(df)*100:.1f}%)
-Low Return (<5%): {len(df[df['expected_return'] < 0.05])} ({len(df[df['expected_return'] < 0.05])/len(df)*100:.1f}%)
+High Return (>10%): {len(df[df['weighted_expected_return'] > 0.10])} ({len(df[df['weighted_expected_return'] > 0.10])/len(df)*100:.1f}%)
+Medium Return (5-10%): {len(df[(df['weighted_expected_return'] >= 0.05) & (df['weighted_expected_return'] <= 0.10)])} ({len(df[(df['weighted_expected_return'] >= 0.05) & (df['weighted_expected_return'] <= 0.10)])/len(df)*100:.1f}%)
+Low Return (<5%): {len(df[df['weighted_expected_return'] < 0.05])} ({len(df[df['weighted_expected_return'] < 0.05])/len(df)*100:.1f}%)
+
+EVR SCORE ANALYSIS:
+==================
+High EVR Score (>0.5): {len(df[df['evr_composite_score'] > 0.5])} ({len(df[df['evr_composite_score'] > 0.5])/len(df)*100:.1f}%)
+Medium EVR Score (0.3-0.5): {len(df[(df['evr_composite_score'] >= 0.3) & (df['evr_composite_score'] <= 0.5)])} ({len(df[(df['evr_composite_score'] >= 0.3) & (df['evr_composite_score'] <= 0.5)])/len(df)*100:.1f}%)
+Low EVR Score (<0.3): {len(df[df['evr_composite_score'] < 0.3])} ({len(df[df['evr_composite_score'] < 0.3])/len(df)*100:.1f}%)
 
 MARKET SENTIMENT:
 ================
-Market Bias: {'Bullish' if len(df[df['direction'] == 'LONG']) > len(df[df['direction'] == 'SHORT']) else 'Bearish'}
-Long/Short Ratio: {len(df[df['direction'] == 'LONG'])}/{len(df[df['direction'] == 'SHORT'])} ({len(df[df['direction'] == 'LONG'])/len(df[df['direction'] == 'SHORT']):.2f}:1)
+Market Bias: {'Bullish' if len(df[df['primary_direction'] == 'LONG']) > len(df[df['primary_direction'] == 'SHORT']) else 'Bearish'}
+Long/Short Ratio: {len(df[df['primary_direction'] == 'LONG'])}/{len(df[df['primary_direction'] == 'SHORT'])} ({len(df[df['primary_direction'] == 'LONG'])/len(df[df['primary_direction'] == 'SHORT']):.2f}:1)
 
 FILES GENERATED:
 ===============

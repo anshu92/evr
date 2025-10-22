@@ -35,8 +35,7 @@ jobs:
     - name: Run Comprehensive EVR Scanner
       run: |
         source .venv/bin/activate
-        python cli_official_scanner.py \
-          --max-tickers 500 \
+        python official_scanner.py \
           --top 50 \
           --output-prefix "weekly_$(date +%Y%m%d)" \
           --log-level INFO
@@ -57,39 +56,38 @@ jobs:
             df = pd.read_csv(latest_file)
             
             # Generate comprehensive weekly report
-            summary = f'''EVR Weekly Trading Signals Report
+            summary = f'''EVR Weekly Aggregated Trading Recommendations Report
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Week Ending: {datetime.now().strftime('%Y-%m-%d')}
 
 WEEKLY SUMMARY STATISTICS:
 ==========================
-Total Signals: {len(df)}
-Long Positions: {len(df[df['direction'] == 'LONG'])} ({len(df[df['direction'] == 'LONG'])/len(df)*100:.1f}%)
-Short Positions: {len(df[df['direction'] == 'SHORT'])} ({len(df[df['direction'] == 'SHORT'])/len(df)*100:.1f}%)
-Average Confidence: {df['confidence'].mean():.1%}
-Average Expected Return: {df['expected_return'].mean():.2%}
-Average Risk/Reward Ratio: {df['risk_reward_ratio'].mean():.2f}
+Total Recommendations: {len(df)}
+Long Positions: {len(df[df['primary_direction'] == 'LONG'])} ({len(df[df['primary_direction'] == 'LONG'])/len(df)*100:.1f}%)
+Short Positions: {len(df[df['primary_direction'] == 'SHORT'])} ({len(df[df['primary_direction'] == 'SHORT'])/len(df)*100:.1f}%)
+Average P(Win): {df['weighted_p_win'].mean():.1%}
+Average Expected Return: {df['weighted_expected_return'].mean():.2%}
+Average EVR Score: {df['evr_composite_score'].mean():.3f}
+Total Individual Signals: {df['total_signals'].sum()}
 
-SIGNAL TYPE BREAKDOWN:
-====================='''
+RECOMMENDATION BREAKDOWN:
+========================'''
             
-            # Signal type breakdown
-            signal_counts = df['signal_type'].value_counts()
-            for signal_type, count in signal_counts.items():
-                percentage = count / len(df) * 100
-                avg_conf = df[df['signal_type'] == signal_type]['confidence'].mean()
-                avg_return = df[df['signal_type'] == signal_type]['expected_return'].mean()
-                summary += f'\n{signal_type}: {count} ({percentage:.1f}%) - Avg Confidence: {avg_conf:.1%}, Avg Return: {avg_return:.2%}'
+            # Signal count breakdown
+            signal_count_dist = df['total_signals'].value_counts().sort_index()
+            for signal_count, ticker_count in signal_count_dist.items():
+                percentage = ticker_count / len(df) * 100
+                summary += f'\nTickers with {signal_count} signals: {ticker_count} ({percentage:.1f}%)'
             
             summary += f'''
 
-TOP 20 SIGNALS BY EXPECTED RETURN:
-=================================='''
+TOP 20 RECOMMENDATIONS BY EVR SCORE:
+===================================='''
             
-            # Top 20 signals
-            top_signals = df.nlargest(20, 'expected_return')
-            for i, (_, signal) in enumerate(top_signals.iterrows(), 1):
-                summary += f'\n{i:2d}. {signal[\"ticker\"]:6s} {signal[\"signal_type\"]:15s} {signal[\"direction\"]:5s} {signal[\"expected_return\"]:6.2%} ({signal[\"confidence\"]:5.1%}) R/R: {signal[\"risk_reward_ratio\"]:4.1f}'
+            # Top 20 recommendations
+            top_recommendations = df.nlargest(20, 'evr_composite_score')
+            for i, (_, rec) in enumerate(top_recommendations.iterrows(), 1):
+                summary += f'\n{i:2d}. {rec[\"ticker\"]:6s} {rec[\"primary_direction\"]:5s} {rec[\"total_signals\"]:2d} signals {rec[\"evr_composite_score\"]:6.3f} score {rec[\"weighted_expected_return\"]:6.2%} return ({rec[\"weighted_p_win\"]:5.1%})'
             
             summary += f'''
 

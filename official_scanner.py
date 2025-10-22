@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-Official NYSE/NASDAQ ticker scanner using NASDAQ's official data sources.
+EVR Official Ticker Scanner with Full Framework
 
-This scanner uses the official NASDAQ FTP feeds to get comprehensive
-lists of all NYSE and NASDAQ tickers with proper logging and progress tracking.
+This scanner implements the complete EVR framework with:
+1. Official ticker data from NASDAQ FTP
+2. Comprehensive technical analysis
+3. Empirical Bayes probability estimation
+4. Kelly fraction sizing
+5. Cost and slippage modeling
+6. Risk management and circuit breakers
+7. Expected growth ranking
+8. Full TradePlan objects with all EVR fields
+9. Optional ML classifier for probability estimation
+10. Signal aggregation by default
 """
 
 import json
@@ -11,7 +20,9 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
@@ -20,6 +31,587 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRe
 from rich.table import Table
 from rich.panel import Panel
 from rich.logging import RichHandler
+
+# Optional ML imports for probability estimation
+try:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.metrics import brier_score_loss, roc_auc_score
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+
+
+@dataclass
+class TradePlan:
+    """EVR TradePlan object with all required fields."""
+    ticker: str
+    setup: str
+    entry: float
+    stop: float
+    targets: List[float]
+    p_win: float
+    avg_r_win: float
+    avg_r_loss: float
+    expected_return: float
+    kelly_fraction: float
+    position_size: float
+    risk_dollars: float
+    notes: str
+    signal_type: str
+    confidence: float
+    take_profit: float
+    cost_bps: float
+    slippage_bps: float
+
+
+@dataclass
+class Signal:
+    """EVR Signal object."""
+    symbol: str
+    setup: str
+    direction: int  # 1 for long, -1 for short
+    strength: float
+    timestamp: datetime
+    features: Dict[str, float]
+
+
+class RollingBayes:
+    """Empirical Bayes probability estimation engine."""
+    
+    def __init__(self, window_size: int = 252, alpha: float = 1.0, beta: float = 1.0, 
+                 ewma_decay: float = 0.1, use_regimes: bool = False, regime_window: int = 63):
+        """Initialize RollingBayes engine.
+        
+        Args:
+            window_size: Rolling window size for historical data
+            alpha: Beta prior alpha parameter
+            beta: Beta prior beta parameter
+            ewma_decay: EWMA decay factor for return tracking
+            use_regimes: Whether to use volatility regime conditioning
+            regime_window: Window size for regime calculation
+        """
+        self.window_size = window_size
+        self.alpha = alpha
+        self.beta = beta
+        self.ewma_decay = ewma_decay
+        self.use_regimes = use_regimes
+        self.regime_window = regime_window
+        
+        # Storage for historical data
+        self.counters = defaultdict(lambda: {
+            'wins': 0, 'trades': 0, 'returns': [], 'timestamps': [],
+            'avg_win': 0.0, 'avg_loss': 0.0, 'ewma_win': 0.0, 'ewma_loss': 0.0
+        })
+        
+        # Regime storage
+        self.regime_counters = defaultdict(lambda: defaultdict(lambda: {
+            'wins': 0, 'trades': 0, 'returns': [], 'avg_win': 0.0, 'avg_loss': 0.0
+        }))
+    
+    def _get_key(self, setup: str, ticker: str, timeframe: str = '1d') -> Tuple[str, str, str]:
+        """Get storage key for counters."""
+        return (setup, ticker, timeframe)
+    
+    def _get_regime(self, volatility: float) -> str:
+        """Determine volatility regime."""
+        if volatility < 0.15:  # Low volatility
+            return 'low'
+        elif volatility < 0.30:  # Medium volatility
+            return 'medium'
+        else:  # High volatility
+            return 'high'
+    
+    def update(self, setup: str, ticker: str, timeframe: str, result: float, 
+               volatility: float = None, timestamp: datetime = None) -> None:
+        """Update counters with trade result.
+        
+        Args:
+            setup: Trading setup name
+            ticker: Stock ticker
+            timeframe: Timeframe (e.g., '1d')
+            result: Trade return (positive for win, negative for loss)
+            volatility: Current volatility (for regime conditioning)
+            timestamp: Trade timestamp
+        """
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        key = self._get_key(setup, ticker, timeframe)
+        counter = self.counters[key]
+        
+        # Update basic counters
+        counter['trades'] += 1
+        counter['returns'].append(result)
+        counter['timestamps'].append(timestamp)
+        
+        if result > 0:
+            counter['wins'] += 1
+        
+        # Maintain rolling window
+        if len(counter['returns']) > self.window_size:
+            old_return = counter['returns'].pop(0)
+            old_timestamp = counter['timestamps'].pop(0)
+            if old_return > 0:
+                counter['wins'] -= 1
+        
+        # Update EWMA for win/loss returns
+        if result > 0:
+            counter['ewma_win'] = (1 - self.ewma_decay) * counter['ewma_win'] + self.ewma_decay * result
+        else:
+            counter['ewma_loss'] = (1 - self.ewma_decay) * counter['ewma_loss'] + self.ewma_decay * result
+        
+        # Update regime counters if enabled
+        if self.use_regimes and volatility is not None:
+            regime = self._get_regime(volatility)
+            regime_key = self._get_key(setup, ticker, timeframe)
+            regime_counter = self.regime_counters[regime][regime_key]
+            
+            regime_counter['trades'] += 1
+            regime_counter['returns'].append(result)
+            
+            if result > 0:
+                regime_counter['wins'] += 1
+            
+            # Maintain regime window
+            if len(regime_counter['returns']) > self.regime_window:
+                old_return = regime_counter['returns'].pop(0)
+                if old_return > 0:
+                    regime_counter['wins'] -= 1
+    
+    def estimate(self, setup: str, ticker: str, timeframe: str = '1d', 
+                 volatility: float = None) -> Tuple[float, float, float]:
+        """Estimate probability and return parameters.
+        
+        Args:
+            setup: Trading setup name
+            ticker: Stock ticker
+            timeframe: Timeframe
+            volatility: Current volatility (for regime conditioning)
+            
+        Returns:
+            Tuple of (p_hat, avg_win, avg_loss)
+        """
+        key = self._get_key(setup, ticker, timeframe)
+        
+        # Use regime-specific estimates if enabled
+        if self.use_regimes and volatility is not None:
+            regime = self._get_regime(volatility)
+            regime_counter = self.regime_counters[regime][key]
+            
+            if regime_counter['trades'] >= 10:  # Minimum sample size
+                wins = regime_counter['wins']
+                trades = regime_counter['trades']
+                returns = regime_counter['returns']
+            else:
+                # Fall back to overall estimates
+                counter = self.counters[key]
+                wins = counter['wins']
+                trades = counter['trades']
+                returns = counter['returns']
+        else:
+            counter = self.counters[key]
+            wins = counter['wins']
+            trades = counter['trades']
+            returns = counter['returns']
+        
+        # Beta-Binomial smoothing
+        p_hat = (wins + self.alpha) / (trades + self.alpha + self.beta)
+        
+        # Calculate average win/loss
+        win_returns = [r for r in returns if r > 0]
+        loss_returns = [r for r in returns if r < 0]
+        
+        avg_win = np.mean(win_returns) if win_returns else 0.0
+        avg_loss = np.mean(loss_returns) if loss_returns else 0.0
+        
+        return p_hat, avg_win, avg_loss
+    
+    def get_ewma_estimates(self, setup: str, ticker: str, timeframe: str = '1d') -> Tuple[float, float]:
+        """Get EWMA-based return estimates.
+        
+        Returns:
+            Tuple of (ewma_win, ewma_loss)
+        """
+        key = self._get_key(setup, ticker, timeframe)
+        counter = self.counters[key]
+        return counter['ewma_win'], counter['ewma_loss']
+
+
+class FeatureClassifier:
+    """Feature-based classifier for probability estimation."""
+    
+    def __init__(self, use_calibration: bool = True, retrain_frequency: int = 252):
+        """Initialize feature classifier.
+        
+        Args:
+            use_calibration: Whether to use isotonic calibration
+            retrain_frequency: How often to retrain (in periods)
+        """
+        self.use_calibration = use_calibration
+        self.retrain_frequency = retrain_frequency
+        
+        if not ML_AVAILABLE:
+            raise ImportError("scikit-learn not available. Install with: pip install scikit-learn")
+        
+        # Initialize models
+        self.base_model = LogisticRegression(random_state=42, max_iter=1000)
+        
+        if use_calibration:
+            self.model = CalibratedClassifierCV(self.base_model, method='isotonic', cv=3)
+        else:
+            self.model = self.base_model
+        
+        # Training data storage
+        self.features_history = []
+        self.outcomes_history = []
+        self.timestamps_history = []
+        
+        # Performance tracking
+        self.brier_scores = []
+        self.roc_auc_scores = []
+        
+        self.last_retrain = datetime.now()
+    
+    def add_training_data(self, features: Dict[str, float], outcome: bool, timestamp: datetime = None) -> None:
+        """Add training data point.
+        
+        Args:
+            features: Feature dictionary
+            outcome: Whether trade was successful
+            timestamp: Data timestamp
+        """
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        self.features_history.append(features)
+        self.outcomes_history.append(outcome)
+        self.timestamps_history.append(timestamp)
+    
+    def _prepare_features(self, features: Dict[str, float]) -> np.ndarray:
+        """Prepare features for model input."""
+        # Convert to consistent feature vector
+        feature_names = [
+            'rsi', 'macd', 'bb_position', 'volume_ratio', 'momentum_5', 'momentum_10',
+            'volatility_20', 'stoch_k', 'williams_r', 'cci', 'atr_percentage', 'adx'
+        ]
+        
+        feature_vector = []
+        for name in feature_names:
+            value = features.get(name, 0.0)
+            # Handle NaN/inf values
+            if np.isnan(value) or np.isinf(value):
+                value = 0.0
+            feature_vector.append(value)
+        
+        return np.array(feature_vector).reshape(1, -1)
+    
+    def train(self) -> None:
+        """Train the classifier."""
+        if len(self.features_history) < 50:  # Minimum training samples
+            return
+        
+        # Prepare training data
+        X = []
+        y = []
+        
+        for features, outcome in zip(self.features_history, self.outcomes_history):
+            feature_vector = self._prepare_features(features)
+            X.append(feature_vector.flatten())
+            y.append(outcome)
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Train model
+        self.model.fit(X, y)
+        
+        # Evaluate performance
+        if len(y) > 10:
+            y_pred_proba = self.model.predict_proba(X)[:, 1]
+            
+            # Brier score
+            brier_score = brier_score_loss(y, y_pred_proba)
+            self.brier_scores.append(brier_score)
+            
+            # ROC-AUC
+            try:
+                roc_auc = roc_auc_score(y, y_pred_proba)
+                self.roc_auc_scores.append(roc_auc)
+            except ValueError:
+                pass  # Handle case where only one class present
+        
+        self.last_retrain = datetime.now()
+    
+    def predict_probability(self, features: Dict[str, float]) -> float:
+        """Predict probability of success.
+        
+        Args:
+            features: Feature dictionary
+            
+        Returns:
+            Probability of success (0-1)
+        """
+        if len(self.features_history) < 10:
+            return 0.5  # Default probability
+        
+        # Check if retraining is needed
+        if (datetime.now() - self.last_retrain).days >= self.retrain_frequency:
+            self.train()
+        
+        # Prepare features and predict
+        feature_vector = self._prepare_features(features)
+        
+        try:
+            prob = self.model.predict_proba(feature_vector)[0, 1]
+            return float(prob)
+        except:
+            return 0.5  # Fallback to default
+
+
+class CostModel:
+    """Cost and slippage modeling."""
+    
+    def __init__(self, commission_bps: float = 1.0, slippage_bps: float = 5.0, 
+                 slippage_atr_multiplier: float = 0.5):
+        """Initialize cost model.
+        
+        Args:
+            commission_bps: Commission per trade in basis points
+            slippage_bps: Fixed slippage in basis points
+            slippage_atr_multiplier: ATR-based slippage multiplier
+        """
+        self.commission_bps = commission_bps
+        self.slippage_bps = slippage_bps
+        self.slippage_atr_multiplier = slippage_atr_multiplier
+    
+    def calculate_costs(self, entry_price: float, atr_percentage: float, 
+                      position_size: float) -> Tuple[float, float]:
+        """Calculate total costs for a trade.
+        
+        Args:
+            entry_price: Entry price
+            atr_percentage: ATR as percentage of price
+            position_size: Position size in dollars
+            
+        Returns:
+            Tuple of (commission_cost, slippage_cost)
+        """
+        # Commission cost
+        commission_cost = position_size * (self.commission_bps / 10000)
+        
+        # Slippage cost (fixed + ATR-based)
+        fixed_slippage = position_size * (self.slippage_bps / 10000)
+        atr_slippage = position_size * (atr_percentage / 100) * self.slippage_atr_multiplier
+        slippage_cost = fixed_slippage + atr_slippage
+        
+        return commission_cost, slippage_cost
+
+
+class KellySizing:
+    """Kelly fraction sizing calculation."""
+    
+    def __init__(self, kelly_fraction: float = 0.25, max_kelly_fraction: float = 0.5,
+                 max_position_size: float = 0.1, min_position_size: float = 0.001):
+        """Initialize Kelly sizing.
+        
+        Args:
+            kelly_fraction: Fraction of Kelly to use (e.g., 0.25 for quarter-Kelly)
+            max_kelly_fraction: Maximum Kelly fraction allowed
+            max_position_size: Maximum position size as fraction of equity
+            min_position_size: Minimum position size as fraction of equity
+        """
+        self.kelly_fraction = kelly_fraction
+        self.max_kelly_fraction = max_kelly_fraction
+        self.max_position_size = max_position_size
+        self.min_position_size = min_position_size
+    
+    def calculate_kelly_fraction(self, p_win: float, avg_win: float, avg_loss: float) -> float:
+        """Calculate Kelly fraction.
+        
+        Args:
+            p_win: Probability of winning
+            avg_win: Average win return
+            avg_loss: Average loss return (should be negative)
+            
+        Returns:
+            Kelly fraction (0-1)
+        """
+        if avg_loss == 0 or p_win <= 0 or p_win >= 1:
+            return 0.0
+        
+        # Kelly formula: f* = (b*p - q) / b, where b = avg_win/|avg_loss|
+        b = avg_win / abs(avg_loss)
+        q = 1 - p_win
+        
+        kelly = (b * p_win - q) / b
+        
+        # Apply constraints
+        kelly = max(0, min(kelly, self.max_kelly_fraction))
+        
+        # Apply fractional Kelly
+        kelly *= self.kelly_fraction
+        
+        return kelly
+    
+    def size_position(self, equity: float, entry_price: float, stop_price: float,
+                      kelly_fraction: float) -> Tuple[float, float]:
+        """Calculate position size.
+        
+        Args:
+            equity: Available equity
+            entry_price: Entry price
+            stop_price: Stop loss price
+            kelly_fraction: Kelly fraction
+            
+        Returns:
+            Tuple of (position_size_dollars, shares)
+        """
+        # Risk per share
+        risk_per_share = abs(entry_price - stop_price)
+        
+        if risk_per_share == 0:
+            return 0.0, 0
+        
+        # Position size based on Kelly
+        position_size_dollars = kelly_fraction * equity
+        
+        # Apply position size constraints
+        max_position_dollars = self.max_position_size * equity
+        min_position_dollars = self.min_position_size * equity
+        
+        position_size_dollars = max(min_position_dollars, 
+                                  min(position_size_dollars, max_position_dollars))
+        
+        # Calculate shares
+        shares = int(position_size_dollars / entry_price)
+        
+        # Adjust for actual position size
+        actual_position_size = shares * entry_price
+        
+        return actual_position_size, shares
+
+
+class RiskGuards:
+    """Risk management and circuit breakers."""
+    
+    def __init__(self, initial_capital: float = 100000, max_position_size: float = 0.1,
+                 daily_loss_limit: float = 0.03, weekly_loss_limit: float = 0.08,
+                 max_drawdown_limit: float = 0.15, max_positions: int = 20):
+        """Initialize risk guards.
+        
+        Args:
+            initial_capital: Initial capital
+            max_position_size: Maximum position size as fraction of equity
+            daily_loss_limit: Daily loss limit as fraction of equity
+            weekly_loss_limit: Weekly loss limit as fraction of equity
+            max_drawdown_limit: Maximum drawdown limit as fraction of equity
+            max_positions: Maximum number of concurrent positions
+        """
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.max_position_size = max_position_size
+        self.daily_loss_limit = daily_loss_limit
+        self.weekly_loss_limit = weekly_loss_limit
+        self.max_drawdown_limit = max_drawdown_limit
+        self.max_positions = max_positions
+        
+        # Risk tracking
+        self.current_positions = {}
+        self.daily_pnl = 0.0
+        self.weekly_pnl = 0.0
+        self.peak_capital = initial_capital
+        self.last_reset_date = datetime.now().date()
+        
+        # Circuit breakers
+        self.daily_loss_breached = False
+        self.weekly_loss_breached = False
+        self.drawdown_breached = False
+    
+    def check_trade_plan(self, trade_plan: TradePlan) -> Dict[str, Any]:
+        """Check if trade plan passes risk guards.
+        
+        Args:
+            trade_plan: Trade plan to check
+            
+        Returns:
+            Dictionary with check results
+        """
+        checks = {
+            'position_size_ok': True,
+            'daily_loss_ok': True,
+            'weekly_loss_ok': True,
+            'drawdown_ok': True,
+            'max_positions_ok': True,
+            'all_checks_passed': True
+        }
+        
+        # Check position size
+        position_fraction = trade_plan.position_size / self.current_capital
+        if position_fraction > self.max_position_size:
+            checks['position_size_ok'] = False
+            checks['all_checks_passed'] = False
+        
+        # Check daily loss limit
+        if self.daily_loss_breached:
+            checks['daily_loss_ok'] = False
+            checks['all_checks_passed'] = False
+        
+        # Check weekly loss limit
+        if self.weekly_loss_breached:
+            checks['weekly_loss_ok'] = False
+            checks['all_checks_passed'] = False
+        
+        # Check drawdown limit
+        if self.drawdown_breached:
+            checks['drawdown_ok'] = False
+            checks['all_checks_passed'] = False
+        
+        # Check max positions
+        if len(self.current_positions) >= self.max_positions:
+            checks['max_positions_ok'] = False
+            checks['all_checks_passed'] = False
+        
+        return checks
+    
+    def update_pnl(self, pnl: float) -> None:
+        """Update P&L and check circuit breakers."""
+        self.current_capital += pnl
+        self.daily_pnl += pnl
+        self.weekly_pnl += pnl
+        
+        # Update peak capital
+        if self.current_capital > self.peak_capital:
+            self.peak_capital = self.current_capital
+        
+        # Check circuit breakers
+        self._check_circuit_breakers()
+    
+    def _check_circuit_breakers(self) -> None:
+        """Check and update circuit breaker status."""
+        # Daily loss breaker
+        if self.daily_pnl < -self.daily_loss_limit * self.current_capital:
+            self.daily_loss_breached = True
+        
+        # Weekly loss breaker
+        if self.weekly_pnl < -self.weekly_loss_limit * self.current_capital:
+            self.weekly_loss_breached = True
+        
+        # Drawdown breaker
+        drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
+        if drawdown > self.max_drawdown_limit:
+            self.drawdown_breached = True
+    
+    def reset_daily(self) -> None:
+        """Reset daily counters."""
+        self.daily_pnl = 0.0
+        self.daily_loss_breached = False
+    
+    def reset_weekly(self) -> None:
+        """Reset weekly counters."""
+        self.weekly_pnl = 0.0
+        self.weekly_loss_breached = False
 
 
 def get_us_tickers(exchange: str) -> pd.DataFrame:
@@ -65,13 +657,16 @@ def get_us_tickers(exchange: str) -> pd.DataFrame:
 
 
 class OfficialTickerScanner:
-    """Official ticker scanner using NASDAQ's data sources."""
+    """Official ticker scanner with full EVR framework integration."""
     
-    def __init__(self, log_level: str = "INFO"):
-        """Initialize the scanner with logging.
+    def __init__(self, log_level: str = "INFO", use_ml_classifier: bool = False,
+                 initial_capital: float = 100000):
+        """Initialize the scanner with EVR framework.
         
         Args:
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
+            use_ml_classifier: Whether to use ML classifier for probability estimation
+            initial_capital: Initial capital for risk management
         """
         self.console = Console()
         
@@ -92,7 +687,58 @@ class OfficialTickerScanner:
         self.cache_dir = Path("cache")
         self.cache_dir.mkdir(exist_ok=True)
         
-        self.logger.info("OfficialTickerScanner initialized")
+        # Initialize EVR framework components
+        self.prob_model = RollingBayes(
+            window_size=252,
+            alpha=1.0,
+            beta=1.0,
+            ewma_decay=0.1,
+            use_regimes=True,
+            regime_window=63
+        )
+        
+        # Initialize ML classifier if requested and available
+        self.use_ml_classifier = use_ml_classifier and ML_AVAILABLE
+        if self.use_ml_classifier:
+            self.ml_classifier = FeatureClassifier(
+                use_calibration=True,
+                retrain_frequency=252
+            )
+            self.logger.info("ML classifier enabled")
+        else:
+            self.ml_classifier = None
+            if use_ml_classifier and not ML_AVAILABLE:
+                self.logger.warning("ML classifier requested but scikit-learn not available")
+        
+        # Initialize cost model
+        self.cost_model = CostModel(
+            commission_bps=1.0,
+            slippage_bps=5.0,
+            slippage_atr_multiplier=0.5
+        )
+        
+        # Initialize Kelly sizing
+        self.kelly_sizing = KellySizing(
+            kelly_fraction=0.25,
+            max_kelly_fraction=0.5,
+            max_position_size=0.1,
+            min_position_size=0.001
+        )
+        
+        # Initialize risk guards
+        self.risk_guards = RiskGuards(
+            initial_capital=initial_capital,
+            max_position_size=0.1,
+            daily_loss_limit=0.03,
+            weekly_loss_limit=0.08,
+            max_drawdown_limit=0.15,
+            max_positions=20
+        )
+        
+        # Storage for trade plans
+        self.trade_plans = []
+        
+        self.logger.info("OfficialTickerScanner with EVR framework initialized")
     
     def get_comprehensive_tickers(self, use_cache: bool = True) -> List[str]:
         """Get comprehensive list of NYSE and NASDAQ tickers.
@@ -197,24 +843,30 @@ class OfficialTickerScanner:
             close = data['Close']
             high = data['High']
             low = data['Low']
+            open_price = data['Open']
             volume = data['Volume']
+            current_price = float(close.iloc[-1])
             
             # Moving averages
-            indicators['sma_20'] = close.rolling(20).mean().iloc[-1]
-            indicators['sma_50'] = close.rolling(50).mean().iloc[-1]
-            indicators['ema_12'] = close.ewm(span=12).mean().iloc[-1]
-            indicators['ema_26'] = close.ewm(span=26).mean().iloc[-1]
+            indicators['sma_20'] = float(close.rolling(20).mean().iloc[-1])
+            indicators['sma_50'] = float(close.rolling(50).mean().iloc[-1])
+            indicators['ema_12'] = float(close.ewm(span=12).mean().iloc[-1])
+            indicators['ema_26'] = float(close.ewm(span=26).mean().iloc[-1])
             
             # RSI
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
             rs = gain / loss
-            indicators['rsi'] = 100 - (100 / (1 + rs)).iloc[-1]
+            rs_value = rs.iloc[-1]
+            if pd.isna(rs_value) or rs_value == 0:
+                indicators['rsi'] = 50.0  # Neutral RSI
+            else:
+                indicators['rsi'] = float(100 - (100 / (1 + rs_value)))
             
             # MACD
             macd_line = indicators['ema_12'] - indicators['ema_26']
-            signal_line = pd.Series([macd_line]).ewm(span=9).mean().iloc[-1]
+            signal_line = float(pd.Series([macd_line]).ewm(span=9).mean().iloc[-1])
             indicators['macd'] = macd_line
             indicators['macd_signal'] = signal_line
             indicators['macd_histogram'] = macd_line - signal_line
@@ -224,29 +876,131 @@ class OfficialTickerScanner:
             bb_std = close.rolling(20).std()
             bb_upper = bb_middle + (bb_std * 2)
             bb_lower = bb_middle - (bb_std * 2)
-            indicators['bb_upper'] = bb_upper.iloc[-1]
-            indicators['bb_lower'] = bb_lower.iloc[-1]
-            indicators['bb_position'] = (close.iloc[-1] - bb_lower.iloc[-1]) / (bb_upper.iloc[-1] - bb_lower.iloc[-1])
+            indicators['bb_upper'] = float(bb_upper.iloc[-1])
+            indicators['bb_lower'] = float(bb_lower.iloc[-1])
+            
+            # BB Position with division by zero protection
+            bb_range = bb_upper.iloc[-1] - bb_lower.iloc[-1]
+            if bb_range > 0:
+                indicators['bb_position'] = float((close.iloc[-1] - bb_lower.iloc[-1]) / bb_range)
+            else:
+                indicators['bb_position'] = 0.5  # Neutral position
             
             # Volume indicators
-            indicators['volume_sma'] = volume.rolling(20).mean().iloc[-1]
-            indicators['volume_ratio'] = volume.iloc[-1] / indicators['volume_sma']
+            indicators['volume_sma'] = float(volume.rolling(20).mean().iloc[-1])
+            if indicators['volume_sma'] > 0:
+                indicators['volume_ratio'] = float(volume.iloc[-1] / indicators['volume_sma'])
+            else:
+                indicators['volume_ratio'] = 1.0  # Default ratio
             
             # Price momentum
-            indicators['momentum_5'] = (close.iloc[-1] / close.iloc[-6] - 1) * 100
-            indicators['momentum_10'] = (close.iloc[-1] / close.iloc[-11] - 1) * 100
+            indicators['momentum_5'] = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
+            indicators['momentum_10'] = float((close.iloc[-1] / close.iloc[-11] - 1) * 100)
             
             # Volatility
             returns = close.pct_change()
-            indicators['volatility_20'] = returns.rolling(20).std().iloc[-1] * np.sqrt(252) * 100
+            indicators['volatility_20'] = float(returns.rolling(20).std().iloc[-1] * np.sqrt(252) * 100)
+            
+            # Support and Resistance levels
+            high_20 = high.rolling(20).max()
+            low_20 = low.rolling(20).min()
+            indicators['resistance_level'] = float(high_20.iloc[-1])
+            indicators['support_level'] = float(low_20.iloc[-1])
+            indicators['resistance_distance'] = float((indicators['resistance_level'] - current_price) / current_price * 100)
+            indicators['support_distance'] = float((current_price - indicators['support_level']) / current_price * 100)
+            
+            # Stochastic Oscillator
+            lowest_low = low.rolling(14).min()
+            highest_high = high.rolling(14).max()
+            stoch_range = highest_high - lowest_low
+            k_percent = pd.Series(index=close.index, dtype=float)
+            k_percent[stoch_range > 0] = 100 * ((close - lowest_low) / stoch_range)[stoch_range > 0]
+            k_percent[stoch_range <= 0] = 50.0  # Neutral value
+            indicators['stoch_k'] = float(k_percent.iloc[-1])
+            indicators['stoch_d'] = float(k_percent.rolling(3).mean().iloc[-1])
+            
+            # Williams %R
+            williams_range = highest_high.iloc[-1] - lowest_low.iloc[-1]
+            if williams_range > 0:
+                indicators['williams_r'] = float(-100 * ((highest_high.iloc[-1] - current_price) / williams_range))
+            else:
+                indicators['williams_r'] = -50.0  # Neutral value
+            
+            # Commodity Channel Index (CCI)
+            typical_price = (high + low + close) / 3
+            sma_tp = typical_price.rolling(20).mean()
+            mad = typical_price.rolling(20).apply(lambda x: np.mean(np.abs(x - x.mean())))
+            mad_value = mad.iloc[-1]
+            if mad_value > 0:
+                indicators['cci'] = float((typical_price.iloc[-1] - sma_tp.iloc[-1]) / (0.015 * mad_value))
+            else:
+                indicators['cci'] = 0.0  # Neutral CCI
+            
+            # Average True Range (ATR)
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            indicators['atr'] = float(true_range.rolling(14).mean().iloc[-1])
+            indicators['atr_percentage'] = float((indicators['atr'] / current_price) * 100)
+            
+            # Price patterns (simplified)
+            high_low_range = high.iloc[-1] - low.iloc[-1]
+            if high_low_range > 0:
+                indicators['doji'] = bool(abs(close.iloc[-1] - open_price.iloc[-1]) / high_low_range < 0.1)
+            else:
+                indicators['doji'] = False
+            indicators['hammer'] = bool((close.iloc[-1] > open_price.iloc[-1]) and ((close.iloc[-1] - low.iloc[-1]) > 2 * (high.iloc[-1] - close.iloc[-1])))
+            indicators['engulfing'] = bool((close.iloc[-1] > open_price.iloc[-1]) and (close.iloc[-2] < open_price.iloc[-2]) and (open_price.iloc[-1] < close.iloc[-2]) and (close.iloc[-1] > open_price.iloc[-2]))
+            
+            # Trend strength
+            indicators['adx'] = self._calculate_adx(high, low, close)
             
         except Exception as e:
             self.logger.debug(f"Error calculating indicators: {e}")
+            import traceback
+            self.logger.debug(f"Traceback: {traceback.format_exc()}")
             return {}
         
         return indicators
     
-    def generate_signals(self, ticker: str, data: pd.DataFrame, indicators: Dict[str, float]) -> List[Dict[str, Any]]:
+    def _calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
+        """Calculate Average Directional Index (ADX)."""
+        try:
+            # True Range
+            tr1 = high - low
+            tr2 = abs(high - close.shift(1))
+            tr3 = abs(low - close.shift(1))
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            
+            # Directional Movement
+            dm_plus = high.diff()
+            dm_minus = -low.diff()
+            dm_plus[dm_plus < 0] = 0
+            dm_minus[dm_minus < 0] = 0
+            
+            # Smoothed values
+            tr_smooth = tr.ewm(alpha=1/period).mean()
+            dm_plus_smooth = dm_plus.ewm(alpha=1/period).mean()
+            dm_minus_smooth = dm_minus.ewm(alpha=1/period).mean()
+            
+            # Directional Indicators
+            di_plus = 100 * (dm_plus_smooth / tr_smooth)
+            di_minus = 100 * (dm_minus_smooth / tr_smooth)
+            
+            # ADX
+            di_sum = di_plus + di_minus
+            if di_sum.iloc[-1] > 0:
+                dx = 100 * abs(di_plus - di_minus) / di_sum
+            else:
+                dx = pd.Series(0, index=di_plus.index)
+            adx = dx.ewm(alpha=1/period).mean()
+            
+            return adx.iloc[-1] if not pd.isna(adx.iloc[-1]) else 0
+        except:
+            return 0
+    
+    def generate_signals(self, ticker: str, data: pd.DataFrame, indicators: Dict[str, float]) -> List[Signal]:
         """Generate trading signals based on technical indicators.
         
         Args:
@@ -255,7 +1009,7 @@ class OfficialTickerScanner:
             indicators: Calculated technical indicators
             
         Returns:
-            List of trading signals
+            List of EVR Signal objects
         """
         signals = []
         
@@ -263,107 +1017,351 @@ class OfficialTickerScanner:
             return signals
         
         current_price = data['Close'].iloc[-1]
+        timestamp = datetime.now()
         
         # Signal 1: Moving Average Crossover
         if indicators.get('sma_20', 0) > indicators.get('sma_50', 0):
             if current_price > indicators['sma_20']:
-                signals.append({
-                    'ticker': ticker,
-                    'signal_type': 'ma_crossover',
-                    'direction': 'LONG',
-                    'entry_price': current_price,
-                    'stop_loss': current_price * 0.95,  # 5% stop loss
-                    'take_profit': current_price * 1.10,  # 10% take profit
-                    'confidence': 0.7,
-                    'reason': 'Price above 20-day SMA, which is above 50-day SMA'
-                })
+                signals.append(Signal(
+                    symbol=ticker,
+                    setup='ma_crossover',
+                    direction=1,  # Long
+                    strength=0.7,
+                    timestamp=timestamp,
+                    features=indicators.copy()
+                ))
         
         # Signal 2: RSI Oversold/Overbought
         rsi = indicators.get('rsi', 50)
         if rsi < 30:  # Oversold
-            signals.append({
-                'ticker': ticker,
-                'signal_type': 'rsi_oversold',
-                'direction': 'LONG',
-                'entry_price': current_price,
-                'stop_loss': current_price * 0.92,  # 8% stop loss
-                'take_profit': current_price * 1.08,  # 8% take profit
-                'confidence': 0.6,
-                'reason': f'RSI oversold at {rsi:.1f}'
-            })
+            signals.append(Signal(
+                symbol=ticker,
+                setup='rsi_oversold',
+                direction=1,  # Long
+                strength=0.6,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
         elif rsi > 70:  # Overbought
-            signals.append({
-                'ticker': ticker,
-                'signal_type': 'rsi_overbought',
-                'direction': 'SHORT',
-                'entry_price': current_price,
-                'stop_loss': current_price * 1.08,  # 8% stop loss
-                'take_profit': current_price * 0.92,  # 8% take profit
-                'confidence': 0.6,
-                'reason': f'RSI overbought at {rsi:.1f}'
-            })
+            signals.append(Signal(
+                symbol=ticker,
+                setup='rsi_overbought',
+                direction=-1,  # Short
+                strength=0.6,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
         
         # Signal 3: MACD Signal
         macd = indicators.get('macd', 0)
         macd_signal = indicators.get('macd_signal', 0)
         if macd > macd_signal and indicators.get('macd_histogram', 0) > 0:
-            signals.append({
-                'ticker': ticker,
-                'signal_type': 'macd_bullish',
-                'direction': 'LONG',
-                'entry_price': current_price,
-                'stop_loss': current_price * 0.96,  # 4% stop loss
-                'take_profit': current_price * 1.12,  # 12% take profit
-                'confidence': 0.65,
-                'reason': 'MACD bullish crossover'
-            })
+            signals.append(Signal(
+                symbol=ticker,
+                setup='macd_bullish',
+                direction=1,  # Long
+                strength=0.65,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
         
         # Signal 4: Bollinger Band Breakout
         bb_position = indicators.get('bb_position', 0.5)
         if bb_position > 0.8:  # Near upper band
-            signals.append({
-                'ticker': ticker,
-                'signal_type': 'bb_breakout',
-                'direction': 'LONG',
-                'entry_price': current_price,
-                'stop_loss': current_price * 0.94,  # 6% stop loss
-                'take_profit': current_price * 1.15,  # 15% take profit
-                'confidence': 0.55,
-                'reason': f'Price near upper Bollinger Band (position: {bb_position:.2f})'
-            })
+            signals.append(Signal(
+                symbol=ticker,
+                setup='bb_breakout',
+                direction=1,  # Long
+                strength=0.55,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
         
         # Signal 5: Volume Confirmation
         volume_ratio = indicators.get('volume_ratio', 1.0)
         if volume_ratio > 1.5:  # High volume
             momentum_5 = indicators.get('momentum_5', 0)
             if momentum_5 > 2:  # Positive momentum
-                signals.append({
-                    'ticker': ticker,
-                    'signal_type': 'volume_momentum',
-                    'direction': 'LONG',
-                    'entry_price': current_price,
-                    'stop_loss': current_price * 0.93,  # 7% stop loss
-                    'take_profit': current_price * 1.13,  # 13% take profit
-                    'confidence': 0.6,
-                    'reason': f'High volume ({volume_ratio:.1f}x) with positive momentum ({momentum_5:.1f}%)'
-                })
+                signals.append(Signal(
+                    symbol=ticker,
+                    setup='volume_momentum',
+                    direction=1,  # Long
+                    strength=0.6,
+                    timestamp=timestamp,
+                    features=indicators.copy()
+                ))
+        
+        # Signal 6: Stochastic Oscillator
+        stoch_k = indicators.get('stoch_k', 50)
+        stoch_d = indicators.get('stoch_d', 50)
+        if stoch_k < 20 and stoch_d < 20:  # Oversold
+            signals.append(Signal(
+                symbol=ticker,
+                setup='stoch_oversold',
+                direction=1,  # Long
+                strength=0.65,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        elif stoch_k > 80 and stoch_d > 80:  # Overbought
+            signals.append(Signal(
+                symbol=ticker,
+                setup='stoch_overbought',
+                direction=-1,  # Short
+                strength=0.65,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        # Signal 7: Williams %R
+        williams_r = indicators.get('williams_r', -50)
+        if williams_r < -80:  # Oversold
+            signals.append(Signal(
+                symbol=ticker,
+                setup='williams_oversold',
+                direction=1,  # Long
+                strength=0.62,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        elif williams_r > -20:  # Overbought
+            signals.append(Signal(
+                symbol=ticker,
+                setup='williams_overbought',
+                direction=-1,  # Short
+                strength=0.62,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        # Signal 8: Commodity Channel Index (CCI)
+        cci = indicators.get('cci', 0)
+        if cci < -100:  # Oversold
+            signals.append(Signal(
+                symbol=ticker,
+                setup='cci_oversold',
+                direction=1,  # Long
+                strength=0.68,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        elif cci > 100:  # Overbought
+            signals.append(Signal(
+                symbol=ticker,
+                setup='cci_overbought',
+                direction=-1,  # Short
+                strength=0.68,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        # Signal 9: Support and Resistance Levels
+        support_distance = indicators.get('support_distance', 100)
+        resistance_distance = indicators.get('resistance_distance', 100)
+        if support_distance < 2:  # Near support
+            signals.append(Signal(
+                symbol=ticker,
+                setup='support_bounce',
+                direction=1,  # Long
+                strength=0.72,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        elif resistance_distance < 2:  # Near resistance
+            signals.append(Signal(
+                symbol=ticker,
+                setup='resistance_rejection',
+                direction=-1,  # Short
+                strength=0.72,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        # Signal 10: Price Patterns
+        if indicators.get('hammer', False):
+            signals.append(Signal(
+                symbol=ticker,
+                setup='hammer_pattern',
+                direction=1,  # Long
+                strength=0.75,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        if indicators.get('engulfing', False):
+            signals.append(Signal(
+                symbol=ticker,
+                setup='engulfing_pattern',
+                direction=1,  # Long
+                strength=0.78,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        if indicators.get('doji', False):
+            signals.append(Signal(
+                symbol=ticker,
+                setup='doji_pattern',
+                direction=1,  # Neutral signal, default to long
+                strength=0.55,
+                timestamp=timestamp,
+                features=indicators.copy()
+            ))
+        
+        # Signal 11: Trend Strength (ADX)
+        adx = indicators.get('adx', 0)
+        if adx > 25:  # Strong trend
+            if indicators.get('sma_20', 0) > indicators.get('sma_50', 0):
+                signals.append(Signal(
+                    symbol=ticker,
+                    setup='strong_uptrend',
+                    direction=1,  # Long
+                    strength=0.80,
+                    timestamp=timestamp,
+                    features=indicators.copy()
+                ))
+            else:
+                signals.append(Signal(
+                    symbol=ticker,
+                    setup='strong_downtrend',
+                    direction=-1,  # Short
+                    strength=0.80,
+                    timestamp=timestamp,
+                    features=indicators.copy()
+                ))
+        
+        # Signal 12: Volatility Breakout
+        volatility = indicators.get('volatility_20', 0)
+        atr_percentage = indicators.get('atr_percentage', 0)
+        if volatility > 30 and atr_percentage > 2:  # High volatility
+            momentum_5 = indicators.get('momentum_5', 0)
+            if abs(momentum_5) > 5:  # Strong momentum
+                direction = 1 if momentum_5 > 0 else -1
+                signals.append(Signal(
+                    symbol=ticker,
+                    setup='volatility_breakout',
+                    direction=direction,
+                    strength=0.70,
+                    timestamp=timestamp,
+                    features=indicators.copy()
+                ))
         
         return signals
     
-    def scan_tickers(self, tickers: List[str], max_tickers: int = 100) -> List[Dict[str, Any]]:
+    def create_trade_plan(self, signal: Signal, data: pd.DataFrame) -> Optional[TradePlan]:
+        """Create TradePlan from EVR Signal.
+        
+        Args:
+            signal: EVR Signal object
+            data: Stock price data
+            
+        Returns:
+            TradePlan object or None if creation fails
+        """
+        try:
+            current_price = float(data['Close'].iloc[-1])
+            atr_percentage = signal.features.get('atr_percentage', 2.0)
+            volatility = signal.features.get('volatility_20', 0.2)
+            
+            # Get probability estimates
+            if self.use_ml_classifier and self.ml_classifier:
+                p_win = self.ml_classifier.predict_probability(signal.features)
+            else:
+                p_win, avg_win, avg_loss = self.prob_model.estimate(
+                    signal.setup, signal.symbol, volatility=volatility
+                )
+            
+            # Calculate entry, stop, and targets
+            if signal.direction == 1:  # Long
+                entry = current_price
+                stop = current_price * (1 - atr_percentage / 100 * 2)  # 2x ATR stop
+                take_profit = current_price * (1 + atr_percentage / 100 * 4)  # 4x ATR target
+                targets = [take_profit]
+            else:  # Short
+                entry = current_price
+                stop = current_price * (1 + atr_percentage / 100 * 2)  # 2x ATR stop
+                take_profit = current_price * (1 - atr_percentage / 100 * 4)  # 4x ATR target
+                targets = [take_profit]
+            
+            # Calculate Kelly fraction
+            kelly_fraction = self.kelly_sizing.calculate_kelly_fraction(p_win, avg_win, avg_loss)
+            
+            # Calculate position size
+            position_size, shares = self.kelly_sizing.size_position(
+                self.risk_guards.current_capital, entry, stop, kelly_fraction
+            )
+            
+            # Calculate costs
+            commission_cost, slippage_cost = self.cost_model.calculate_costs(
+                entry, atr_percentage, position_size
+            )
+            
+            # Calculate expected return
+            if signal.direction == 1:
+                potential_return = (take_profit - entry) / entry
+                potential_loss = (entry - stop) / entry
+            else:
+                potential_return = (entry - take_profit) / entry
+                potential_loss = (stop - entry) / entry
+            
+            expected_return = p_win * potential_return - (1 - p_win) * potential_loss
+            
+            # Calculate risk in dollars
+            risk_dollars = abs(entry - stop) * shares
+            
+            # Create TradePlan
+            trade_plan = TradePlan(
+                ticker=signal.symbol,
+                setup=signal.setup,
+                entry=entry,
+                stop=stop,
+                targets=targets,
+                p_win=p_win,
+                avg_r_win=avg_win,
+                avg_r_loss=avg_loss,
+                expected_return=expected_return,
+                kelly_fraction=kelly_fraction,
+                position_size=position_size,
+                risk_dollars=risk_dollars,
+                notes=f"Generated from {signal.setup} signal",
+                signal_type=signal.setup,
+                confidence=signal.strength,
+                take_profit=take_profit,
+                cost_bps=(commission_cost + slippage_cost) / position_size * 10000,
+                slippage_bps=slippage_cost / position_size * 10000
+            )
+            
+            return trade_plan
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to create trade plan for {signal.symbol}: {e}")
+            return None
+    
+    
+    def scan_tickers(self, tickers: List[str], max_tickers: int = 100) -> List[TradePlan]:
         """Scan tickers for trading signals.
         
         Args:
             tickers: List of ticker symbols
-            max_tickers: Maximum number of tickers to scan
+            max_tickers: Maximum number of tickers to scan (None for all tickers)
             
         Returns:
-            List of trading signals
+            List of TradePlan objects
         """
-        self.logger.info(f"Starting scan of {min(len(tickers), max_tickers)} tickers")
+        import random
         
-        all_signals = []
-        processed_tickers = tickers[:max_tickers]
+        # Determine how many tickers to scan
+        if max_tickers is None or max_tickers >= len(tickers):
+            tickers_to_scan = len(tickers)
+            processed_tickers = tickers
+            self.logger.info(f"Starting scan of all {tickers_to_scan} tickers")
+        else:
+            tickers_to_scan = max_tickers
+            # Use random sampling to avoid alphabetical bias
+            processed_tickers = random.sample(tickers, tickers_to_scan)
+            self.logger.info(f"Starting scan of {tickers_to_scan} randomly selected tickers from {len(tickers)} total")
+        
+        all_trade_plans = []
         
         with Progress(
             SpinnerColumn(),
@@ -374,7 +1372,7 @@ class OfficialTickerScanner:
             TimeRemainingColumn(),
             console=self.console,
         ) as progress:
-            task = progress.add_task("Scanning tickers...", total=len(processed_tickers))
+            task = progress.add_task("Scanning tickers...", total=tickers_to_scan)
             
             for i, ticker in enumerate(processed_tickers):
                 try:
@@ -394,7 +1392,15 @@ class OfficialTickerScanner:
                     
                     # Generate signals
                     signals = self.generate_signals(ticker, data, indicators)
-                    all_signals.extend(signals)
+                    
+                    # Convert signals to trade plans
+                    for signal in signals:
+                        trade_plan = self.create_trade_plan(signal, data)
+                        if trade_plan is not None:
+                            # Check risk guards
+                            risk_checks = self.risk_guards.check_trade_plan(trade_plan)
+                            if risk_checks['all_checks_passed']:
+                                all_trade_plans.append(trade_plan)
                     
                     if signals:
                         self.logger.debug(f"Generated {len(signals)} signals for {ticker}")
@@ -407,177 +1413,574 @@ class OfficialTickerScanner:
                     progress.advance(task)
                     continue
         
-        # Sort by confidence and calculate additional metrics
-        for signal in all_signals:
-            # Calculate risk-reward ratio
-            if signal['direction'] == 'LONG':
-                risk = signal['entry_price'] - signal['stop_loss']
-                reward = signal['take_profit'] - signal['entry_price']
-            else:
-                risk = signal['stop_loss'] - signal['entry_price']
-                reward = signal['entry_price'] - signal['take_profit']
-            
-            signal['risk_reward_ratio'] = reward / risk if risk > 0 else 0
-            signal['risk_percentage'] = abs(risk / signal['entry_price']) * 100
-            signal['reward_percentage'] = abs(reward / signal['entry_price']) * 100
-            
-            # Calculate expected return (simplified)
-            signal['expected_return'] = signal['confidence'] * signal['reward_percentage'] / 100
+        # Rank by expected growth proxy: E[log(1 + f_used·R)]
+        def expected_growth_score(trade_plan: TradePlan) -> float:
+            """Calculate expected growth score for ranking."""
+            try:
+                # Expected growth = E[log(1 + f_used·R)]
+                # Approximate using Taylor expansion: E[log(1 + f·R)] ≈ f·E[R] - 0.5·f²·Var[R]
+                
+                f_used = trade_plan.kelly_fraction
+                expected_return = trade_plan.expected_return
+                
+                # Estimate variance from win/loss probabilities
+                p_win = trade_plan.p_win
+                avg_win = trade_plan.avg_r_win
+                avg_loss = trade_plan.avg_r_loss
+                
+                # Variance approximation
+                variance = p_win * (avg_win - expected_return)**2 + (1 - p_win) * (avg_loss - expected_return)**2
+                
+                # Expected growth score
+                growth_score = f_used * expected_return - 0.5 * f_used**2 * variance
+                
+                return growth_score
+            except:
+                return 0.0
         
-        # Sort by expected return
-        all_signals.sort(key=lambda x: x['expected_return'], reverse=True)
+        # Sort by expected growth score
+        all_trade_plans.sort(key=expected_growth_score, reverse=True)
         
-        self.logger.info(f"Scan completed: {len(all_signals)} signals from {len(processed_tickers)} tickers")
-        return all_signals
+        self.logger.info(f"Scan completed: {len(all_trade_plans)} trade plans from {tickers_to_scan} tickers")
+        return all_trade_plans
     
-    def display_results(self, signals: List[Dict[str, Any]], top_n: int = 20) -> None:
-        """Display results in a formatted table.
+    def display_results(self, trade_plans: List[TradePlan], top_n: int = 20) -> None:
+        """Display EVR TradePlan results in a formatted table.
         
         Args:
-            signals: List of trading signals
-            top_n: Number of top signals to display
+            trade_plans: List of TradePlan objects
+            top_n: Number of top trade plans to display
         """
-        if not signals:
-            self.console.print("[red]No trading signals found[/red]")
+        if not trade_plans:
+            self.console.print("[red]No trade plans found[/red]")
             return
         
-        # Create table
-        table = Table(title=f"Top {min(top_n, len(signals))} Trading Signals")
+        # Display EVR TradePlan results
+        table = Table(title=f"Top {min(top_n, len(trade_plans))} EVR Trade Plans")
         table.add_column("Rank", style="cyan", width=4)
         table.add_column("Ticker", style="magenta", width=8)
-        table.add_column("Signal", style="blue", width=15)
+        table.add_column("Setup", style="blue", width=15)
         table.add_column("Direction", style="green", width=8)
-        table.add_column("Entry Price", style="yellow", width=10)
-        table.add_column("Stop Loss", style="red", width=10)
-        table.add_column("Take Profit", style="green", width=12)
-        table.add_column("Confidence", style="cyan", width=10)
-        table.add_column("Expected Return", style="green", width=12)
-        table.add_column("Risk/Reward", style="blue", width=10)
+        table.add_column("Entry", style="yellow", width=10)
+        table.add_column("Stop", style="red", width=10)
+        table.add_column("Target", style="green", width=10)
+        table.add_column("P(Win)", style="cyan", width=8)
+        table.add_column("E[R]", style="green", width=8)
+        table.add_column("Kelly", style="blue", width=8)
+        table.add_column("Size", style="yellow", width=10)
+        table.add_column("Risk $", style="red", width=10)
         
-        for i, signal in enumerate(signals[:top_n], 1):
+        for i, plan in enumerate(trade_plans[:top_n], 1):
+            direction = "LONG" if plan.entry < plan.stop else "SHORT"
             table.add_row(
                 str(i),
-                signal['ticker'],
-                signal['signal_type'],
-                signal['direction'],
-                f"${signal['entry_price']:.2f}",
-                f"${signal['stop_loss']:.2f}",
-                f"${signal['take_profit']:.2f}",
-                f"{signal['confidence']:.1%}",
-                f"{signal['expected_return']:.2%}",
-                f"{signal['risk_reward_ratio']:.1f}",
+                plan.ticker,
+                plan.setup,
+                direction,
+                f"${plan.entry:.2f}",
+                f"${plan.stop:.2f}",
+                f"${plan.targets[0]:.2f}",
+                f"{plan.p_win:.1%}",
+                f"{plan.expected_return:.1%}",
+                f"{plan.kelly_fraction:.1%}",
+                f"${plan.position_size:,.0f}",
+                f"${plan.risk_dollars:,.0f}"
             )
         
         self.console.print(table)
         
         # Display summary statistics
-        total_signals = len(signals)
-        long_signals = len([s for s in signals if s['direction'] == 'LONG'])
-        short_signals = len([s for s in signals if s['direction'] == 'SHORT'])
+        total_plans = len(trade_plans)
+        long_plans = len([p for p in trade_plans if p.entry < p.stop])
+        short_plans = len([p for p in trade_plans if p.entry > p.stop])
         
-        avg_confidence = sum(s['confidence'] for s in signals) / total_signals
-        avg_expected_return = sum(s['expected_return'] for s in signals) / total_signals
+        avg_p_win = sum(p.p_win for p in trade_plans) / total_plans
+        avg_expected_return = sum(p.expected_return for p in trade_plans) / total_plans
+        avg_kelly = sum(p.kelly_fraction for p in trade_plans) / total_plans
+        total_risk = sum(p.risk_dollars for p in trade_plans)
         
         summary_text = f"""
-Summary Statistics:
-  Total Signals: {total_signals}
-  Long Positions: {long_signals} ({long_signals/total_signals:.1%})
-  Short Positions: {short_signals} ({short_signals/total_signals:.1%})
-  Average Confidence: {avg_confidence:.1%}
+EVR Trade Plan Summary:
+  Total Plans: {total_plans}
+  Long Positions: {long_plans} ({long_plans/total_plans:.1%})
+  Short Positions: {short_plans} ({short_plans/total_plans:.1%})
+  Average P(Win): {avg_p_win:.1%}
   Average Expected Return: {avg_expected_return:.2%}
+  Average Kelly Fraction: {avg_kelly:.1%}
+  Total Risk: ${total_risk:,.0f}
+  Available Capital: ${self.risk_guards.current_capital:,.0f}
         """
         
-        panel = Panel(summary_text, title="Scan Results", border_style="green")
+        panel = Panel(summary_text, title="EVR Scan Results", border_style="green")
         self.console.print(panel)
     
-    def save_results(self, signals: List[Dict[str, Any]], filename_prefix: str = "signals") -> None:
-        """Save results to files.
+    def save_results(self, trade_plans: List[TradePlan], filename_prefix: str = "evr_trade_plans") -> None:
+        """Save EVR TradePlan results to files.
         
         Args:
-            signals: List of trading signals
+            trade_plans: List of TradePlan objects
+            filename_prefix: Prefix for output files
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Convert TradePlan objects to dictionaries for JSON/CSV export
+        trade_plan_dicts = []
+        for plan in trade_plans:
+            plan_dict = {
+                'ticker': plan.ticker,
+                'setup': plan.setup,
+                'entry': plan.entry,
+                'stop': plan.stop,
+                'targets': plan.targets,
+                'p_win': plan.p_win,
+                'avg_r_win': plan.avg_r_win,
+                'avg_r_loss': plan.avg_r_loss,
+                'expected_return': plan.expected_return,
+                'kelly_fraction': plan.kelly_fraction,
+                'position_size': plan.position_size,
+                'risk_dollars': plan.risk_dollars,
+                'notes': plan.notes,
+                'signal_type': plan.signal_type,
+                'confidence': plan.confidence,
+                'take_profit': plan.take_profit,
+                'cost_bps': plan.cost_bps,
+                'slippage_bps': plan.slippage_bps
+            }
+            trade_plan_dicts.append(plan_dict)
+        
+        # Save as CSV
+        csv_file = self.output_dir / f"{filename_prefix}_{timestamp}.csv"
+        df = pd.DataFrame(trade_plan_dicts)
+        df.to_csv(csv_file, index=False)
+        self.logger.info(f"Saved {len(trade_plans)} trade plans to {csv_file}")
+        
+        # Save as JSON
+        json_file = self.output_dir / f"{filename_prefix}_{timestamp}.json"
+        with open(json_file, 'w') as f:
+            json.dump(trade_plan_dicts, f, indent=2, default=str)
+        self.logger.info(f"Saved detailed trade plans to {json_file}")
+        
+        # Save summary
+        summary_file = self.output_dir / f"{filename_prefix}_{timestamp}_summary.txt"
+        with open(summary_file, 'w') as f:
+            f.write(f"EVR Trade Plans Summary\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Trade Plans: {len(trade_plans)}\n\n")
+            
+            # Calculate statistics
+            total_plans = len(trade_plans)
+            long_plans = len([p for p in trade_plans if p.entry < p.stop])
+            short_plans = len([p for p in trade_plans if p.entry > p.stop])
+            avg_p_win = sum(p.p_win for p in trade_plans) / total_plans
+            avg_expected_return = sum(p.expected_return for p in trade_plans) / total_plans
+            avg_kelly = sum(p.kelly_fraction for p in trade_plans) / total_plans
+            total_risk = sum(p.risk_dollars for p in trade_plans)
+            
+            f.write(f"Summary Statistics:\n")
+            f.write(f"  Long Positions: {long_plans} ({long_plans/total_plans:.1%})\n")
+            f.write(f"  Short Positions: {short_plans} ({short_plans/total_plans:.1%})\n")
+            f.write(f"  Average P(Win): {avg_p_win:.1%}\n")
+            f.write(f"  Average Expected Return: {avg_expected_return:.2%}\n")
+            f.write(f"  Average Kelly Fraction: {avg_kelly:.1%}\n")
+            f.write(f"  Total Risk: ${total_risk:,.0f}\n")
+            f.write(f"  Available Capital: ${self.risk_guards.current_capital:,.0f}\n\n")
+            
+            f.write(f"Top 15 Trade Plans:\n")
+            for i, plan in enumerate(trade_plans[:15], 1):
+                direction = "LONG" if plan.entry < plan.stop else "SHORT"
+                f.write(f"{i:2d}. {plan.ticker:6s} {plan.setup:15s} {direction:5s} "
+                       f"P(Win): {plan.p_win:5.1%} E[R]: {plan.expected_return:6.2%} "
+                       f"Kelly: {plan.kelly_fraction:5.1%} Risk: ${plan.risk_dollars:8,.0f}\n")
+        
+        self.logger.info(f"Saved summary to {summary_file}")
+    
+    def aggregate_trade_plans(self, trade_plans: List[TradePlan]) -> List[Dict[str, Any]]:
+        """Aggregate multiple trade plans per ticker into unified EVR recommendations.
+        
+        Args:
+            trade_plans: List of EVR TradePlan objects
+            
+        Returns:
+            List of aggregated ticker recommendations with EVR metrics
+        """
+        # Group trade plans by ticker
+        ticker_plans = {}
+        for plan in trade_plans:
+            ticker = plan.ticker
+            if ticker not in ticker_plans:
+                ticker_plans[ticker] = []
+            ticker_plans[ticker].append(plan)
+        
+        aggregated = []
+        
+        for ticker, plans in ticker_plans.items():
+            if not plans:
+                continue
+            
+            # Calculate aggregated EVR metrics
+            total_plans = len(plans)
+            
+            # Weight by Kelly fraction and expected return
+            total_weight = sum(plan.kelly_fraction * abs(plan.expected_return) for plan in plans)
+            
+            if total_weight > 0:
+                # Weighted averages
+                weighted_p_win = sum(plan.p_win * plan.kelly_fraction * abs(plan.expected_return) for plan in plans) / total_weight
+                weighted_expected_return = sum(plan.expected_return * plan.kelly_fraction * abs(plan.expected_return) for plan in plans) / total_weight
+                weighted_kelly = sum(plan.kelly_fraction * plan.kelly_fraction * abs(plan.expected_return) for plan in plans) / total_weight
+            else:
+                # Simple averages if no weight
+                weighted_p_win = sum(plan.p_win for plan in plans) / total_plans
+                weighted_expected_return = sum(plan.expected_return for plan in plans) / total_plans
+                weighted_kelly = sum(plan.kelly_fraction for plan in plans) / total_plans
+            
+            # Determine primary direction (most common)
+            directions = ["LONG" if plan.entry < plan.stop else "SHORT" for plan in plans]
+            primary_direction = max(set(directions), key=directions.count)
+            
+            # Get the best plan (highest expected growth score)
+            best_plan = max(plans, key=lambda p: p.kelly_fraction * p.expected_return)
+            
+            # Calculate signal diversity score
+            signal_types = set(plan.setup for plan in plans)
+            diversity_score = len(signal_types) / 12.0  # Normalize to 0-1 (max 12 signal types)
+            
+            # Calculate consensus score
+            consensus_score = directions.count(primary_direction) / total_plans
+            
+            # Calculate EVR composite score
+            evr_composite_score = self._calculate_evr_composite_score(
+                weighted_p_win, weighted_expected_return, weighted_kelly, 
+                diversity_score, consensus_score, best_plan
+            )
+            
+            # Calculate aggregated risk metrics
+            total_risk = sum(plan.risk_dollars for plan in plans)
+            avg_cost_bps = sum(plan.cost_bps for plan in plans) / total_plans
+            avg_slippage_bps = sum(plan.slippage_bps for plan in plans) / total_plans
+            
+            # Get signal type breakdown
+            signal_type_counts = {}
+            for plan in plans:
+                signal_type = plan.setup
+                signal_type_counts[signal_type] = signal_type_counts.get(signal_type, 0) + 1
+            
+            # Create aggregated recommendation
+            aggregated_recommendation = {
+                'ticker': ticker,
+                'total_signals': total_plans,
+                'signal_types': signal_type_counts,
+                'primary_direction': primary_direction,
+                'entry_price': best_plan.entry,
+                'stop_loss': best_plan.stop,
+                'take_profit': best_plan.take_profit,
+                'targets': best_plan.targets,
+                
+                # EVR aggregated metrics
+                'weighted_p_win': weighted_p_win,
+                'weighted_expected_return': weighted_expected_return,
+                'weighted_kelly_fraction': weighted_kelly,
+                'total_risk_dollars': total_risk,
+                'avg_cost_bps': avg_cost_bps,
+                'avg_slippage_bps': avg_slippage_bps,
+                
+                # Composite scoring
+                'diversity_score': diversity_score,
+                'consensus_score': consensus_score,
+                'evr_composite_score': evr_composite_score,
+                
+                # Best plan details
+                'best_setup': best_plan.setup,
+                'best_confidence': best_plan.confidence,
+                'best_position_size': best_plan.position_size,
+                
+                # Summary
+                'signal_summary': f"{total_plans} signals: {', '.join([f'{k}({v})' for k, v in signal_type_counts.items()])}"
+            }
+            
+            aggregated.append(aggregated_recommendation)
+        
+        # Sort by EVR composite score (highest first)
+        aggregated.sort(key=lambda x: x['evr_composite_score'], reverse=True)
+        
+        return aggregated
+    
+    def _calculate_evr_composite_score(self, p_win: float, expected_return: float, kelly_fraction: float,
+                                     diversity_score: float, consensus_score: float, best_plan: TradePlan) -> float:
+        """Calculate EVR composite score for aggregated recommendations.
+        
+        Args:
+            p_win: Weighted probability of winning
+            expected_return: Weighted expected return
+            kelly_fraction: Weighted Kelly fraction
+            diversity_score: Signal diversity score
+            consensus_score: Direction consensus score
+            best_plan: Best individual trade plan
+            
+        Returns:
+            EVR composite score (0-1)
+        """
+        # EVR-specific scoring components
+        probability_score = min(p_win, 1.0)  # Cap at 1.0
+        payoff_score = min(abs(expected_return) / 0.20, 1.0)  # Normalize to 20% max
+        kelly_score = min(kelly_fraction / 0.25, 1.0)  # Normalize to 25% max Kelly
+        
+        # Risk-adjusted component
+        risk_score = min(1.0 / (1.0 + best_plan.risk_dollars / 1000), 1.0)  # Lower risk = higher score
+        
+        # Cost efficiency component
+        cost_score = min(1.0 / (1.0 + best_plan.cost_bps / 100), 1.0)  # Lower costs = higher score
+        
+        # EVR composite score with sophisticated weighting
+        evr_score = (
+            probability_score * 0.25 +      # 25% weight on probability
+            payoff_score * 0.20 +             # 20% weight on payoff
+            kelly_score * 0.15 +              # 15% weight on Kelly sizing
+            diversity_score * 0.15 +          # 15% weight on signal diversity
+            consensus_score * 0.10 +          # 10% weight on consensus
+            risk_score * 0.10 +               # 10% weight on risk management
+            cost_score * 0.05                 # 5% weight on cost efficiency
+        )
+        
+        return min(max(evr_score, 0.0), 1.0)
+    
+    def display_aggregated_results(self, aggregated_recommendations: List[Dict[str, Any]], top_n: int = 20) -> None:
+        """Display aggregated EVR recommendations.
+        
+        Args:
+            aggregated_recommendations: List of aggregated recommendations
+            top_n: Number of top recommendations to display
+        """
+        if not aggregated_recommendations:
+            self.console.print("[red]No aggregated recommendations found[/red]")
+            return
+        
+        # Display aggregated EVR results
+        table = Table(title=f"Top {min(top_n, len(aggregated_recommendations))} EVR Aggregated Recommendations")
+        table.add_column("Rank", style="cyan", width=4)
+        table.add_column("Ticker", style="magenta", width=8)
+        table.add_column("Signals", style="blue", width=8)
+        table.add_column("Direction", style="green", width=8)
+        table.add_column("Entry", style="yellow", width=10)
+        table.add_column("Stop", style="red", width=10)
+        table.add_column("Target", style="green", width=10)
+        table.add_column("P(Win)", style="cyan", width=8)
+        table.add_column("E[R]", style="green", width=8)
+        table.add_column("Kelly", style="blue", width=8)
+        table.add_column("EVR Score", style="magenta", width=10)
+        table.add_column("Risk $", style="red", width=10)
+        
+        for i, rec in enumerate(aggregated_recommendations[:top_n], 1):
+            table.add_row(
+                str(i),
+                rec['ticker'],
+                str(rec['total_signals']),
+                rec['primary_direction'],
+                f"${rec['entry_price']:.2f}",
+                f"${rec['stop_loss']:.2f}",
+                f"${rec['take_profit']:.2f}",
+                f"{rec['weighted_p_win']:.1%}",
+                f"{rec['weighted_expected_return']:.1%}",
+                f"{rec['weighted_kelly_fraction']:.1%}",
+                f"{rec['evr_composite_score']:.3f}",
+                f"${rec['total_risk_dollars']:,.0f}"
+            )
+        
+        self.console.print(table)
+        
+        # Display summary statistics
+        total_recommendations = len(aggregated_recommendations)
+        long_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'LONG'])
+        short_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'SHORT'])
+        
+        avg_p_win = sum(r['weighted_p_win'] for r in aggregated_recommendations) / total_recommendations
+        avg_expected_return = sum(r['weighted_expected_return'] for r in aggregated_recommendations) / total_recommendations
+        avg_kelly = sum(r['weighted_kelly_fraction'] for r in aggregated_recommendations) / total_recommendations
+        avg_evr_score = sum(r['evr_composite_score'] for r in aggregated_recommendations) / total_recommendations
+        total_risk = sum(r['total_risk_dollars'] for r in aggregated_recommendations)
+        
+        summary_text = f"""
+EVR Aggregated Summary:
+  Total Recommendations: {total_recommendations}
+  Long Positions: {long_recommendations} ({long_recommendations/total_recommendations:.1%})
+  Short Positions: {short_recommendations} ({short_recommendations/total_recommendations:.1%})
+  Average P(Win): {avg_p_win:.1%}
+  Average Expected Return: {avg_expected_return:.2%}
+  Average Kelly Fraction: {avg_kelly:.1%}
+  Average EVR Score: {avg_evr_score:.3f}
+  Total Risk: ${total_risk:,.0f}
+  Available Capital: ${self.risk_guards.current_capital:,.0f}
+        """
+        
+        panel = Panel(summary_text, title="EVR Aggregated Results", border_style="green")
+        self.console.print(panel)
+    
+    def save_aggregated_results(self, aggregated_recommendations: List[Dict[str, Any]], filename_prefix: str = "evr_aggregated") -> None:
+        """Save aggregated EVR recommendations to files.
+        
+        Args:
+            aggregated_recommendations: List of aggregated recommendations
             filename_prefix: Prefix for output files
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Save as CSV
         csv_file = self.output_dir / f"{filename_prefix}_{timestamp}.csv"
-        df = pd.DataFrame(signals)
+        df = pd.DataFrame(aggregated_recommendations)
         df.to_csv(csv_file, index=False)
-        self.logger.info(f"Saved {len(signals)} signals to {csv_file}")
+        self.logger.info(f"Saved {len(aggregated_recommendations)} aggregated recommendations to {csv_file}")
         
         # Save as JSON
         json_file = self.output_dir / f"{filename_prefix}_{timestamp}.json"
         with open(json_file, 'w') as f:
-            json.dump(signals, f, indent=2, default=str)
-        self.logger.info(f"Saved detailed results to {json_file}")
+            json.dump(aggregated_recommendations, f, indent=2, default=str)
+        self.logger.info(f"Saved detailed aggregated results to {json_file}")
         
         # Save summary
         summary_file = self.output_dir / f"{filename_prefix}_{timestamp}_summary.txt"
         with open(summary_file, 'w') as f:
-            f.write(f"EVR Trading Signals Summary\n")
+            f.write(f"EVR Aggregated Recommendations Summary\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Signals: {len(signals)}\n\n")
+            f.write(f"Total Recommendations: {len(aggregated_recommendations)}\n\n")
             
-            # Group by signal type
-            signal_counts = {}
-            for signal in signals:
-                signal_type = signal['signal_type']
-                signal_counts[signal_type] = signal_counts.get(signal_type, 0) + 1
+            # Calculate statistics
+            total_recommendations = len(aggregated_recommendations)
+            long_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'LONG'])
+            short_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'SHORT'])
+            avg_p_win = sum(r['weighted_p_win'] for r in aggregated_recommendations) / total_recommendations
+            avg_expected_return = sum(r['weighted_expected_return'] for r in aggregated_recommendations) / total_recommendations
+            avg_kelly = sum(r['weighted_kelly_fraction'] for r in aggregated_recommendations) / total_recommendations
+            avg_evr_score = sum(r['evr_composite_score'] for r in aggregated_recommendations) / total_recommendations
+            total_risk = sum(r['total_risk_dollars'] for r in aggregated_recommendations)
             
-            f.write("Signals by Type:\n")
-            for signal_type, count in signal_counts.items():
-                f.write(f"  {signal_type}: {count}\n")
+            f.write(f"Summary Statistics:\n")
+            f.write(f"  Long Positions: {long_recommendations} ({long_recommendations/total_recommendations:.1%})\n")
+            f.write(f"  Short Positions: {short_recommendations} ({short_recommendations/total_recommendations:.1%})\n")
+            f.write(f"  Average P(Win): {avg_p_win:.1%}\n")
+            f.write(f"  Average Expected Return: {avg_expected_return:.2%}\n")
+            f.write(f"  Average Kelly Fraction: {avg_kelly:.1%}\n")
+            f.write(f"  Average EVR Score: {avg_evr_score:.3f}\n")
+            f.write(f"  Total Risk: ${total_risk:,.0f}\n")
+            f.write(f"  Available Capital: ${self.risk_guards.current_capital:,.0f}\n\n")
             
-            f.write(f"\nTop 10 Signals:\n")
-            for i, signal in enumerate(signals[:10], 1):
-                f.write(f"{i:2d}. {signal['ticker']:6s} {signal['signal_type']:15s} {signal['direction']:5s} "
-                       f"Conf: {signal['confidence']:5.1%} Expected: {signal['expected_return']:6.2%}\n")
+            f.write(f"Top 15 Aggregated Recommendations:\n")
+            for i, rec in enumerate(aggregated_recommendations[:15], 1):
+                f.write(f"{i:2d}. {rec['ticker']:6s} {rec['primary_direction']:5s} "
+                       f"Signals: {rec['total_signals']:2d} P(Win): {rec['weighted_p_win']:5.1%} "
+                       f"E[R]: {rec['weighted_expected_return']:6.2%} Kelly: {rec['weighted_kelly_fraction']:5.1%} "
+                       f"EVR Score: {rec['evr_composite_score']:.3f}\n")
+                f.write(f"     {rec['signal_summary']}\n")
         
-        self.logger.info(f"Saved summary to {summary_file}")
+        self.logger.info(f"Saved aggregated summary to {summary_file}")
 
 
 def main():
     """Main function to run the official scanner."""
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='EVR Official Ticker Scanner with Full Framework')
+    parser.add_argument('--max-tickers', type=int, default=None, help='Maximum number of tickers to scan (default: all tickers)')
+    parser.add_argument('--top', type=int, default=20, help='Number of top trade plans to display')
+    parser.add_argument('--output-prefix', type=str, default='evr_aggregated', help='Prefix for output files')
+    parser.add_argument('--no-cache', action='store_true', help='Force fresh ticker list fetch')
+    parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
+    parser.add_argument('--use-ml', action='store_true', help='Use ML classifier for probability estimation')
+    parser.add_argument('--initial-capital', type=float, default=100000, help='Initial capital for risk management')
+    parser.add_argument('--no-aggregate', action='store_true', help='Disable aggregation and show individual trade plans')
+    
+    args = parser.parse_args()
+    
     console = Console()
     
     # Display header
     header_text = """
-EVR Official Ticker Scanner
+EVR Official Ticker Scanner with Full Framework
 
-This scanner uses NASDAQ's official FTP feeds to get comprehensive
-lists of all NYSE and NASDAQ tickers with:
+This scanner implements the complete EVR framework with:
 1. Official ticker data from NASDAQ FTP
 2. Comprehensive technical analysis
-3. Multiple trading signal generation
-4. Risk-reward analysis
-5. Detailed logging and progress tracking
+3. Empirical Bayes probability estimation
+4. Kelly fraction sizing
+5. Cost and slippage modeling
+6. Risk management and circuit breakers
+7. Expected growth ranking
+8. Full TradePlan objects with all EVR fields
+9. Optional ML classifier for probability estimation
     """
     
     panel = Panel(header_text, title="EVR Official Scanner", border_style="blue")
     console.print(panel)
     
     try:
-        # Initialize scanner with logging
-        scanner = OfficialTickerScanner(log_level="INFO")
+        # Initialize scanner with EVR framework
+        scanner = OfficialTickerScanner(
+            log_level=args.log_level,
+            use_ml_classifier=args.use_ml,
+            initial_capital=args.initial_capital
+        )
         
         # Get ticker list
         console.print("\n[blue]Getting official ticker lists...[/blue]")
-        tickers = scanner.get_comprehensive_tickers()
+        if args.no_cache:
+            tickers = scanner.get_comprehensive_tickers(use_cache=False)
+        else:
+            tickers = scanner.get_comprehensive_tickers()
         console.print(f"[green]Found {len(tickers)} official tickers[/green]")
         
-        # Scan for signals
-        console.print("\n[blue]Scanning for trading signals...[/blue]")
-        signals = scanner.scan_tickers(tickers, max_tickers=100)  # Limit for demo
+        # Scan for trade plans
+        console.print("\n[blue]Scanning for EVR trade plans...[/blue]")
+        max_tickers = args.max_tickers if args.max_tickers is not None else len(tickers)
+        trade_plans = scanner.scan_tickers(tickers, max_tickers=max_tickers)
         
-        # Display results
-        console.print("\n[blue]Displaying results...[/blue]")
-        scanner.display_results(signals, top_n=20)
-        
-        # Save results
-        console.print("\n[blue]Saving results...[/blue]")
-        scanner.save_results(signals)
-        
-        console.print("\n[green]✅ Scan completed successfully![/green]")
+        if not args.no_aggregate:
+            # Aggregate signals by ticker
+            console.print("\n[green]Aggregating signals by ticker...[/green]")
+            aggregated_recommendations = scanner.aggregate_trade_plans(trade_plans)
+            
+            # Display aggregated results
+            console.print("\n[green]Displaying EVR aggregated recommendations...[/green]")
+            scanner.display_aggregated_results(aggregated_recommendations, top_n=args.top)
+            
+            # Save aggregated results
+            console.print("\n[blue]Saving EVR aggregated recommendations...[/blue]")
+            scanner.save_aggregated_results(aggregated_recommendations, filename_prefix=args.output_prefix)
+            
+            console.print(f"\n[green]✅ EVR aggregation completed successfully![/green]")
+            console.print(f"[green]Generated {len(aggregated_recommendations)} aggregated recommendations from {len(trade_plans)} trade plans[/green]")
+            
+            # Show top aggregated recommendation details
+            if aggregated_recommendations:
+                top_rec = aggregated_recommendations[0]
+                console.print(f"\n[cyan]Top Aggregated Recommendation: {top_rec['ticker']}[/cyan]")
+                console.print(f"[cyan]Signals: {top_rec['total_signals']} | Direction: {top_rec['primary_direction']}[/cyan]")
+                console.print(f"[cyan]P(Win): {top_rec['weighted_p_win']:.1%} | Expected Return: {top_rec['weighted_expected_return']:.2%} | Kelly: {top_rec['weighted_kelly_fraction']:.1%}[/cyan]")
+                console.print(f"[cyan]Entry: ${top_rec['entry_price']:.2f} | Stop: ${top_rec['stop_loss']:.2f} | Target: ${top_rec['take_profit']:.2f}[/cyan]")
+                console.print(f"[cyan]EVR Score: {top_rec['evr_composite_score']:.3f} | Risk: ${top_rec['total_risk_dollars']:,.0f}[/cyan]")
+                console.print(f"[cyan]Signal Summary: {top_rec['signal_summary']}[/cyan]")
+            else:
+                console.print(f"\n[red]❌ No EVR aggregated recommendations found![/red]")
+        else:
+            # Display individual trade plans
+            console.print("\n[blue]Displaying EVR trade plans...[/blue]")
+            scanner.display_results(trade_plans, top_n=args.top)
+            
+            # Save individual results
+            console.print("\n[blue]Saving EVR trade plans...[/blue]")
+            scanner.save_results(trade_plans, filename_prefix=args.output_prefix)
+            
+            console.print(f"\n[green]✅ EVR scan completed successfully![/green]")
+            console.print(f"[green]Generated {len(trade_plans)} ranked trade plans[/green]")
+            
+            # Show top recommendation details
+            if trade_plans:
+                top_plan = trade_plans[0]
+                direction = "LONG" if top_plan.entry < top_plan.stop else "SHORT"
+                console.print(f"\n[cyan]Top Trade Plan: {top_plan.ticker}[/cyan]")
+                console.print(f"[cyan]Setup: {top_plan.setup} | Direction: {direction}[/cyan]")
+                console.print(f"[cyan]P(Win): {top_plan.p_win:.1%} | Expected Return: {top_plan.expected_return:.2%} | Kelly: {top_plan.kelly_fraction:.1%}[/cyan]")
+                console.print(f"[cyan]Entry: ${top_plan.entry:.2f} | Stop: ${top_plan.stop:.2f} | Target: ${top_plan.targets[0]:.2f}[/cyan]")
+                console.print(f"[cyan]Position Size: ${top_plan.position_size:,.0f} | Risk: ${top_plan.risk_dollars:,.0f}[/cyan]")
         
         return True
         

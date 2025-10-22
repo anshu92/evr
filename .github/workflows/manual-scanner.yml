@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       max_tickers:
-        description: 'Maximum number of tickers to scan'
+        description: 'Maximum number of tickers to scan (leave empty to scan all)'
         required: false
-        default: '100'
+        default: ''
         type: string
       top_signals:
         description: 'Number of top signals to display'
@@ -67,8 +67,13 @@ jobs:
           CACHE_FLAG="--no-cache"
         fi
         
-        python cli_official_scanner.py \
-          --max-tickers ${{ github.event.inputs.max_tickers }} \
+        MAX_TICKERS_FLAG=""
+        if [ -n "${{ github.event.inputs.max_tickers }}" ]; then
+          MAX_TICKERS_FLAG="--max-tickers ${{ github.event.inputs.max_tickers }}"
+        fi
+        
+        python official_scanner.py \
+          $MAX_TICKERS_FLAG \
           --top ${{ github.event.inputs.top_signals }} \
           --output-prefix "manual_$(date +%Y%m%d_%H%M%S)" \
           --log-level ${{ github.event.inputs.log_level }} \

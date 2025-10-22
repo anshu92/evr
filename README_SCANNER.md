@@ -7,6 +7,7 @@ A comprehensive trading signal scanner that uses official NASDAQ FTP data source
 - **Official Data Sources**: Uses NASDAQ's official FTP feeds for comprehensive ticker lists
 - **Comprehensive Coverage**: Scans 8,034+ official NYSE and NASDAQ tickers
 - **Technical Analysis**: Multiple signal types including Bollinger Bands, Moving Averages, RSI, MACD
+- **Signal Aggregation**: Combines multiple signals per ticker into ranked recommendations (default behavior)
 - **Risk Management**: Built-in stop-loss, take-profit, and risk-reward calculations
 - **Progress Tracking**: Real-time progress bars and detailed logging
 - **Caching**: 24-hour cache for ticker lists to reduce API calls
@@ -40,25 +41,26 @@ pip install -e .
 ### Basic Usage
 
 ```bash
-# Run the scanner with default settings
+# Run the scanner with aggregated recommendations (scans all tickers by default)
 python official_scanner.py
 
-# Use the CLI interface
-python cli_official_scanner.py
+# Run with individual signals (disable aggregation)
+python official_scanner.py --no-aggregate
 ```
 
 ### CLI Options
 
 ```bash
-python cli_official_scanner.py --help
+python official_scanner.py --help
 ```
 
 **Available Options:**
-- `--max-tickers, -m`: Maximum number of tickers to scan (default: 100)
-- `--top, -n`: Number of top signals to display (default: 20)
+- `--max-tickers`: Maximum number of tickers to scan (default: all tickers)
+- `--top`: Number of top recommendations to display (default: 20)
 - `--output-prefix`: Prefix for output files (default: signals)
 - `--log-level`: Logging level - DEBUG, INFO, WARNING, ERROR (default: INFO)
 - `--no-cache`: Force fresh ticker fetch (ignore cache)
+- `--no-aggregate`: Disable aggregation and show individual signals
 
 ## Usage Examples
 
@@ -107,6 +109,46 @@ The scanner uses NASDAQ's official FTP feeds:
 - **NASDAQ**: 5,142+ tickers
 - **NYSE**: 2,892+ tickers
 - **Caching**: 24-hour cache to reduce API calls
+
+## Signal Aggregation
+
+The scanner can aggregate multiple signals per ticker into ranked recommendations using a composite scoring algorithm:
+
+### Aggregation Features
+- **Signal Weighting**: Combines signals based on confidence and expected return
+- **Consensus Analysis**: Measures agreement between signals on direction
+- **Diversity Scoring**: Rewards tickers with multiple signal types
+- **Composite Scoring**: Weighted combination of confidence, expected return, diversity, and consensus
+- **Ranked Output**: Sorts tickers by composite score for easy prioritization
+
+### Usage
+```bash
+# Default behavior (aggregation enabled)
+python official_scanner.py --max-tickers 200 --top 15
+
+# Disable aggregation for individual signals
+python official_scanner.py --no-aggregate --max-tickers 100 --top 20
+```
+
+### Enhanced Composite Score Calculation
+The composite score combines multiple sophisticated metrics:
+- **Probability Score** (25% weight): Based on signal strength and historical effectiveness
+- **Payoff Score** (25% weight): Risk-reward ratios and expected returns
+- **Risk-Adjusted Return** (20% weight): Sharpe-like ratio with consistency factor
+- **Confidence** (15% weight): Average signal confidence
+- **Signal Diversity** (10% weight): Number of different signal types
+- **Consensus** (5% weight): Agreement on direction
+
+### Output Format
+Aggregated results include:
+- Ranked ticker recommendations
+- Enhanced composite scores for ranking
+- Probability scores (signal effectiveness)
+- Payoff scores (risk-reward analysis)
+- Risk-adjusted return scores
+- Signal type breakdown per ticker
+- Average confidence and expected return
+- Primary direction (LONG/SHORT)
 
 ## Signal Types
 
