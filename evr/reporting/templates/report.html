@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EVR Backtest Report - {{ run_id }}</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 5px;
+        }
+        h3 {
+            color: #7f8c8d;
+            margin-top: 20px;
+        }
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .metric-card {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .metric-label {
+            color: #7f8c8d;
+            font-size: 14px;
+            margin-top: 5px;
+        }
+        .positive {
+            color: #27ae60;
+        }
+        .negative {
+            color: #e74c3c;
+        }
+        .neutral {
+            color: #95a5a6;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f8f9fa;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .chart-container {
+            text-align: center;
+            margin: 30px 0;
+        }
+        .chart-container img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .summary-stats {
+            background-color: #ecf0f1;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .setup-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .setup-card {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            color: #7f8c8d;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>EVR Backtest Report</h1>
+        
+        <div class="summary-stats">
+            <h2>Summary</h2>
+            <p><strong>Run ID:</strong> {{ run_id }}</p>
+            <p><strong>Period:</strong> {{ start_date }} to {{ end_date }}</p>
+            <p><strong>Symbols:</strong> {{ symbols|join(', ') }}</p>
+            <p><strong>Setups:</strong> {{ setups|join(', ') }}</p>
+            <p><strong>Total Trades:</strong> {{ total_trades }}</p>
+        </div>
+
+        <h2>Performance Metrics</h2>
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-value {{ 'positive' if metrics.total_return > 0 else 'negative' if metrics.total_return < 0 else 'neutral' }}">
+                    {{ "%.2f"|format(metrics.total_return * 100) }}%
+                </div>
+                <div class="metric-label">Total Return</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {{ 'positive' if metrics.cagr > 0 else 'negative' if metrics.cagr < 0 else 'neutral' }}">
+                    {{ "%.2f"|format(metrics.cagr * 100) }}%
+                </div>
+                <div class="metric-label">CAGR</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value negative">
+                    {{ "%.2f"|format(metrics.max_drawdown * 100) }}%
+                </div>
+                <div class="metric-label">Max Drawdown</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {{ 'positive' if metrics.sharpe_ratio > 0 else 'negative' if metrics.sharpe_ratio < 0 else 'neutral' }}">
+                    {{ "%.2f"|format(metrics.sharpe_ratio) }}
+                </div>
+                <div class="metric-label">Sharpe Ratio</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {{ 'positive' if metrics.win_rate > 0.5 else 'negative' if metrics.win_rate < 0.5 else 'neutral' }}">
+                    {{ "%.1f"|format(metrics.win_rate * 100) }}%
+                </div>
+                <div class="metric-label">Win Rate</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-value {{ 'positive' if metrics.profit_factor > 1 else 'negative' if metrics.profit_factor < 1 else 'neutral' }}">
+                    {{ "%.2f"|format(metrics.profit_factor) }}
+                </div>
+                <div class="metric-label">Profit Factor</div>
+            </div>
+        </div>
+
+        {% if has_charts %}
+        <h2>Charts</h2>
+        <div class="chart-container">
+            <img src="charts/equity_curve.png" alt="Equity Curve">
+        </div>
+        <div class="chart-container">
+            <img src="charts/drawdown.png" alt="Drawdown">
+        </div>
+        <div class="chart-container">
+            <img src="charts/returns_histogram.png" alt="Returns Histogram">
+        </div>
+        <div class="chart-container">
+            <img src="charts/trade_pnl.png" alt="Trade P&L">
+        </div>
+        <div class="chart-container">
+            <img src="charts/symbol_pnl.png" alt="Symbol P&L">
+        </div>
+        <div class="chart-container">
+            <img src="charts/setup_win_rate.png" alt="Setup Win Rate">
+        </div>
+        <div class="chart-container">
+            <img src="charts/setup_pnl.png" alt="Setup P&L">
+        </div>
+        {% endif %}
+
+        <h2>Setup Performance</h2>
+        <div class="setup-stats">
+            {% for setup, stats in setup_stats.items() %}
+            <div class="setup-card">
+                <h3>{{ setup }}</h3>
+                <p><strong>Total Trades:</strong> {{ stats.total_trades }}</p>
+                <p><strong>Win Rate:</strong> {{ "%.1f"|format(stats.win_rate * 100) }}%</p>
+                <p><strong>Total P&L:</strong> 
+                    <span class="{{ 'positive' if stats.total_pnl > 0 else 'negative' if stats.total_pnl < 0 else 'neutral' }}">
+                        ${{ "%.2f"|format(stats.total_pnl) }}
+                    </span>
+                </p>
+            </div>
+            {% endfor %}
+        </div>
+
+        <h2>Detailed Metrics</h2>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Total Trades</td>
+                <td>{{ metrics.total_trades }}</td>
+            </tr>
+            <tr>
+                <td>Winning Trades</td>
+                <td>{{ metrics.winning_trades }}</td>
+            </tr>
+            <tr>
+                <td>Losing Trades</td>
+                <td>{{ metrics.losing_trades }}</td>
+            </tr>
+            <tr>
+                <td>Average Win</td>
+                <td>{{ "%.2f"|format(metrics.avg_win * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Average Loss</td>
+                <td>{{ "%.2f"|format(metrics.avg_loss * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Largest Win</td>
+                <td>{{ "%.2f"|format(metrics.largest_win * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Largest Loss</td>
+                <td>{{ "%.2f"|format(metrics.largest_loss * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Expectancy</td>
+                <td>{{ "%.4f"|format(metrics.expectancy) }}</td>
+            </tr>
+            <tr>
+                <td>VaR (95%)</td>
+                <td>{{ "%.2f"|format(metrics.var_95 * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Expected Shortfall</td>
+                <td>{{ "%.2f"|format(metrics.expected_shortfall * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Max Consecutive Wins</td>
+                <td>{{ metrics.max_consecutive_wins }}</td>
+            </tr>
+            <tr>
+                <td>Max Consecutive Losses</td>
+                <td>{{ metrics.max_consecutive_losses }}</td>
+            </tr>
+            <tr>
+                <td>Turnover</td>
+                <td>{{ "%.2f"|format(metrics.turnover) }}</td>
+            </tr>
+            <tr>
+                <td>Average Trade Duration</td>
+                <td>{{ "%.1f"|format(metrics.avg_trade_duration) }} days</td>
+            </tr>
+            <tr>
+                <td>Best Month</td>
+                <td>{{ "%.2f"|format(metrics.best_month * 100) }}%</td>
+            </tr>
+            <tr>
+                <td>Worst Month</td>
+                <td>{{ "%.2f"|format(metrics.worst_month * 100) }}%</td>
+            </tr>
+        </table>
+
+        <div class="footer">
+            <p>Generated by EVR (Empirical Volatility Regime) Trading Framework</p>
+            <p>Report generated on {{ config.name }} v{{ config.version }}</p>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,79 @@
+# EVR Default Configuration
+
+name: "EVR Strategy"
+description: "Empirical Volatility Regime Trading Strategy"
+version: "1.0.0"
+
+# Data configuration
+data:
+  primary_source: "yfinance"
+  fallback_sources: ["stooq"]
+  cache_dir: "~/.evr/data"
+  cache_format: "parquet"
+  cache_ttl_days: 1
+  universe_file: null
+  symbols: []
+  start_date: null
+  end_date: null
+  timeframe: "1d"
+  adjust_splits: true
+  adjust_dividends: true
+  timezone: "America/Toronto"
+  api_keys: {}
+  rate_limit_delay: 0.1
+
+# Probability model configuration
+prob:
+  window_size: 252
+  min_samples: 50
+  alpha: 0.1
+  beta_prior_alpha: 1.0
+  beta_prior_beta: 1.0
+  use_regimes: false
+  regime_window: 63
+  regime_threshold: 0.1
+  update_frequency: "daily"
+
+# Risk management configuration
+risk:
+  initial_capital: 100000.0
+  max_position_size: 0.1
+  max_sector_exposure: 0.3
+  max_correlation: 0.7
+  max_risk_per_trade: 0.02
+  min_risk_per_trade: 0.005
+  use_kelly: true
+  kelly_fraction: 0.25
+  max_kelly_fraction: 0.5
+  daily_loss_limit: 0.05
+  weekly_loss_limit: 0.15
+  max_drawdown_limit: 0.25
+  max_positions: 20
+  min_positions: 1
+  commission_per_trade: 1.0
+  slippage_bps: 5.0
+  slippage_atr_multiplier: 0.5
+
+# Reporting configuration
+report:
+  output_dir: "./runs"
+  format: "html"
+  include_charts: true
+  chart_style: "seaborn"
+  chart_size: [12, 8]
+  dpi: 300
+  include_equity_curve: true
+  include_drawdown: true
+  include_returns_histogram: true
+  include_trade_analysis: true
+  include_setup_analysis: true
+  include_calibration: true
+  template_dir: null
+  custom_css: null
+
+# Global settings
+log_level: "INFO"
+log_file: null
+n_jobs: -1
+memory_limit: "4GB"
+validate_config: true

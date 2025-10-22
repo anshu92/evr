@@ -1,0 +1,318 @@
+# EVR Framework .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# EVR Specific Files
+# ==================
+
+# Data cache
+cache/
+*.cache
+
+# Scan results
+scans/
+scans/*.csv
+scans/*.json
+scans/*.txt
+scans/*.md
+
+# Test outputs
+test_outputs/
+test_*.csv
+test_*.json
+test_*.txt
+
+# Reports
+reports/
+runs/
+*.html
+*.pdf
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Configuration overrides
+config_local.yaml
+config_local.yml
+.local.yaml
+.local.yml
+
+# Data files
+data/
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Model files
+models/
+*.pkl
+*.pickle
+*.joblib
+
+# Backtest results
+backtests/
+backtest_*.csv
+backtest_*.json
+backtest_*.html
+
+# Recommendation results
+recommendations/
+recommendations_*.csv
+recommendations_*.json
+recommendations_*.txt
+
+# Daily/Weekly/Monthly reports
+daily_*.csv
+daily_*.json
+daily_*.txt
+weekly_*.csv
+weekly_*.json
+weekly_*.txt
+monthly_*.csv
+monthly_*.json
+monthly_*.txt
+
+# Manual scan results
+manual_*.csv
+manual_*.json
+manual_*.txt
+
+# Production scan results
+production_*.csv
+production_*.json
+production_*.txt
+
+# Demo results
+demo_*.csv
+demo_*.json
+demo_*.txt
+
+# Analysis results
+analysis_*.csv
+analysis_*.json
+analysis_*.txt
+
+# Trading signals
+signals_*.csv
+signals_*.json
+signals_*.txt
+
+# Market analysis
+market_*.csv
+market_*.json
+market_*.txt
+
+# Risk analysis
+risk_*.csv
+risk_*.json
+risk_*.txt
+
+# Sector analysis
+sector_*.csv
+sector_*.json
+sector_*.txt
+
+# Validation results
+validation_*.csv
+validation_*.json
+validation_*.txt
+
+# Health check results
+health_*.csv
+health_*.json
+health_*.txt
+
+# API data
+api_*.csv
+api_*.json
+api_*.txt
+
+# Trading platform exports
+trading_*.csv
+trading_*.json
+trading_*.txt
+
+# Spreadsheet data
+spreadsheet_*.csv
+spreadsheet_*.json
+spreadsheet_*.txt
+
+# JSON data
+json_*.csv
+json_*.json
+json_*.txt
+
+# Summary files
+summary_*.txt
+summary_*.md
+*_summary.txt
+*_summary.md
+
+# GitHub Actions artifacts
+.github/workflows/artifacts/
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+*.lnk
+
+# Linux
+*~
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
