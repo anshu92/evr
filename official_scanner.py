@@ -2014,7 +2014,9 @@ EVR Trade Plan Summary:
                 weighted_kelly = sum(plan.kelly_fraction for plan in plans) / total_plans
             
             # Determine primary direction (most common)
-            directions = ["LONG" if plan.entry < plan.stop else "SHORT" for plan in plans]
+            # LONG: stop < entry (stop below entry, buy to profit from upward move)
+            # SHORT: stop > entry (stop above entry, sell to profit from downward move)
+            directions = ["LONG" if plan.entry > plan.stop else "SHORT" for plan in plans]
             primary_direction = max(set(directions), key=directions.count)
             
             # Get the best plan (highest expected growth score)
