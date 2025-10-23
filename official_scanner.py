@@ -21,7 +21,7 @@ import time
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -526,10 +526,10 @@ class CostModel:
         Returns:
             Tuple of (commission_cost, slippage_cost)
         """
-        # Commission cost
+        # Commission cost (based on position size, not entry price)
         commission_cost = position_size * (self.commission_bps / 10000)
         
-        # Slippage cost (fixed + ATR-based)
+        # Slippage cost (fixed + ATR-based, based on position size)
         fixed_slippage = position_size * (self.slippage_bps / 10000)
         atr_slippage = position_size * (atr_percentage / 100) * self.slippage_atr_multiplier
         slippage_cost = fixed_slippage + atr_slippage
@@ -815,6 +815,10 @@ class OfficialTickerScanner:
         self.cache_dir = Path("cache")
         self.cache_dir.mkdir(exist_ok=True)
         
+        # Delisted tickers tracking
+        self.delisted_file = self.cache_dir / "delisted_tickers.json"
+        self.delisted_tickers = self._load_delisted_tickers()
+        
         # Initialize rate limiter and parallel data fetcher
         self.rate_limiter = RateLimiter(base_delay=0.5, max_delay=10.0, backoff_factor=1.5)
         self.data_fetcher = ParallelDataFetcher(max_workers=8, rate_limiter=self.rate_limiter)
@@ -971,11 +975,13 @@ class OfficialTickerScanner:
             cache_age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
             
             if cache_age < timedelta(hours=cache_age_hours):
+                start_time = time.time()
                 data = pd.read_parquet(cache_file)
-                self.logger.debug(f"Loaded {ticker} from cache")
+                load_time = time.time() - start_time
+                self.logger.debug(f"📂 Loaded {ticker} from cache in {load_time:.3f}s ({len(data)} rows)")
                 return data
             else:
-                self.logger.debug(f"Cache expired for {ticker} (age: {cache_age})")
+                self.logger.debug(f"⏰ Cache expired for {ticker} (age: {cache_age})")
                 return None
         except Exception as e:
             self.logger.debug(f"Failed to load cache for {ticker}: {e}")
@@ -994,10 +1000,64 @@ class OfficialTickerScanner:
         
         try:
             cache_file = self._get_cache_path(ticker, period)
+            start_time = time.time()
             data.to_parquet(cache_file, compression='snappy')
-            self.logger.debug(f"Cached {ticker} data to {cache_file}")
+            save_time = time.time() - start_time
+            file_size = cache_file.stat().st_size / 1024  # KB
+            self.logger.debug(f"💾 Cached {ticker} to {cache_file.name} in {save_time:.3f}s ({file_size:.1f}KB)")
         except Exception as e:
-            self.logger.debug(f"Failed to cache {ticker}: {e}")
+            self.logger.debug(f"❌ Failed to cache {ticker}: {e}")
+    
+    def _load_delisted_tickers(self) -> Set[str]:
+        """Load delisted tickers from file.
+        
+        Returns:
+            Set of delisted ticker symbols
+        """
+        try:
+            if self.delisted_file.exists():
+                with open(self.delisted_file, 'r') as f:
+                    data = json.load(f)
+                    return set(data.get('delisted_tickers', []))
+            return set()
+        except Exception as e:
+            self.logger.debug(f"Failed to load delisted tickers: {e}")
+            return set()
+    
+    def _save_delisted_tickers(self) -> None:
+        """Save delisted tickers to file."""
+        try:
+            data = {
+                'delisted_tickers': list(self.delisted_tickers),
+                'last_updated': datetime.now().isoformat()
+            }
+            with open(self.delisted_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.logger.debug(f"Saved {len(self.delisted_tickers)} delisted tickers to {self.delisted_file}")
+        except Exception as e:
+            self.logger.debug(f"Failed to save delisted tickers: {e}")
+    
+    def _mark_ticker_delisted(self, ticker: str, reason: str = "No data available") -> None:
+        """Mark a ticker as delisted.
+        
+        Args:
+            ticker: Ticker symbol to mark as delisted
+            reason: Reason for delisting
+        """
+        self.delisted_tickers.add(ticker)
+        self._save_delisted_tickers()
+        self.logger.debug(f"Marked {ticker} as delisted: {reason}")
+    
+    def _is_ticker_delisted(self, ticker: str) -> bool:
+        """Check if a ticker is marked as delisted.
+        
+        Args:
+            ticker: Ticker symbol to check
+            
+        Returns:
+            True if ticker is delisted, False otherwise
+        """
+        return ticker in self.delisted_tickers
     
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics.
@@ -1024,7 +1084,8 @@ class OfficialTickerScanner:
                 "total_files": total_files,
                 "total_size_mb": round(total_size_mb, 2),
                 "oldest_file": oldest_file,
-                "newest_file": newest_file
+                "newest_file": newest_file,
+                "delisted_tickers": len(self.delisted_tickers)
             }
         except Exception as e:
             self.logger.debug(f"Failed to get cache stats: {e}")
@@ -1041,23 +1102,41 @@ class OfficialTickerScanner:
         Returns:
             DataFrame with stock data or None if failed
         """
+        # Check if ticker is already marked as delisted
+        if self._is_ticker_delisted(ticker):
+            self.logger.debug(f"⏭️  Skipping delisted ticker: {ticker}")
+            return None
+        
         # Try cache first
         if use_cache:
+            self.logger.debug(f"🔍 Checking cache for {ticker}...")
             cached_data = self._load_from_cache(ticker, period)
             if cached_data is not None:
+                self.logger.debug(f"✅ Cache HIT for {ticker} ({len(cached_data)} rows)")
                 return cached_data
+            else:
+                self.logger.debug(f"❌ Cache MISS for {ticker}")
         
         # Fetch from API
+        self.logger.debug(f"🌐 Fetching {ticker} from API...")
+        start_time = time.time()
         data = self.data_fetcher.fetch_ticker_data(ticker, period)
+        fetch_time = time.time() - start_time
         
         if data is not None and not data.empty:
+            self.logger.debug(f"✅ API SUCCESS for {ticker} ({len(data)} rows, {fetch_time:.2f}s)")
             # Save to cache for future use
             if use_cache:
+                self.logger.debug(f"💾 Caching {ticker} data...")
+                cache_start = time.time()
                 self._save_to_cache(ticker, period, data)
+                cache_time = time.time() - cache_start
+                self.logger.debug(f"💾 Cached {ticker} in {cache_time:.2f}s")
             return data
         
-        # No fallback - return None if data unavailable
-        self.logger.debug(f"No data available for {ticker}")
+        # Mark ticker as delisted if no data available
+        self.logger.debug(f"❌ No data available for {ticker} after {fetch_time:.2f}s - marking as delisted")
+        self._mark_ticker_delisted(ticker, "No data available from API")
         return None
     
     
@@ -1635,8 +1714,9 @@ class OfficialTickerScanner:
             
             # Calculate cost basis points (avoid division by zero)
             total_cost = commission_cost + slippage_cost
-            cost_bps = (total_cost / position_size * 10000) if position_size > 0 else 0
-            slippage_bps = (slippage_cost / position_size * 10000) if position_size > 0 else 0
+            # Cost basis points should be based on the original cost model settings, not calculated from actual costs
+            cost_bps = self.cost_model.commission_bps
+            slippage_bps = self.cost_model.slippage_bps
             
             # Create TradePlan
             trade_plan = TradePlan(
@@ -1712,10 +1792,16 @@ class OfficialTickerScanner:
         ) as progress:
             task = progress.add_task("Scanning tickers...", total=tickers_to_scan)
             
-            for batch in batches:
+            for batch_idx, batch in enumerate(batches):
+                batch_start = time.time()
+                self.logger.debug(f"🔄 Processing batch {batch_idx + 1}/{len(batches)} with {len(batch)} tickers")
+                
                 # Process batch in parallel
                 batch_results = self._process_ticker_batch(batch, use_cache=use_cache)
                 all_trade_plans.extend(batch_results)
+                
+                batch_time = time.time() - batch_start
+                self.logger.debug(f"✅ Batch {batch_idx + 1} completed in {batch_time:.2f}s ({len(batch_results)} trade plans)")
                 
                 # Update progress
                 progress.advance(task, len(batch))
@@ -1802,19 +1888,26 @@ class OfficialTickerScanner:
         """
         def process_single_ticker(ticker: str) -> List[TradePlan]:
             """Process a single ticker and return trade plans."""
+            ticker_start = time.time()
             try:
                 # Get stock data
                 data = self.get_stock_data(ticker, use_cache=use_cache)
                 if data is None or len(data) < 50:
+                    self.logger.debug(f"⏭️  {ticker}: No data or insufficient data ({len(data) if data is not None else 0} rows)")
                     return []
                 
                 # Calculate indicators
+                indicators_start = time.time()
                 indicators = self.calculate_technical_indicators(data)
+                indicators_time = time.time() - indicators_start
                 if not indicators:
+                    self.logger.debug(f"⏭️  {ticker}: No indicators calculated")
                     return []
                 
                 # Generate signals
+                signals_start = time.time()
                 signals = self.generate_signals(ticker, data, indicators)
+                signals_time = time.time() - signals_start
                 
                 # Convert signals to trade plans
                 trade_plans = []
@@ -1826,10 +1919,13 @@ class OfficialTickerScanner:
                         if risk_checks['all_checks_passed']:
                             trade_plans.append(trade_plan)
                 
+                total_time = time.time() - ticker_start
+                self.logger.debug(f"✅ {ticker}: {len(trade_plans)} trade plans in {total_time:.2f}s (indicators: {indicators_time:.2f}s, signals: {signals_time:.2f}s)")
                 return trade_plans
                 
             except Exception as e:
-                self.logger.debug(f"Error processing {ticker}: {e}")
+                total_time = time.time() - ticker_start
+                self.logger.debug(f"❌ {ticker}: Error after {total_time:.2f}s - {e}")
                 return []
         
         # Process tickers in parallel
@@ -2101,8 +2197,10 @@ EVR Trade Plan Summary:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Convert TradePlan objects to dictionaries for JSON/CSV export
+        # Filter out NULL actions to focus on actionable recommendations
+        actionable_plans = [plan for plan in trade_plans if plan.action != "NULL"]
         trade_plan_dicts = []
-        for plan in trade_plans:
+        for plan in actionable_plans:
             plan_dict = {
                 'ticker': plan.ticker,
                 'setup': plan.setup,
@@ -2136,7 +2234,7 @@ EVR Trade Plan Summary:
         csv_file = self.output_dir / f"{filename_prefix}_{timestamp}.csv"
         df = pd.DataFrame(trade_plan_dicts)
         df.to_csv(csv_file, index=False)
-        self.logger.info(f"Saved {len(trade_plans)} trade plans to {csv_file}")
+        self.logger.info(f"Saved {len(actionable_plans)} actionable trade plans to {csv_file}")
         
         # Save as JSON
         json_file = self.output_dir / f"{filename_prefix}_{timestamp}.json"
@@ -2147,38 +2245,41 @@ EVR Trade Plan Summary:
         # Save summary
         summary_file = self.output_dir / f"{filename_prefix}_{timestamp}_summary.txt"
         with open(summary_file, 'w') as f:
-            f.write(f"EVR Trade Plans Summary\n")
+            f.write(f"EVR Trade Plans Summary (Actionable Only)\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Trade Plans: {len(trade_plans)}\n\n")
+            f.write(f"Total Trade Plans: {len(trade_plans)} (All)\n")
+            f.write(f"Actionable Plans: {len(actionable_plans)} (BUY/SHORT only)\n")
+            f.write(f"Filtered Out: {len(trade_plans) - len(actionable_plans)} (NULL actions)\n\n")
             
-            # Calculate statistics
-            total_plans = len(trade_plans)
+            # Calculate statistics for actionable plans only
+            total_plans = len(actionable_plans)
+            if total_plans == 0:
+                f.write("No actionable recommendations found.\n")
+                return
             # LONG: stop < entry (stop below entry)
             # SHORT: stop > entry (stop above entry)
-            long_plans = len([p for p in trade_plans if p.entry > p.stop])
-            short_plans = len([p for p in trade_plans if p.entry < p.stop])
-            buy_actions = len([p for p in trade_plans if p.action == "BUY"])
-            short_actions = len([p for p in trade_plans if p.action == "SHORT"])
-            null_actions = len([p for p in trade_plans if p.action == "NULL"])
-            avg_p_win = sum(p.p_win for p in trade_plans) / total_plans
-            avg_expected_return = sum(p.expected_return for p in trade_plans) / total_plans
-            avg_kelly = sum(p.kelly_fraction for p in trade_plans) / total_plans
-            total_risk = sum(p.risk_dollars for p in trade_plans)
+            long_plans = len([p for p in actionable_plans if p.entry > p.stop])
+            short_plans = len([p for p in actionable_plans if p.entry < p.stop])
+            buy_actions = len([p for p in actionable_plans if p.action == "BUY"])
+            short_actions = len([p for p in actionable_plans if p.action == "SHORT"])
+            avg_p_win = sum(p.p_win for p in actionable_plans) / total_plans
+            avg_expected_return = sum(p.expected_return for p in actionable_plans) / total_plans
+            avg_kelly = sum(p.kelly_fraction for p in actionable_plans) / total_plans
+            total_risk = sum(p.risk_dollars for p in actionable_plans)
             
-            f.write(f"Summary Statistics:\n")
+            f.write(f"Summary Statistics (Actionable Only):\n")
             f.write(f"  Long Positions: {long_plans} ({long_plans/total_plans:.1%})\n")
             f.write(f"  Short Positions: {short_plans} ({short_plans/total_plans:.1%})\n")
             f.write(f"  BUY Actions: {buy_actions} ({buy_actions/total_plans:.1%})\n")
             f.write(f"  SHORT Actions: {short_actions} ({short_actions/total_plans:.1%})\n")
-            f.write(f"  NULL Actions: {null_actions} ({null_actions/total_plans:.1%})\n")
             f.write(f"  Average P(Win): {avg_p_win:.1%}\n")
             f.write(f"  Average Expected Return: {avg_expected_return:.2%}\n")
             f.write(f"  Average Kelly Fraction: {avg_kelly:.1%}\n")
             f.write(f"  Total Risk: ${total_risk:,.0f}\n")
             f.write(f"  Available Capital: ${self.risk_guards.current_capital:,.0f}\n\n")
             
-            f.write(f"Top 15 Trade Plans:\n")
-            for i, plan in enumerate(trade_plans[:15], 1):
+            f.write(f"Top 15 Actionable Trade Plans:\n")
+            for i, plan in enumerate(actionable_plans[:15], 1):
                 # LONG: stop < entry (stop below entry, buy to profit from upward move)
                 # SHORT: stop > entry (stop above entry, sell to profit from downward move)
                 direction = "LONG" if plan.entry > plan.stop else "SHORT"
@@ -2234,8 +2335,14 @@ EVR Trade Plan Summary:
             directions = ["LONG" if plan.entry > plan.stop else "SHORT" for plan in plans]
             primary_direction = max(set(directions), key=directions.count)
             
-            # Get the best plan (highest expected growth score)
-            best_plan = max(plans, key=lambda p: p.kelly_fraction * p.expected_return)
+            # Get the best plan that matches the primary direction
+            # Filter plans by primary direction first
+            primary_direction_plans = [p for p in plans if (p.entry > p.stop) == (primary_direction == "LONG")]
+            if primary_direction_plans:
+                best_plan = max(primary_direction_plans, key=lambda p: p.kelly_fraction * p.expected_return)
+            else:
+                # Fallback to best plan overall if no plans match primary direction
+                best_plan = max(plans, key=lambda p: p.kelly_fraction * p.expected_return)
             
             # Calculate signal diversity score
             signal_types = set(plan.setup for plan in plans)
@@ -2452,43 +2559,52 @@ EVR Aggregated Summary:
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        # Filter out NULL actions to focus on actionable recommendations
+        actionable_recommendations = [rec for rec in aggregated_recommendations if rec.get('action') != 'NULL']
+        
         # Save as CSV
         csv_file = self.output_dir / f"{filename_prefix}_{timestamp}.csv"
-        df = pd.DataFrame(aggregated_recommendations)
+        df = pd.DataFrame(actionable_recommendations)
         df.to_csv(csv_file, index=False)
-        self.logger.info(f"Saved {len(aggregated_recommendations)} aggregated recommendations to {csv_file}")
+        self.logger.info(f"Saved {len(actionable_recommendations)} actionable aggregated recommendations to {csv_file}")
         
         # Save as JSON
         json_file = self.output_dir / f"{filename_prefix}_{timestamp}.json"
         with open(json_file, 'w') as f:
-            json.dump(aggregated_recommendations, f, indent=2, default=str)
+            json.dump(actionable_recommendations, f, indent=2, default=str)
         self.logger.info(f"Saved detailed aggregated results to {json_file}")
         
         # Save summary
         summary_file = self.output_dir / f"{filename_prefix}_{timestamp}_summary.txt"
         with open(summary_file, 'w') as f:
-            f.write(f"EVR Aggregated Recommendations Summary\n")
+            f.write(f"EVR Aggregated Recommendations Summary (Actionable Only)\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Recommendations: {len(aggregated_recommendations)}\n\n")
+            f.write(f"Total Recommendations: {len(aggregated_recommendations)} (All)\n")
+            f.write(f"Actionable Recommendations: {len(actionable_recommendations)} (BUY/SHORT only)\n")
+            f.write(f"Filtered Out: {len(aggregated_recommendations) - len(actionable_recommendations)} (NULL actions)\n\n")
             
-            # Calculate statistics
-            total_recommendations = len(aggregated_recommendations)
+            # Calculate statistics for actionable recommendations only
+            total_recommendations = len(actionable_recommendations)
             
             if total_recommendations == 0:
-                f.write("\nNo recommendations found.\n")
+                f.write("\nNo actionable recommendations found.\n")
                 return
             
-            long_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'LONG'])
-            short_recommendations = len([r for r in aggregated_recommendations if r['primary_direction'] == 'SHORT'])
-            avg_p_win = sum(r['weighted_p_win'] for r in aggregated_recommendations) / total_recommendations
-            avg_expected_return = sum(r['weighted_expected_return'] for r in aggregated_recommendations) / total_recommendations
-            avg_kelly = sum(r['weighted_kelly_fraction'] for r in aggregated_recommendations) / total_recommendations
-            avg_evr_score = sum(r['evr_composite_score'] for r in aggregated_recommendations) / total_recommendations
-            total_risk = sum(r['total_risk_dollars'] for r in aggregated_recommendations)
+            long_recommendations = len([r for r in actionable_recommendations if r['primary_direction'] == 'LONG'])
+            short_recommendations = len([r for r in actionable_recommendations if r['primary_direction'] == 'SHORT'])
+            buy_actions = len([r for r in actionable_recommendations if r.get('action') == 'BUY'])
+            short_actions = len([r for r in actionable_recommendations if r.get('action') == 'SHORT'])
+            avg_p_win = sum(r['weighted_p_win'] for r in actionable_recommendations) / total_recommendations
+            avg_expected_return = sum(r['weighted_expected_return'] for r in actionable_recommendations) / total_recommendations
+            avg_kelly = sum(r['weighted_kelly_fraction'] for r in actionable_recommendations) / total_recommendations
+            avg_evr_score = sum(r['evr_composite_score'] for r in actionable_recommendations) / total_recommendations
+            total_risk = sum(r['total_risk_dollars'] for r in actionable_recommendations)
             
-            f.write(f"Summary Statistics:\n")
+            f.write(f"Summary Statistics (Actionable Only):\n")
             f.write(f"  Long Positions: {long_recommendations} ({long_recommendations/total_recommendations:.1%})\n")
             f.write(f"  Short Positions: {short_recommendations} ({short_recommendations/total_recommendations:.1%})\n")
+            f.write(f"  BUY Actions: {buy_actions} ({buy_actions/total_recommendations:.1%})\n")
+            f.write(f"  SHORT Actions: {short_actions} ({short_actions/total_recommendations:.1%})\n")
             f.write(f"  Average P(Win): {avg_p_win:.1%}\n")
             f.write(f"  Average Expected Return: {avg_expected_return:.2%}\n")
             f.write(f"  Average Kelly Fraction: {avg_kelly:.1%}\n")
@@ -2496,9 +2612,10 @@ EVR Aggregated Summary:
             f.write(f"  Total Risk: ${total_risk:,.0f}\n")
             f.write(f"  Available Capital: ${self.risk_guards.current_capital:,.0f}\n\n")
             
-            f.write(f"Top 15 Aggregated Recommendations:\n")
-            for i, rec in enumerate(aggregated_recommendations[:15], 1):
-                f.write(f"{i:2d}. {rec['ticker']:6s} {rec['primary_direction']:5s} "
+            f.write(f"Top 15 Actionable Aggregated Recommendations:\n")
+            for i, rec in enumerate(actionable_recommendations[:15], 1):
+                action = rec.get('action', 'NULL')
+                f.write(f"{i:2d}. {rec['ticker']:6s} {rec['primary_direction']:5s} {action:5s} "
                        f"Signals: {rec['total_signals']:2d} P(Win): {rec['weighted_p_win']:5.1%} "
                        f"E[R]: {rec['weighted_expected_return']:6.2%} Kelly: {rec['weighted_kelly_fraction']:5.1%} "
                        f"EVR Score: {rec['evr_composite_score']:.3f}\n")
@@ -3451,6 +3568,7 @@ def main():
     parser.add_argument('--output-prefix', type=str, default='evr_aggregated', help='Prefix for output files')
     parser.add_argument('--no-cache', action='store_true', help='Disable caching for ticker data')
     parser.add_argument('--clear-cache', action='store_true', help='Clear all cached ticker data before scanning')
+    parser.add_argument('--clear-delisted', action='store_true', help='Clear delisted ticker list and retry all tickers')
     parser.add_argument('--log-level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--use-ml', action='store_true', help='Use ML classifier for probability estimation')
     parser.add_argument('--initial-capital', type=float, default=100000, help='Initial capital for risk management')
@@ -3498,6 +3616,13 @@ This scanner implements the complete EVR framework with:
                 shutil.rmtree(cache_dir)
                 cache_dir.mkdir(exist_ok=True)
                 console.print(f"[green]Cache cleared successfully[/green]")
+        
+        # Clear delisted tickers if requested
+        if args.clear_delisted:
+            delisted_file = Path("cache/delisted_tickers.json")
+            if delisted_file.exists():
+                delisted_file.unlink()
+                console.print(f"[green]Delisted ticker list cleared[/green]")
         
         # Initialize scanner with EVR framework
         scanner = OfficialTickerScanner(
@@ -3605,7 +3730,7 @@ This scanner implements the complete EVR framework with:
             if not args.clear_cache:
                 cache_stats = scanner.get_cache_stats()
                 if cache_stats.get("total_files", 0) > 0:
-                    console.print(f"\n[blue]Cache: {cache_stats['total_files']} files, {cache_stats['total_size_mb']} MB[/blue]")
+                    console.print(f"\n[blue]Cache: {cache_stats['total_files']} files, {cache_stats['total_size_mb']} MB | Delisted: {cache_stats.get('delisted_tickers', 0)}[/blue]")
             
             # Scan for trade plans
             console.print("\n[blue]Scanning for EVR trade plans...[/blue]")
