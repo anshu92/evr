@@ -186,6 +186,8 @@ class TradePlan:
     required_win_rate: float = 0.0
     # Action: BUY/SHORT/NULL based on expectancy and win rate
     action: str = "NULL"
+    # Liquidity score (0-1, higher is better)
+    liquidity_score: float = 0.0
 
 
 @dataclass
@@ -742,6 +744,137 @@ class RiskGuards:
         self.weekly_loss_breached = False
 
 
+class LiquidityGuards:
+    """Liquidity guardrails to ensure tradeable stocks."""
+    
+    def __init__(self, min_avg_volume: int = 100000, min_price: float = 1.0, 
+                 max_price: float = 10000.0, min_market_cap: float = 100000000,
+                 max_bid_ask_spread: float = 0.05, min_daily_volume: int = 50000):
+        """Initialize liquidity guards.
+        
+        Args:
+            min_avg_volume: Minimum average daily volume (30-day)
+            min_price: Minimum stock price to trade
+            max_price: Maximum stock price to trade
+            min_market_cap: Minimum market capitalization
+            max_bid_ask_spread: Maximum bid-ask spread as percentage of price
+            min_daily_volume: Minimum daily volume for current day
+        """
+        self.min_avg_volume = min_avg_volume
+        self.min_price = min_price
+        self.max_price = max_price
+        self.min_market_cap = min_market_cap
+        self.max_bid_ask_spread = max_bid_ask_spread
+        self.min_daily_volume = min_daily_volume
+    
+    def check_liquidity(self, data: pd.DataFrame, current_price: float) -> Dict[str, Any]:
+        """Check if stock meets liquidity requirements.
+        
+        Args:
+            data: Stock data DataFrame
+            current_price: Current stock price
+            
+        Returns:
+            Dictionary with liquidity checks and overall result
+        """
+        checks = {
+            'price_ok': True,
+            'volume_ok': True,
+            'avg_volume_ok': True,
+            'daily_volume_ok': True,
+            'spread_ok': True,
+            'all_checks_passed': True
+        }
+        
+        try:
+            # Check price range
+            if current_price < self.min_price or current_price > self.max_price:
+                checks['price_ok'] = False
+                checks['all_checks_passed'] = False
+            
+            # Check daily volume (if available)
+            if len(data) > 0:
+                latest_volume = data['Volume'].iloc[-1]
+                if latest_volume < self.min_daily_volume:
+                    checks['daily_volume_ok'] = False
+                    checks['all_checks_passed'] = False
+                
+                # Check average volume (30-day)
+                if len(data) >= 30:
+                    avg_volume = data['Volume'].tail(30).mean()
+                    if avg_volume < self.min_avg_volume:
+                        checks['avg_volume_ok'] = False
+                        checks['all_checks_passed'] = False
+                elif len(data) >= 10:
+                    # Use available data if less than 30 days
+                    avg_volume = data['Volume'].mean()
+                    if avg_volume < self.min_avg_volume * 0.5:  # Relaxed requirement
+                        checks['avg_volume_ok'] = False
+                        checks['all_checks_passed'] = False
+                
+                # Estimate bid-ask spread (simplified using high-low range)
+                if 'High' in data.columns and 'Low' in data.columns:
+                    latest_high = data['High'].iloc[-1]
+                    latest_low = data['Low'].iloc[-1]
+                    if latest_high > 0 and latest_low > 0:
+                        estimated_spread = (latest_high - latest_low) / current_price
+                        if estimated_spread > self.max_bid_ask_spread:
+                            checks['spread_ok'] = False
+                            checks['all_checks_passed'] = False
+            
+        except Exception as e:
+            # If we can't calculate liquidity metrics, fail the check
+            checks['all_checks_passed'] = False
+        
+        return checks
+    
+    def get_liquidity_score(self, data: pd.DataFrame, current_price: float) -> float:
+        """Calculate liquidity score (0-1, higher is better).
+        
+        Args:
+            data: Stock data DataFrame
+            current_price: Current stock price
+            
+        Returns:
+            Liquidity score between 0 and 1
+        """
+        try:
+            score = 1.0
+            
+            # Volume score (0-0.4)
+            if len(data) > 0:
+                latest_volume = data['Volume'].iloc[-1]
+                volume_score = min(1.0, latest_volume / (self.min_avg_volume * 2))
+                score *= (0.2 + 0.2 * volume_score)
+                
+                # Average volume score (0-0.3)
+                if len(data) >= 10:
+                    avg_volume = data['Volume'].tail(min(30, len(data))).mean()
+                    avg_volume_score = min(1.0, avg_volume / self.min_avg_volume)
+                    score *= (0.1 + 0.2 * avg_volume_score)
+            
+            # Price score (0-0.2)
+            if self.min_price <= current_price <= self.max_price:
+                price_score = 0.2
+            else:
+                price_score = 0.0
+            score *= price_score
+            
+            # Spread score (0-0.1)
+            if 'High' in data.columns and 'Low' in data.columns and len(data) > 0:
+                latest_high = data['High'].iloc[-1]
+                latest_low = data['Low'].iloc[-1]
+                if latest_high > 0 and latest_low > 0:
+                    estimated_spread = (latest_high - latest_low) / current_price
+                    spread_score = max(0.0, 1.0 - estimated_spread / self.max_bid_ask_spread)
+                    score *= (0.05 + 0.05 * spread_score)
+            
+            return max(0.0, min(1.0, score))
+            
+        except Exception:
+            return 0.0
+
+
 def get_us_tickers(exchange: str) -> pd.DataFrame:
     """Get official US ticker list from NASDAQ FTP.
     
@@ -788,13 +921,20 @@ class OfficialTickerScanner:
     """Official ticker scanner with full EVR framework integration."""
     
     def __init__(self, log_level: str = "INFO", use_ml_classifier: bool = False,
-                 initial_capital: float = 100000):
+                 initial_capital: float = 100000, min_avg_volume: int = 100000,
+                 min_price: float = 1.0, max_price: float = 10000.0,
+                 max_bid_ask_spread: float = 0.05, min_daily_volume: int = 50000):
         """Initialize the scanner with EVR framework.
         
         Args:
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
             use_ml_classifier: Whether to use ML classifier for probability estimation
             initial_capital: Initial capital for risk management
+            min_avg_volume: Minimum average daily volume for liquidity
+            min_price: Minimum stock price for liquidity
+            max_price: Maximum stock price for liquidity
+            max_bid_ask_spread: Maximum bid-ask spread as percentage
+            min_daily_volume: Minimum daily volume for current day
         """
         self.console = Console()
         
@@ -869,6 +1009,16 @@ class OfficialTickerScanner:
             weekly_loss_limit=0.08,
             max_drawdown_limit=0.15,
             max_positions=20
+        )
+        
+        # Initialize liquidity guards
+        self.liquidity_guards = LiquidityGuards(
+            min_avg_volume=min_avg_volume,
+            min_price=min_price,
+            max_price=max_price,
+            min_market_cap=100000000,    # $100M market cap (fixed)
+            max_bid_ask_spread=max_bid_ask_spread,
+            min_daily_volume=min_daily_volume
         )
         
         # Storage for trade plans
@@ -1657,6 +1807,12 @@ class OfficialTickerScanner:
             atr_percentage = signal.features.get('atr_percentage', 2.0)
             volatility = signal.features.get('volatility_20', 0.2)
             
+            # Check liquidity requirements
+            liquidity_checks = self.liquidity_guards.check_liquidity(data, current_price)
+            if not liquidity_checks['all_checks_passed']:
+                self.logger.debug(f"Liquidity check failed for {signal.symbol}: {liquidity_checks}")
+                return None
+            
             # Get probability estimates
             if self.use_ml_classifier and self.ml_classifier:
                 p_win = self.ml_classifier.predict_probability(signal.features)
@@ -1743,6 +1899,9 @@ class OfficialTickerScanner:
             # Compute R-unit metrics and assign action
             self._compute_r_unit_metrics(trade_plan)
             self._assign_action(trade_plan)
+            
+            # Calculate and store liquidity score
+            trade_plan.liquidity_score = self.liquidity_guards.get_liquidity_score(data, current_price)
             
             return trade_plan
             
@@ -2128,6 +2287,7 @@ class OfficialTickerScanner:
         table.add_column("Costs", style="red", width=8)
         table.add_column("E[R]", style="blue", width=8)
         table.add_column("Min P", style="yellow", width=8)
+        table.add_column("Liquidity", style="cyan", width=8)
         table.add_column("Score", style="magenta", width=8)
         
         for i, plan in enumerate(trade_plans[:top_n], 1):
@@ -2155,6 +2315,7 @@ class OfficialTickerScanner:
                 f"{plan.costs_r:.2f}R",
                 f"[{expectancy_color}]{plan.expectancy_r:.3f}R[/{expectancy_color}]",
                 f"{plan.min_win_rate:.1%}",
+                f"{plan.liquidity_score:.2f}",
                 f"{plan.expectancy_r + (0.1 if plan.p_win >= plan.required_win_rate else 0):.3f}"
             )
         
@@ -2226,7 +2387,8 @@ EVR Trade Plan Summary:
                 'expectancy_r': plan.expectancy_r,
                 'min_win_rate': plan.min_win_rate,
                 'required_win_rate': plan.required_win_rate,
-                'action': plan.action
+                'action': plan.action,
+                'liquidity_score': plan.liquidity_score
             }
             trade_plan_dicts.append(plan_dict)
         
@@ -3583,6 +3745,13 @@ def main():
     parser.add_argument('--training-window', type=int, default=90, help='Training window in days for walk-forward analysis')
     parser.add_argument('--testing-window', type=int, default=30, help='Testing window in days for walk-forward analysis')
     
+    # Liquidity guardrails arguments
+    parser.add_argument('--min-volume', type=int, default=100000, help='Minimum average daily volume for liquidity')
+    parser.add_argument('--min-price', type=float, default=1.0, help='Minimum stock price for liquidity')
+    parser.add_argument('--max-price', type=float, default=10000.0, help='Maximum stock price for liquidity')
+    parser.add_argument('--max-spread', type=float, default=0.05, help='Maximum bid-ask spread as percentage')
+    parser.add_argument('--min-daily-volume', type=int, default=50000, help='Minimum daily volume for current day')
+    
     args = parser.parse_args()
     
     console = Console()
@@ -3628,7 +3797,12 @@ This scanner implements the complete EVR framework with:
         scanner = OfficialTickerScanner(
             log_level=args.log_level,
             use_ml_classifier=args.use_ml,
-            initial_capital=args.initial_capital
+            initial_capital=args.initial_capital,
+            min_avg_volume=args.min_volume,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            max_bid_ask_spread=args.max_spread,
+            min_daily_volume=args.min_daily_volume
         )
         
         # Get ticker list
