@@ -22,7 +22,7 @@ import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -205,7 +205,8 @@ class RollingBayes:
     """Empirical Bayes probability estimation engine."""
     
     def __init__(self, window_size: int = 252, alpha: float = 1.0, beta: float = 1.0, 
-                 ewma_decay: float = 0.1, use_regimes: bool = False, regime_window: int = 63):
+                 ewma_decay: float = 0.1, use_regimes: bool = False, regime_window: int = 63,
+                 portfolio_manager: Optional['PortfolioManager'] = None):
         """Initialize RollingBayes engine.
         
         Args:
@@ -215,6 +216,7 @@ class RollingBayes:
             ewma_decay: EWMA decay factor for return tracking
             use_regimes: Whether to use volatility regime conditioning
             regime_window: Window size for regime calculation
+            portfolio_manager: Portfolio manager for historical data
         """
         self.window_size = window_size
         self.alpha = alpha
@@ -222,6 +224,7 @@ class RollingBayes:
         self.ewma_decay = ewma_decay
         self.use_regimes = use_regimes
         self.regime_window = regime_window
+        self.portfolio_manager = portfolio_manager
         
         # Storage for historical data
         self.counters = defaultdict(lambda: {
@@ -233,6 +236,43 @@ class RollingBayes:
         self.regime_counters = defaultdict(lambda: defaultdict(lambda: {
             'wins': 0, 'trades': 0, 'returns': [], 'avg_win': 0.0, 'avg_loss': 0.0
         }))
+        
+        # Load historical data from portfolio if available
+        if self.portfolio_manager:
+            self._load_historical_data()
+    
+    def _load_historical_data(self) -> None:
+        """Load historical trade data from portfolio manager."""
+        if not self.portfolio_manager:
+            return
+        
+        # Get closed positions from portfolio
+        closed_positions = [p for p in self.portfolio_manager.state.positions if p.status != "OPEN"]
+        
+        for position in closed_positions:
+            if position.pnl is not None and position.exit_date is not None:
+                # Calculate return percentage
+                return_pct = position.return_pct if position.return_pct is not None else 0.0
+                
+                # Determine if it was a win
+                is_win = return_pct > 0
+                
+                # Update counters
+                key = self._get_key(position.setup, position.ticker)
+                counter = self.counters[key]
+                
+                counter['trades'] += 1
+                if is_win:
+                    counter['wins'] += 1
+                
+                counter['returns'].append(return_pct)
+                counter['timestamps'].append(position.exit_date)
+                
+                # Update averages
+                if is_win:
+                    counter['avg_win'] = sum([r for r in counter['returns'] if r > 0]) / len([r for r in counter['returns'] if r > 0])
+                else:
+                    counter['avg_loss'] = sum([r for r in counter['returns'] if r < 0]) / len([r for r in counter['returns'] if r < 0])
     
     def _get_key(self, setup: str, ticker: str, timeframe: str = '1d') -> Tuple[str, str, str]:
         """Get storage key for counters."""
@@ -875,6 +915,238 @@ class LiquidityGuards:
             return 0.0
 
 
+@dataclass
+class PortfolioPosition:
+    """Portfolio position tracking."""
+    ticker: str
+    setup: str
+    entry_price: float
+    stop_price: float
+    target_prices: List[float]
+    position_size: float
+    entry_date: datetime
+    p_win: float
+    expected_return: float
+    kelly_fraction: float
+    risk_dollars: float
+    status: str = "OPEN"  # OPEN, CLOSED, STOPPED_OUT, TARGET_HIT
+    exit_price: Optional[float] = None
+    exit_date: Optional[datetime] = None
+    pnl: Optional[float] = None
+    return_pct: Optional[float] = None
+
+
+@dataclass
+class PortfolioState:
+    """Portfolio state tracking."""
+    total_capital: float
+    available_capital: float
+    allocated_capital: float
+    total_pnl: float
+    total_return_pct: float
+    positions: List[PortfolioPosition]
+    last_updated: datetime
+    run_count: int
+    performance_history: List[Dict[str, Any]]
+
+
+class PortfolioManager:
+    """Portfolio management system with $1000 allocation and performance tracking."""
+    
+    def __init__(self, initial_capital: float = 1000.0, data_file: str = "portfolio_state.json"):
+        """Initialize portfolio manager.
+        
+        Args:
+            initial_capital: Initial capital allocation
+            data_file: File to persist portfolio state
+        """
+        self.initial_capital = initial_capital
+        self.data_file = Path(data_file)
+        self.state = self._load_state()
+        
+    def _load_state(self) -> PortfolioState:
+        """Load portfolio state from file or create new."""
+        if self.data_file.exists():
+            try:
+                with open(self.data_file, 'r') as f:
+                    data = json.load(f)
+                
+                # Convert positions back to PortfolioPosition objects
+                positions = []
+                for pos_data in data.get('positions', []):
+                    pos = PortfolioPosition(**pos_data)
+                    # Convert string dates back to datetime
+                    if isinstance(pos.entry_date, str):
+                        pos.entry_date = datetime.fromisoformat(pos.entry_date)
+                    if isinstance(pos.exit_date, str):
+                        pos.exit_date = datetime.fromisoformat(pos.exit_date)
+                    positions.append(pos)
+                
+                # Convert last_updated string to datetime
+                last_updated = data.get('last_updated')
+                if isinstance(last_updated, str):
+                    last_updated = datetime.fromisoformat(last_updated)
+                
+                return PortfolioState(
+                    total_capital=data.get('total_capital', self.initial_capital),
+                    available_capital=data.get('available_capital', self.initial_capital),
+                    allocated_capital=data.get('allocated_capital', 0.0),
+                    total_pnl=data.get('total_pnl', 0.0),
+                    total_return_pct=data.get('total_return_pct', 0.0),
+                    positions=positions,
+                    last_updated=last_updated or datetime.now(),
+                    run_count=data.get('run_count', 0),
+                    performance_history=data.get('performance_history', [])
+                )
+            except Exception as e:
+                print(f"Error loading portfolio state: {e}")
+                return self._create_initial_state()
+        else:
+            return self._create_initial_state()
+    
+    def _create_initial_state(self) -> PortfolioState:
+        """Create initial portfolio state."""
+        return PortfolioState(
+            total_capital=self.initial_capital,
+            available_capital=self.initial_capital,
+            allocated_capital=0.0,
+            total_pnl=0.0,
+            total_return_pct=0.0,
+            positions=[],
+            last_updated=datetime.now(),
+            run_count=0,
+            performance_history=[]
+        )
+    
+    def _save_state(self) -> None:
+        """Save portfolio state to file."""
+        try:
+            # Convert to serializable format
+            state_dict = asdict(self.state)
+            
+            # Convert datetime objects to strings
+            state_dict['last_updated'] = self.state.last_updated.isoformat()
+            for pos in state_dict['positions']:
+                if pos['entry_date']:
+                    pos['entry_date'] = pos['entry_date'].isoformat()
+                if pos['exit_date']:
+                    pos['exit_date'] = pos['exit_date'].isoformat()
+            
+            with open(self.data_file, 'w') as f:
+                json.dump(state_dict, f, indent=2)
+        except Exception as e:
+            print(f"Error saving portfolio state: {e}")
+    
+    def update_allocation(self, new_capital: float) -> None:
+        """Update the total capital allocation."""
+        self.state.total_capital = new_capital
+        self.state.available_capital = new_capital - self.state.allocated_capital
+        self.state.run_count += 1
+        self.state.last_updated = datetime.now()
+        self._save_state()
+    
+    def add_position(self, trade_plan: TradePlan) -> bool:
+        """Add a new position to the portfolio."""
+        if self.state.available_capital < trade_plan.risk_dollars:
+            return False
+        
+        position = PortfolioPosition(
+            ticker=trade_plan.ticker,
+            setup=trade_plan.setup,
+            entry_price=trade_plan.entry,
+            stop_price=trade_plan.stop,
+            target_prices=trade_plan.targets,
+            position_size=trade_plan.position_size,
+            entry_date=datetime.now(),
+            p_win=trade_plan.p_win,
+            expected_return=trade_plan.expected_return,
+            kelly_fraction=trade_plan.kelly_fraction,
+            risk_dollars=trade_plan.risk_dollars
+        )
+        
+        self.state.positions.append(position)
+        self.state.allocated_capital += trade_plan.risk_dollars
+        self.state.available_capital -= trade_plan.risk_dollars
+        self._save_state()
+        return True
+    
+    def close_position(self, ticker: str, exit_price: float, reason: str = "MANUAL") -> Optional[PortfolioPosition]:
+        """Close a position and calculate P&L."""
+        for position in self.state.positions:
+            if position.ticker == ticker and position.status == "OPEN":
+                position.exit_price = exit_price
+                position.exit_date = datetime.now()
+                position.status = reason
+                
+                # Calculate P&L
+                position.pnl = (exit_price - position.entry_price) * position.position_size
+                position.return_pct = (exit_price - position.entry_price) / position.entry_price
+                
+                # Update portfolio totals
+                self.state.total_pnl += position.pnl
+                self.state.total_capital += position.pnl
+                self.state.available_capital += position.risk_dollars + position.pnl
+                self.state.allocated_capital -= position.risk_dollars
+                
+                # Update return percentage
+                self.state.total_return_pct = (self.state.total_capital - self.initial_capital) / self.initial_capital
+                
+                # Record performance
+                self._record_performance()
+                self._save_state()
+                return position
+        
+        return None
+    
+    def _record_performance(self) -> None:
+        """Record current performance metrics."""
+        performance = {
+            'timestamp': datetime.now().isoformat(),
+            'total_capital': self.state.total_capital,
+            'total_pnl': self.state.total_pnl,
+            'total_return_pct': self.state.total_return_pct,
+            'open_positions': len([p for p in self.state.positions if p.status == "OPEN"]),
+            'run_count': self.state.run_count
+        }
+        self.state.performance_history.append(performance)
+    
+    def get_portfolio_summary(self) -> Dict[str, Any]:
+        """Get portfolio summary statistics."""
+        open_positions = [p for p in self.state.positions if p.status == "OPEN"]
+        closed_positions = [p for p in self.state.positions if p.status != "OPEN"]
+        
+        # Calculate win rate
+        wins = len([p for p in closed_positions if p.pnl and p.pnl > 0])
+        total_trades = len(closed_positions)
+        win_rate = wins / total_trades if total_trades > 0 else 0.0
+        
+        # Calculate average win/loss
+        win_pnls = [p.pnl for p in closed_positions if p.pnl and p.pnl > 0]
+        loss_pnls = [p.pnl for p in closed_positions if p.pnl and p.pnl < 0]
+        
+        avg_win = sum(win_pnls) / len(win_pnls) if win_pnls else 0.0
+        avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+        
+        return {
+            'total_capital': self.state.total_capital,
+            'available_capital': self.state.available_capital,
+            'allocated_capital': self.state.allocated_capital,
+            'total_pnl': self.state.total_pnl,
+            'total_return_pct': self.state.total_return_pct,
+            'open_positions': len(open_positions),
+            'closed_positions': len(closed_positions),
+            'win_rate': win_rate,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'run_count': self.state.run_count,
+            'last_updated': self.state.last_updated
+        }
+    
+    def get_historical_performance(self) -> List[Dict[str, Any]]:
+        """Get historical performance data."""
+        return self.state.performance_history
+
+
 def get_us_tickers(exchange: str) -> pd.DataFrame:
     """Get official US ticker list from NASDAQ FTP.
     
@@ -921,9 +1193,10 @@ class OfficialTickerScanner:
     """Official ticker scanner with full EVR framework integration."""
     
     def __init__(self, log_level: str = "INFO", use_ml_classifier: bool = False,
-                 initial_capital: float = 100000, min_avg_volume: int = 100000,
+                 initial_capital: float = 1000, min_avg_volume: int = 100000,
                  min_price: float = 1.0, max_price: float = 10000.0,
-                 max_bid_ask_spread: float = 0.05, min_daily_volume: int = 50000):
+                 max_bid_ask_spread: float = 0.05, min_daily_volume: int = 50000,
+                 portfolio_file: str = "portfolio_state.json"):
         """Initialize the scanner with EVR framework.
         
         Args:
@@ -963,14 +1236,21 @@ class OfficialTickerScanner:
         self.rate_limiter = RateLimiter(base_delay=0.5, max_delay=10.0, backoff_factor=1.5)
         self.data_fetcher = ParallelDataFetcher(max_workers=8, rate_limiter=self.rate_limiter)
         
-        # Initialize EVR framework components
+        # Initialize portfolio manager
+        self.portfolio_manager = PortfolioManager(
+            initial_capital=initial_capital,
+            data_file=portfolio_file
+        )
+        
+        # Initialize EVR framework components with portfolio manager
         self.prob_model = RollingBayes(
             window_size=252,
             alpha=1.0,
             beta=1.0,
             ewma_decay=0.1,
             use_regimes=True,
-            regime_window=63
+            regime_window=63,
+            portfolio_manager=self.portfolio_manager
         )
         
         # Initialize ML classifier if requested and available
@@ -2785,6 +3065,80 @@ EVR Aggregated Summary:
         
         self.logger.info(f"Saved aggregated summary to {summary_file}")
     
+    def display_portfolio_status(self) -> None:
+        """Display current portfolio status and allocation."""
+        summary = self.portfolio_manager.get_portfolio_summary()
+        
+        # Create portfolio status table
+        table = Table(title="Portfolio Status & Allocation")
+        table.add_column("Metric", style="cyan", width=20)
+        table.add_column("Value", style="green", width=15)
+        table.add_column("Details", style="yellow", width=30)
+        
+        # Capital allocation
+        table.add_row(
+            "Total Capital",
+            f"${summary['total_capital']:,.2f}",
+            f"Initial: $1000, P&L: ${summary['total_pnl']:,.2f}"
+        )
+        
+        table.add_row(
+            "Available Capital",
+            f"${summary['available_capital']:,.2f}",
+            f"{(summary['available_capital']/summary['total_capital']*100):.1f}% of total"
+        )
+        
+        table.add_row(
+            "Allocated Capital",
+            f"${summary['allocated_capital']:,.2f}",
+            f"{(summary['allocated_capital']/summary['total_capital']*100):.1f}% of total"
+        )
+        
+        # Performance metrics
+        table.add_row(
+            "Total Return",
+            f"{summary['total_return_pct']:.2%}",
+            f"${summary['total_pnl']:,.2f} absolute"
+        )
+        
+        table.add_row(
+            "Open Positions",
+            str(summary['open_positions']),
+            f"Risk: ${summary['allocated_capital']:,.2f}"
+        )
+        
+        table.add_row(
+            "Closed Positions",
+            str(summary['closed_positions']),
+            f"Win Rate: {summary['win_rate']:.1%}"
+        )
+        
+        if summary['closed_positions'] > 0:
+            table.add_row(
+                "Avg Win",
+                f"${summary['avg_win']:,.2f}",
+                f"{(summary['avg_win']/summary['total_capital']*100):.1f}%"
+            )
+            
+            table.add_row(
+                "Avg Loss",
+                f"${summary['avg_loss']:,.2f}",
+                f"{(summary['avg_loss']/summary['total_capital']*100):.1f}%"
+            )
+        
+        table.add_row(
+            "Run Count",
+            str(summary['run_count']),
+            f"Last: {summary['last_updated'].strftime('%Y-%m-%d %H:%M')}"
+        )
+        
+        self.console.print(table)
+        
+        # Display allocation update
+        self.console.print(f"\n[blue]Updating allocation to ${summary['total_capital']:,.2f}...[/blue]")
+        self.portfolio_manager.update_allocation(summary['total_capital'])
+        self.console.print(f"[green]✅ Allocation updated successfully![/green]")
+    
     def backtest_strategy(self, tickers: List[str], start_date: str = "2023-01-01", 
                          end_date: str = "2024-01-01", initial_capital: float = 100000,
                          max_positions: int = 10, rebalance_frequency: str = "weekly") -> Dict[str, Any]:
@@ -3804,6 +4158,10 @@ This scanner implements the complete EVR framework with:
             max_bid_ask_spread=args.max_spread,
             min_daily_volume=args.min_daily_volume
         )
+        
+        # Display portfolio status and update allocation
+        console.print("\n[blue]Portfolio Status & Allocation Update...[/blue]")
+        scanner.display_portfolio_status()
         
         # Get ticker list
         console.print("\n[blue]Getting official ticker lists...[/blue]")
