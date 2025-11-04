@@ -17,6 +17,7 @@ This scanner implements the complete EVR framework with:
 
 import json
 import logging
+import sys
 import time
 import random
 from datetime import datetime, timedelta
@@ -169,7 +170,7 @@ class TradePlan:
     avg_r_loss: float
     expected_return: float
     kelly_fraction: float
-    position_size: float
+    position_size: float  # Dollar value of position
     risk_dollars: float
     notes: str
     signal_type: str
@@ -177,6 +178,7 @@ class TradePlan:
     take_profit: float
     cost_bps: float
     slippage_bps: float
+    shares: int = 0  # Number of shares to buy
     # R-unit metrics (added dynamically)
     r_unit: float = 0.0
     reward_r: float = 0.0
@@ -923,12 +925,13 @@ class PortfolioPosition:
     entry_price: float
     stop_price: float
     target_prices: List[float]
-    position_size: float
-    entry_date: datetime
-    p_win: float
-    expected_return: float
-    kelly_fraction: float
-    risk_dollars: float
+    position_size: float  # Number of shares
+    shares: int = 0  # Explicit number of shares field
+    entry_date: datetime = None
+    p_win: float = 0.0
+    expected_return: float = 0.0
+    kelly_fraction: float = 0.0
+    risk_dollars: float = 0.0
     status: str = "OPEN"  # OPEN, CLOSED, STOPPED_OUT, TARGET_HIT
     exit_price: Optional[float] = None
     exit_date: Optional[datetime] = None
@@ -962,6 +965,7 @@ class PortfolioManager:
         """
         self.initial_capital = initial_capital
         self.data_file = Path(data_file)
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.state = self._load_state()
         
     def _load_state(self) -> PortfolioState:
@@ -974,6 +978,9 @@ class PortfolioManager:
                 # Convert positions back to PortfolioPosition objects
                 positions = []
                 for pos_data in data.get('positions', []):
+                    # Handle backward compatibility: if 'shares' field doesn't exist, set it from position_size
+                    if 'shares' not in pos_data:
+                        pos_data['shares'] = int(pos_data.get('position_size', 0))
                     pos = PortfolioPosition(**pos_data)
                     # Convert string dates back to datetime
                     if isinstance(pos.entry_date, str):
@@ -1019,10 +1026,14 @@ class PortfolioManager:
         )
     
     def _save_state(self) -> None:
-        """Save portfolio state to file."""
+        """Save portfolio state to file (only open positions)."""
         try:
             # Convert to serializable format
             state_dict = asdict(self.state)
+            
+            # Filter to only keep open positions
+            open_positions = [pos for pos in state_dict['positions'] if pos['status'] == 'OPEN']
+            state_dict['positions'] = open_positions
             
             # Convert datetime objects to strings
             state_dict['last_updated'] = self.state.last_updated.isoformat()
@@ -1041,13 +1052,29 @@ class PortfolioManager:
         """Update the total capital allocation."""
         self.state.total_capital = new_capital
         self.state.available_capital = new_capital - self.state.allocated_capital
+        self.state.last_updated = datetime.now()
+        self._save_state()
+    
+    def increment_run_count(self) -> None:
+        """Increment run count and update timestamp."""
         self.state.run_count += 1
         self.state.last_updated = datetime.now()
         self._save_state()
     
     def add_position(self, trade_plan: TradePlan) -> bool:
-        """Add a new position to the portfolio."""
-        if self.state.available_capital < trade_plan.risk_dollars:
+        """Add a new position to the portfolio.
+        
+        Returns:
+            bool: True if position added successfully, False otherwise
+        """
+        # Check if position already exists for this ticker/setup
+        existing_position = self._find_existing_position(trade_plan.ticker, trade_plan.setup)
+        if existing_position:
+            self.logger.debug(f"Position already exists for {trade_plan.ticker} ({trade_plan.setup}), skipping duplicate")
+            return False
+        
+        # Check if we have enough capital (position_size is in dollars)
+        if self.state.available_capital < trade_plan.position_size:
             return False
         
         position = PortfolioPosition(
@@ -1056,7 +1083,8 @@ class PortfolioManager:
             entry_price=trade_plan.entry,
             stop_price=trade_plan.stop,
             target_prices=trade_plan.targets,
-            position_size=trade_plan.position_size,
+            position_size=trade_plan.position_size,  # Dollar value
+            shares=trade_plan.shares,  # Number of shares
             entry_date=datetime.now(),
             p_win=trade_plan.p_win,
             expected_return=trade_plan.expected_return,
@@ -1065,10 +1093,115 @@ class PortfolioManager:
         )
         
         self.state.positions.append(position)
-        self.state.allocated_capital += trade_plan.risk_dollars
-        self.state.available_capital -= trade_plan.risk_dollars
+        # Deduct the dollar value of the position from available capital
+        self.state.allocated_capital += trade_plan.position_size
+        self.state.available_capital -= trade_plan.position_size
         self._save_state()
         return True
+    
+    def _find_existing_position(self, ticker: str, setup: str) -> Optional[PortfolioPosition]:
+        """Find existing open position for ticker/setup combination.
+        
+        Args:
+            ticker: Stock ticker
+            setup: Trading setup name
+            
+        Returns:
+            PortfolioPosition if found, None otherwise
+        """
+        for position in self.state.positions:
+            if position.status == "OPEN" and position.ticker == ticker and position.setup == setup:
+                return position
+        return None
+    
+    def monitor_and_close_positions(self, data_fetcher) -> Dict[str, Any]:
+        """Monitor all open positions and automatically close those that hit stops or targets.
+        
+        Args:
+            data_fetcher: ParallelDataFetcher instance to fetch current prices
+            
+        Returns:
+            Dictionary with monitoring results
+        """
+        open_positions = [p for p in self.state.positions if p.status == "OPEN"]
+        
+        if not open_positions:
+            return {
+                'monitored': 0,
+                'closed': 0,
+                'stopped_out': 0,
+                'targets_hit': 0,
+                'errors': 0
+            }
+        
+        # Fetch current data for all open positions
+        tickers = [p.ticker for p in open_positions]
+        self.logger.info(f"Monitoring {len(tickers)} open positions: {', '.join(tickers)}")
+        
+        ticker_data = data_fetcher.fetch_multiple_tickers(tickers, period="5d")
+        
+        results = {
+            'monitored': len(tickers),
+            'closed': 0,
+            'stopped_out': 0,
+            'targets_hit': 0,
+            'errors': 0
+        }
+        
+        for position in open_positions:
+            data = ticker_data.get(position.ticker)
+            
+            if data is None or data.empty:
+                self.logger.warning(f"Could not fetch data for {position.ticker}, skipping position check")
+                results['errors'] += 1
+                continue
+            
+            try:
+                # Get current price (latest close)
+                current_price = float(data['Close'].iloc[-1])
+                
+                # Determine if long or short based on entry/stop relationship
+                is_long = position.entry_price > position.stop_price
+                
+                should_close = False
+                reason = None
+                
+                if is_long:
+                    # Long position checks
+                    if current_price <= position.stop_price:
+                        should_close = True
+                        reason = "STOPPED_OUT"
+                        results['stopped_out'] += 1
+                    elif position.target_prices and current_price >= position.target_prices[0]:
+                        should_close = True
+                        reason = "TARGET_HIT"
+                        results['targets_hit'] += 1
+                else:
+                    # Short position checks
+                    if current_price >= position.stop_price:
+                        should_close = True
+                        reason = "STOPPED_OUT"
+                        results['stopped_out'] += 1
+                    elif position.target_prices and current_price <= position.target_prices[0]:
+                        should_close = True
+                        reason = "TARGET_HIT"
+                        results['targets_hit'] += 1
+                
+                if should_close:
+                    closed_pos = self.close_position(position.ticker, current_price, reason)
+                    if closed_pos:
+                        results['closed'] += 1
+                        pnl_str = f"${closed_pos.pnl:+,.2f}" if closed_pos.pnl else "N/A"
+                        self.logger.info(
+                            f"✓ Closed {position.ticker} @ ${current_price:.2f} ({reason}) - "
+                            f"Entry: ${position.entry_price:.2f}, P&L: {pnl_str}"
+                        )
+                
+            except Exception as e:
+                self.logger.error(f"Error monitoring position {position.ticker}: {e}")
+                results['errors'] += 1
+        
+        return results
     
     def close_position(self, ticker: str, exit_price: float, reason: str = "MANUAL") -> Optional[PortfolioPosition]:
         """Close a position and calculate P&L."""
@@ -1078,15 +1211,16 @@ class PortfolioManager:
                 position.exit_date = datetime.now()
                 position.status = reason
                 
-                # Calculate P&L
-                position.pnl = (exit_price - position.entry_price) * position.position_size
+                # Calculate P&L based on shares
+                position.pnl = (exit_price - position.entry_price) * position.shares
                 position.return_pct = (exit_price - position.entry_price) / position.entry_price
                 
                 # Update portfolio totals
                 self.state.total_pnl += position.pnl
                 self.state.total_capital += position.pnl
-                self.state.available_capital += position.risk_dollars + position.pnl
-                self.state.allocated_capital -= position.risk_dollars
+                # Return the original position_size (dollars) plus P&L to available capital
+                self.state.available_capital += position.position_size + position.pnl
+                self.state.allocated_capital -= position.position_size
                 
                 # Update return percentage
                 self.state.total_return_pct = (self.state.total_capital - self.initial_capital) / self.initial_capital
@@ -1192,7 +1326,7 @@ def get_us_tickers(exchange: str) -> pd.DataFrame:
 class OfficialTickerScanner:
     """Official ticker scanner with full EVR framework integration."""
     
-    def __init__(self, log_level: str = "INFO", use_ml_classifier: bool = False,
+    def __init__(self, log_level: str = "INFO", use_ml_classifier: bool = True,
                  initial_capital: float = 1000, min_avg_volume: int = 100000,
                  min_price: float = 1.0, max_price: float = 10000.0,
                  max_bid_ask_spread: float = 0.05, min_daily_volume: int = 50000,
@@ -1201,7 +1335,7 @@ class OfficialTickerScanner:
         
         Args:
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-            use_ml_classifier: Whether to use ML classifier for probability estimation
+            use_ml_classifier: Whether to use ML classifier for probability estimation (Bayesian calibration)
             initial_capital: Initial capital for risk management
             min_avg_volume: Minimum average daily volume for liquidity
             min_price: Minimum stock price for liquidity
@@ -1252,6 +1386,9 @@ class OfficialTickerScanner:
             regime_window=63,
             portfolio_manager=self.portfolio_manager
         )
+        
+        # Load trained parameters if available
+        self._load_trained_parameters()
         
         # Initialize ML classifier if requested and available
         self.use_ml_classifier = use_ml_classifier and ML_AVAILABLE
@@ -1305,6 +1442,139 @@ class OfficialTickerScanner:
         self.trade_plans = []
         
         self.logger.info("OfficialTickerScanner with EVR framework initialized")
+    
+    def _load_trained_parameters(self) -> None:
+        """Load trained parameters from historical backtesting if available."""
+        try:
+            from parameter_integration import integrate_trained_parameters
+            
+            params_path = Path("trained_parameters/scanner_parameters.json")
+            
+            # Check if parameters exist
+            if params_path.exists():
+                # Check age of parameters
+                needs_retraining = self._check_parameters_age(params_path)
+                
+                if needs_retraining:
+                    self.logger.info("⏰ Training parameters are 3+ days old, triggering retraining...")
+                    self._retrain_parameters(is_initial=False)
+            else:
+                # Parameters don't exist - trigger initial training
+                self.logger.info("📊 No trained parameters found, triggering initial training...")
+                self._retrain_parameters(is_initial=True)
+            
+            # Load parameters (either existing or newly trained)
+            if params_path.exists():
+                success = integrate_trained_parameters(self, str(params_path))
+                if success:
+                    self.logger.info("✓ Loaded trained parameters from historical backtesting")
+                else:
+                    self.logger.warning("Failed to load trained parameters, using defaults")
+            else:
+                self.logger.warning("Training failed or parameters not created, using default priors")
+                self.logger.info("You can manually train by running: python run_parameter_training.py")
+                
+        except ImportError:
+            self.logger.warning("parameter_integration module not found, using default priors")
+        except Exception as e:
+            self.logger.warning(f"Error loading trained parameters: {e}, using defaults")
+    
+    def _check_parameters_age(self, params_path: Path) -> bool:
+        """Check if training parameters are 3+ days old.
+        
+        Args:
+            params_path: Path to parameters file
+            
+        Returns:
+            True if parameters need retraining (3+ days old), False otherwise
+        """
+        try:
+            # Read the parameters file
+            with open(params_path, 'r') as f:
+                params = json.load(f)
+            
+            # Get training date from metadata
+            training_date_str = params.get('metadata', {}).get('training_date')
+            if not training_date_str:
+                self.logger.warning("No training date found in parameters, triggering retraining")
+                return True
+            
+            # Parse training date
+            training_date = datetime.fromisoformat(training_date_str)
+            current_date = datetime.now()
+            
+            # Calculate age in days
+            age_days = (current_date - training_date).days
+            
+            self.logger.info(f"Training parameters age: {age_days} days")
+            
+            # Return True if 3+ days old
+            return age_days >= 3
+            
+        except Exception as e:
+            self.logger.warning(f"Error checking parameter age: {e}, assuming retraining needed")
+            return True
+    
+    def _retrain_parameters(self, is_initial: bool = False) -> None:
+        """Retrain parameters by running the training script.
+        
+        Args:
+            is_initial: True if this is initial training (no parameters exist), False for retraining
+        """
+        try:
+            import subprocess
+            
+            if is_initial:
+                self.logger.info("🔄 Starting initial parameter training...")
+                self.console.print(Panel(
+                    "[cyan]No trained parameters found - performing initial training[/cyan]\n"
+                    "[yellow]Training probability models from historical data...[/yellow]\n"
+                    "[blue]This may take 5-10 minutes. Please wait...[/blue]",
+                    title="📊 Initial Training",
+                    border_style="cyan"
+                ))
+            else:
+                self.logger.info("🔄 Starting automatic parameter retraining...")
+                self.console.print(Panel(
+                    "[yellow]Training parameters are outdated (3+ days old)[/yellow]\n"
+                    "[cyan]Automatically retraining parameters from historical data...[/cyan]\n"
+                    "[blue]This may take 5-10 minutes. Please wait...[/blue]",
+                    title="⏰ Automatic Retraining",
+                    border_style="yellow"
+                ))
+            
+            # Run the training script
+            result = subprocess.run(
+                [sys.executable, "run_parameter_training.py", "--mode", "train"],
+                capture_output=True,
+                text=True,
+                timeout=900  # 15 minute timeout
+            )
+            
+            if result.returncode == 0:
+                if is_initial:
+                    self.logger.info("✓ Initial training completed successfully")
+                    self.console.print("[green]✓ Parameters trained successfully![/green]")
+                else:
+                    self.logger.info("✓ Automatic retraining completed successfully")
+                    self.console.print("[green]✓ Parameters retrained successfully![/green]")
+            else:
+                self.logger.error(f"Training failed with return code {result.returncode}")
+                self.logger.error(f"Stderr: {result.stderr}")
+                if is_initial:
+                    self.console.print("[red]⚠ Initial training failed, using default parameters[/red]")
+                else:
+                    self.console.print("[red]⚠ Automatic retraining failed, using existing parameters[/red]")
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("Training timed out after 15 minutes")
+            self.console.print("[red]⚠ Training timed out, using default parameters[/red]")
+        except FileNotFoundError:
+            self.logger.error("run_parameter_training.py not found, skipping training")
+            self.console.print("[red]⚠ Training script not found, using default parameters[/red]")
+        except Exception as e:
+            self.logger.error(f"Error during training: {e}")
+            self.console.print(f"[red]⚠ Training error: {e}, using default parameters[/red]")
     
     def get_comprehensive_tickers(self, use_cache: bool = True) -> List[str]:
         """Get comprehensive list of NYSE and NASDAQ tickers.
@@ -2167,6 +2437,7 @@ class OfficialTickerScanner:
                 expected_return=expected_return,
                 kelly_fraction=kelly_fraction,
                 position_size=position_size,
+                shares=shares,
                 risk_dollars=risk_dollars,
                 notes=f"Generated from {signal.setup} signal",
                 signal_type=signal.setup,
@@ -2325,6 +2596,10 @@ class OfficialTickerScanner:
         Returns:
             List of TradePlan objects
         """
+        if not tickers:
+            self.logger.debug("No tickers provided for processing; skipping batch")
+            return []
+
         def process_single_ticker(ticker: str) -> List[TradePlan]:
             """Process a single ticker and return trade plans."""
             ticker_start = time.time()
@@ -2370,7 +2645,11 @@ class OfficialTickerScanner:
         # Process tickers in parallel
         all_trade_plans = []
         
-        with ThreadPoolExecutor(max_workers=min(12, len(tickers))) as executor:
+        max_workers = min(12, len(tickers))
+        if max_workers <= 0:
+            return []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_ticker = {
                 executor.submit(process_single_ticker, ticker): ticker 
@@ -2398,6 +2677,10 @@ class OfficialTickerScanner:
         Returns:
             List of recommendations
         """
+        if not tickers:
+            self.logger.debug("No tickers provided for backtest processing; skipping batch")
+            return []
+
         def process_single_backtest_ticker(ticker: str) -> List[Dict[str, Any]]:
             """Process a single ticker for backtesting."""
             try:
@@ -2457,7 +2740,11 @@ class OfficialTickerScanner:
         # Process tickers in parallel
         all_recommendations = []
         
-        with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as executor:
+        max_workers = min(8, len(tickers))
+        if max_workers <= 0:
+            return []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_ticker = {
                 executor.submit(process_single_backtest_ticker, ticker): ticker 
@@ -2753,104 +3040,158 @@ EVR Trade Plan Summary:
         for ticker, plans in ticker_plans.items():
             if not plans:
                 continue
-            
+
             # Calculate aggregated EVR metrics
             total_plans = len(plans)
-            
-            # Weight by Kelly fraction and expected return
-            total_weight = sum(plan.kelly_fraction * abs(plan.expected_return) for plan in plans)
-            
+
+            # Separate plans by direction for primary aggregation
+            long_plans = [plan for plan in plans if plan.entry > plan.stop]
+            short_plans = [plan for plan in plans if plan.entry < plan.stop]
+
+            # Determine primary direction (default to LONG on ties to keep behaviour stable)
+            if len(long_plans) >= len(short_plans):
+                primary_direction = "LONG"
+                primary_plans = long_plans
+                opposing_direction = "SHORT"
+                opposing_plans = short_plans
+            else:
+                primary_direction = "SHORT"
+                primary_plans = short_plans
+                opposing_direction = "LONG"
+                opposing_plans = long_plans
+
+            # Fallback to all plans if we somehow have no plans for the primary side
+            if not primary_plans:
+                primary_plans = plans
+                primary_direction = "LONG" if plans[0].entry > plans[0].stop else "SHORT"
+                opposing_direction = "SHORT" if primary_direction == "LONG" else "LONG"
+                opposing_plans = []
+
+            primary_plan_count = len(primary_plans)
+            opposing_plan_count = len(opposing_plans)
+
+            # FIX: Use weighted averages based on the primary-direction plans only
+            total_weight = sum(abs(plan.expected_return) for plan in primary_plans)
+
             if total_weight > 0:
-                # Weighted averages
-                weighted_p_win = sum(plan.p_win * plan.kelly_fraction * abs(plan.expected_return) for plan in plans) / total_weight
-                weighted_expected_return = sum(plan.expected_return * plan.kelly_fraction * abs(plan.expected_return) for plan in plans) / total_weight
-                weighted_kelly = sum(plan.kelly_fraction * plan.kelly_fraction * abs(plan.expected_return) for plan in plans) / total_weight
+                weighted_p_win = sum(plan.p_win * abs(plan.expected_return) for plan in primary_plans) / total_weight
+                weighted_expected_return = sum(plan.expected_return * abs(plan.expected_return) for plan in primary_plans) / total_weight
+                weighted_kelly = sum(plan.kelly_fraction * abs(plan.expected_return) for plan in primary_plans) / total_weight
             else:
-                # Simple averages if no weight
-                weighted_p_win = sum(plan.p_win for plan in plans) / total_plans
-                weighted_expected_return = sum(plan.expected_return for plan in plans) / total_plans
-                weighted_kelly = sum(plan.kelly_fraction for plan in plans) / total_plans
-            
-            # Determine primary direction (most common)
-            # LONG: stop < entry (stop below entry, buy to profit from upward move)
-            # SHORT: stop > entry (stop above entry, sell to profit from downward move)
-            directions = ["LONG" if plan.entry > plan.stop else "SHORT" for plan in plans]
-            primary_direction = max(set(directions), key=directions.count)
-            
-            # Get the best plan that matches the primary direction
-            # Filter plans by primary direction first
-            primary_direction_plans = [p for p in plans if (p.entry > p.stop) == (primary_direction == "LONG")]
-            if primary_direction_plans:
-                best_plan = max(primary_direction_plans, key=lambda p: p.kelly_fraction * p.expected_return)
+                weighted_p_win = (
+                    sum(plan.p_win for plan in primary_plans) / primary_plan_count
+                    if primary_plan_count else 0.0
+                )
+                weighted_expected_return = (
+                    sum(plan.expected_return for plan in primary_plans) / primary_plan_count
+                    if primary_plan_count else 0.0
+                )
+                weighted_kelly = (
+                    sum(plan.kelly_fraction for plan in primary_plans) / primary_plan_count
+                    if primary_plan_count else 0.0
+                )
+
+            # Get the best plan within the primary direction (fallback to any plan if needed)
+            if primary_plans:
+                best_plan = max(primary_plans, key=lambda p: p.kelly_fraction * p.expected_return)
             else:
-                # Fallback to best plan overall if no plans match primary direction
                 best_plan = max(plans, key=lambda p: p.kelly_fraction * p.expected_return)
-            
-            # Calculate signal diversity score
-            signal_types = set(plan.setup for plan in plans)
-            diversity_score = len(signal_types) / 12.0  # Normalize to 0-1 (max 12 signal types)
-            
-            # Calculate consensus score
-            consensus_score = directions.count(primary_direction) / total_plans
-            
+
+            # Calculate signal diversity and consensus using primary-direction plans
+            primary_signal_types = {}
+            for plan in primary_plans:
+                primary_signal_types[plan.setup] = primary_signal_types.get(plan.setup, 0) + 1
+            diversity_score = min(len(primary_signal_types) / 12.0, 1.0) if primary_plans else 0.0
+            consensus_score = min(primary_plan_count / total_plans, 1.0) if total_plans else 0.0
+
             # Calculate EVR composite score
             evr_composite_score = self._calculate_evr_composite_score(
-                weighted_p_win, weighted_expected_return, weighted_kelly, 
-                diversity_score, consensus_score, best_plan
+                weighted_p_win,
+                weighted_expected_return,
+                weighted_kelly,
+                diversity_score,
+                consensus_score,
+                best_plan
             )
-            
-            # Calculate aggregated risk metrics
-            total_risk = sum(plan.risk_dollars for plan in plans)
-            avg_cost_bps = sum(plan.cost_bps for plan in plans) / total_plans
-            avg_slippage_bps = sum(plan.slippage_bps for plan in plans) / total_plans
-            
-            # Get signal type breakdown
-            signal_type_counts = {}
+
+            # Calculate aggregated risk metrics (report deployable risk and directional context)
+            direction_risk_total = sum(plan.risk_dollars for plan in primary_plans)
+            opposing_risk_total = sum(plan.risk_dollars for plan in opposing_plans)
+            deployable_risk = best_plan.risk_dollars if best_plan else 0.0
+            avg_cost_bps = (
+                sum(plan.cost_bps for plan in primary_plans) / primary_plan_count
+                if primary_plan_count else 0.0
+            )
+            avg_slippage_bps = (
+                sum(plan.slippage_bps for plan in primary_plans) / primary_plan_count
+                if primary_plan_count else 0.0
+            )
+
+            # Get signal type breakdowns for transparency
+            all_signal_type_counts = {}
             for plan in plans:
                 signal_type = plan.setup
-                signal_type_counts[signal_type] = signal_type_counts.get(signal_type, 0) + 1
-            
+                all_signal_type_counts[signal_type] = all_signal_type_counts.get(signal_type, 0) + 1
+
+            primary_setups_summary = (
+                ', '.join([f"{k}({v})" for k, v in primary_signal_types.items()])
+                if primary_signal_types else 'n/a'
+            )
+            overall_setups_summary = (
+                ', '.join([f"{k}({v})" for k, v in all_signal_type_counts.items()])
+                if all_signal_type_counts else 'n/a'
+            )
+
             # Compute aggregated action based on best plan's expectancy and required win rate
-            # Action only if expectancy > 0 and p_win >= required_win_rate
             if best_plan.expectancy_r > 0 and weighted_p_win >= best_plan.required_win_rate:
                 aggregated_action = "BUY" if primary_direction == "LONG" else "SHORT"
             else:
                 aggregated_action = "NULL"
-            
+
             # Create aggregated recommendation
             aggregated_recommendation = {
                 'ticker': ticker,
                 'total_signals': total_plans,
-                'signal_types': signal_type_counts,
+                'primary_direction_signals': primary_plan_count,
+                'opposing_direction_signals': opposing_plan_count,
+                'signal_types': all_signal_type_counts,
+                'primary_signal_types': primary_signal_types,
                 'primary_direction': primary_direction,
                 'action': aggregated_action,
                 'entry_price': best_plan.entry,
                 'stop_loss': best_plan.stop,
                 'take_profit': best_plan.take_profit,
                 'targets': best_plan.targets,
-                
+
                 # EVR aggregated metrics
                 'weighted_p_win': weighted_p_win,
                 'weighted_expected_return': weighted_expected_return,
                 'weighted_kelly_fraction': weighted_kelly,
-                'total_risk_dollars': total_risk,
+                'total_risk_dollars': deployable_risk,
+                'direction_risk_dollars': direction_risk_total,
+                'opposing_direction_risk_dollars': opposing_risk_total,
                 'avg_cost_bps': avg_cost_bps,
                 'avg_slippage_bps': avg_slippage_bps,
-                
+
                 # Composite scoring
                 'diversity_score': diversity_score,
                 'consensus_score': consensus_score,
                 'evr_composite_score': evr_composite_score,
-                
+
                 # Best plan details
                 'best_setup': best_plan.setup,
                 'best_confidence': best_plan.confidence,
                 'best_position_size': best_plan.position_size,
-                
+
                 # Summary
-                'signal_summary': f"{total_plans} signals: {', '.join([f'{k}({v})' for k, v in signal_type_counts.items()])}"
+                'signal_summary': (
+                    f"{total_plans} signals (primary {primary_direction}: {primary_plan_count}, "
+                    f"{opposing_direction}: {opposing_plan_count}) | "
+                    f"Primary setups: {primary_setups_summary} | "
+                    f"All setups: {overall_setups_summary}"
+                )
             }
-            
+
             aggregated.append(aggregated_recommendation)
         
         # Sort by EVR composite score (highest first)
@@ -2874,19 +3215,33 @@ EVR Trade Plan Summary:
             EVR composite score based on R-unit expectancy
         """
         try:
+            # Clamp normalized components to 0-1 before combining
+            diversity_score = max(0.0, min(diversity_score, 1.0))
+            consensus_score = max(0.0, min(consensus_score, 1.0))
+
+            # FIX: Properly normalize all components before combining
             # Use R-unit expectancy from the best plan
             if hasattr(best_plan, 'expectancy_r') and best_plan.expectancy_r is not None:
                 expectancy_r = best_plan.expectancy_r
                 
-                # Safety margin bonus
+                # Normalize expectancy_r (typical range -1.0 to 3.0) to 0-1 scale
+                normalized_expectancy = max(0, min((expectancy_r + 1.0) / 4.0, 1.0))
+                
+                # Safety margin bonus (0 or 0.2 contribution)
                 safety_bonus = 0.0
                 if hasattr(best_plan, 'required_win_rate') and p_win >= best_plan.required_win_rate:
-                    safety_bonus = 0.1
+                    safety_bonus = 0.2
                 
-                # Final score: R-unit expectancy + safety bonus + diversity/consensus bonuses
-                composite_score = expectancy_r + safety_bonus + 0.05 * diversity_score + 0.05 * consensus_score
+                # FIX: Properly weight normalized components
+                # Expectancy is most important (40%), safety margin (20%), diversity (20%), consensus (20%)
+                composite_score = (
+                    normalized_expectancy * 0.40 +
+                    safety_bonus +
+                    diversity_score * 0.20 +
+                    consensus_score * 0.20
+                )
                 
-                return composite_score
+                return max(0.0, min(composite_score, 1.0))
             else:
                 # Fallback to original scoring if R-unit metrics not available
                 probability_score = min(p_win, 1.0)
@@ -3133,11 +3488,127 @@ EVR Aggregated Summary:
         )
         
         self.console.print(table)
+    
+    def update_portfolio_from_recommendations(self, recommendations: List[Dict[str, Any]], 
+                                             max_positions: int = 5, auto_add: bool = True) -> None:
+        """Update portfolio with positions from recommendations.
         
-        # Display allocation update
-        self.console.print(f"\n[blue]Updating allocation to ${summary['total_capital']:,.2f}...[/blue]")
-        self.portfolio_manager.update_allocation(summary['total_capital'])
-        self.console.print(f"[green]✅ Allocation updated successfully![/green]")
+        Args:
+            recommendations: List of aggregated recommendations
+            max_positions: Maximum number of positions to add
+            auto_add: Whether to automatically add positions
+        """
+        if not recommendations:
+            self.console.print("[yellow]⚠️  No recommendations to process[/yellow]")
+            return
+        
+        # Filter to actionable recommendations (BUY or SHORT action)
+        actionable_recs = [r for r in recommendations if r.get('action') in ['BUY', 'SHORT']]
+        
+        if not actionable_recs:
+            self.console.print("[yellow]⚠️  No actionable recommendations (all NULL actions)[/yellow]")
+            return
+        
+        self.console.print(f"\n[cyan]📊 Processing {len(actionable_recs)} actionable recommendations for portfolio...[/cyan]")
+        
+        # Get current portfolio state
+        summary = self.portfolio_manager.get_portfolio_summary()
+        available_capital = summary['available_capital']
+        open_positions = summary['open_positions']
+        
+        self.console.print(f"[cyan]Available Capital: ${available_capital:,.2f} | Open Positions: {open_positions}[/cyan]")
+        
+        if open_positions >= max_positions:
+            self.console.print(f"[yellow]⚠️  Portfolio full ({open_positions}/{max_positions} positions)[/yellow]")
+            return
+        
+        # Add positions up to max_positions limit
+        positions_to_add = min(len(actionable_recs), max_positions - open_positions)
+        added_count = 0
+        skipped_count = 0
+        
+        for i, rec in enumerate(actionable_recs[:positions_to_add + 5]):  # Look at a few extra in case some fail
+            if added_count >= positions_to_add:
+                break
+            
+            ticker = rec['ticker']
+            action = rec['action']
+            entry_price = rec['entry_price']
+            stop_loss = rec['stop_loss']
+            
+            # Create a TradePlan from the recommendation
+            # Calculate avg_r_win and avg_r_loss from expected return
+            risk_per_share = abs(entry_price - stop_loss)
+            target_price = rec.get('take_profit', entry_price * 1.10)
+            reward_per_share = abs(target_price - entry_price) if action == 'BUY' else abs(entry_price - target_price)
+            avg_r_win = reward_per_share / risk_per_share if risk_per_share > 0 else 1.0
+            avg_r_loss = 1.0  # By definition, loss is 1R
+            
+            # FIX: Recalculate position size based on ACTUAL available capital
+            # Use Kelly fraction but cap risk at 2.5% of actual available capital
+            kelly_fraction = rec['weighted_kelly_fraction']
+            max_risk_dollars = min(available_capital * 0.025, available_capital * kelly_fraction)
+            
+            # Calculate shares based on risk per share
+            if risk_per_share > 0:
+                shares = int(max_risk_dollars / risk_per_share)
+                actual_position_value = shares * entry_price
+                actual_risk_dollars = shares * risk_per_share
+            else:
+                shares = 0
+                actual_position_value = 0
+                actual_risk_dollars = 0
+            
+            # Skip if position is too small or we don't have enough capital
+            if shares <= 0 or actual_position_value > available_capital:
+                skipped_count += 1
+                self.console.print(f"[yellow]⚠️  Skipped: {ticker} (shares: {shares}, value: ${actual_position_value:.0f} > available ${available_capital:.2f})[/yellow]")
+                continue
+            
+            trade_plan = TradePlan(
+                ticker=ticker,
+                signal_type=rec['primary_direction'],
+                setup=rec.get('best_setup', 'AGGREGATED'),
+                entry=entry_price,
+                stop=stop_loss,
+                take_profit=rec.get('take_profit', entry_price * 1.10),
+                targets=[rec.get('take_profit', entry_price * 1.10)],
+                position_size=actual_position_value,  # Dollar value of position ✅
+                shares=shares,                         # Number of shares ✅
+                risk_dollars=actual_risk_dollars,    # Use recalculated risk
+                p_win=rec['weighted_p_win'],
+                avg_r_win=avg_r_win,
+                avg_r_loss=avg_r_loss,
+                expected_return=rec['weighted_expected_return'],
+                kelly_fraction=rec['weighted_kelly_fraction'],
+                confidence=rec.get('best_confidence', 0.5),
+                cost_bps=rec.get('avg_cost_bps', 10),
+                slippage_bps=rec.get('avg_slippage_bps', 5),
+                action=action,
+                notes=f"Aggregated from {rec.get('total_signals', 1)} signals - sized for ${available_capital:.0f} capital"
+            )
+            
+            # Try to add position
+            if auto_add:
+                success = self.portfolio_manager.add_position(trade_plan)
+                if success:
+                    added_count += 1
+                    # Update available capital for next iteration
+                    available_capital -= actual_position_value
+                    self.console.print(f"[green]✅ Added: {ticker} ({action}) @ ${entry_price:.2f}, Stop: ${stop_loss:.2f}, Shares: {shares}, Risk: ${trade_plan.risk_dollars:,.0f}[/green]")
+                else:
+                    skipped_count += 1
+                    self.console.print(f"[yellow]⚠️  Skipped: {ticker} (insufficient capital)[/yellow]")
+            else:
+                # Just show what would be added
+                self.console.print(f"[cyan]Would add: {ticker} ({action}) @ ${entry_price:.2f}, Risk: ${trade_plan.risk_dollars:,.0f}[/cyan]")
+        
+        if auto_add:
+            self.console.print(f"\n[green]✅ Portfolio updated: {added_count} positions added, {skipped_count} skipped[/green]")
+            # Display updated portfolio status
+            self.display_portfolio_status()
+        else:
+            self.console.print(f"\n[cyan]Preview: {positions_to_add} positions would be added[/cyan]")
     
     def backtest_strategy(self, tickers: List[str], start_date: str = "2023-01-01", 
                          end_date: str = "2024-01-01", initial_capital: float = 100000,
@@ -3166,34 +3637,57 @@ EVR Aggregated Summary:
             'total_value': initial_capital,
             'trades': [],
             'daily_values': [],
-            'dates': []
+            'dates': [],
+            'price_cache': {}  # FIX: Cache for historical prices {(ticker, date): price}
         }
         
-        # Generate date range for backtesting
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        # INTRADAY: Generate datetime range for backtesting (30-minute bars)
+        # Parse dates and set to market open if no time specified
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            start_dt = start_dt.replace(hour=9, minute=30, second=0, microsecond=0)
         
-        if rebalance_frequency == "daily":
-            date_step = timedelta(days=1)
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            end_dt = end_dt.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        # INTRADAY: Support 30-minute rebalancing intervals
+        if rebalance_frequency == "30min":
+            rebalance_minutes = 30
+        elif rebalance_frequency == "hourly":
+            rebalance_minutes = 60
+        elif rebalance_frequency == "daily":
+            rebalance_minutes = 390  # 6.5 hours = 1 trading day
         elif rebalance_frequency == "weekly":
-            date_step = timedelta(days=7)
-        elif rebalance_frequency == "monthly":
-            date_step = timedelta(days=30)
+            rebalance_minutes = 390 * 5  # 5 trading days
         else:
-            date_step = timedelta(days=7)  # Default to weekly
+            rebalance_minutes = 30  # Default to 30-minute for intraday
         
         current_date = start_dt
         last_rebalance_date = start_dt
         
         while current_date <= end_dt:
+            # INTRADAY: Skip non-market hours
+            if not self._is_market_open(current_date):
+                current_date = self._get_next_market_time(current_date, 30)
+                continue
+            
+            # INTRADAY: Check exit conditions every 30 minutes
+            self._check_exit_conditions(portfolio, current_date)
+            
             # Check if it's time to rebalance
-            if current_date >= last_rebalance_date + date_step:
-                self.logger.debug(f"Rebalancing on {current_date.strftime('%Y-%m-%d')}")
+            minutes_since_rebalance = (current_date - last_rebalance_date).total_seconds() / 60
+            if minutes_since_rebalance >= rebalance_minutes:
+                self.logger.debug(f"Rebalancing on {current_date.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-                # Get current recommendations for this date
-                recommendations = self._get_recommendations_for_date(tickers, current_date.strftime('%Y-%m-%d'))
+                # INTRADAY: Get current recommendations for this datetime
+                recommendations = self._get_recommendations_for_date(tickers, current_date.strftime('%Y-%m-%d %H:%M:%S'))
                 
-                self.logger.debug(f"Found {len(recommendations)} recommendations for {current_date.strftime('%Y-%m-%d')}")
+                self.logger.debug(f"Found {len(recommendations)} recommendations for {current_date.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 if recommendations:
                     # Execute trades based on recommendations
@@ -3201,21 +3695,22 @@ EVR Aggregated Summary:
                 
                 last_rebalance_date = current_date
             
-            # Update portfolio value for this date
+            # INTRADAY: Update portfolio value every 30 minutes
             self._update_portfolio_value(portfolio, current_date)
             
-            current_date += timedelta(days=1)
+            # INTRADAY: Move to next 30-minute bar
+            current_date = self._get_next_market_time(current_date, 30)
         
         # Close all remaining positions at the end of backtest
         self.logger.info("Closing all remaining positions at end of backtest")
         for ticker in list(portfolio['positions'].keys()):
             self._close_position(portfolio, ticker, end_dt)
         
-        # Update final portfolio value after closing all positions
+        # INTRADAY: Update final portfolio value after closing all positions
         # At this point, all positions are closed, so total value = cash
         portfolio['total_value'] = portfolio['cash']
         portfolio['daily_values'].append(portfolio['cash'])
-        portfolio['dates'].append(end_dt.strftime('%Y-%m-%d'))
+        portfolio['dates'].append(end_dt.strftime('%Y-%m-%d %H:%M:%S'))
         
         # Calculate final metrics
         metrics = self._calculate_backtest_metrics(portfolio, start_date, end_date)
@@ -3266,15 +3761,20 @@ EVR Aggregated Summary:
                     # Use yfinance to get data up to the backtest date with retry logic
                     import yfinance as yf
                     
-                    # Calculate start date to ensure we have enough data for indicators
-                    start_date = (datetime.strptime(date, '%Y-%m-%d') - timedelta(days=365)).strftime('%Y-%m-%d')
+                    # INTRADAY: Calculate start date for 30-minute bars (max 60 days for yfinance)
+                    # Use 60 days to get enough 30-min bars for indicators
+                    date_obj = datetime.strptime(date, '%Y-%m-%d %H:%M:%S') if ' ' in date else datetime.strptime(date, '%Y-%m-%d')
+                    start_date = (date_obj - timedelta(days=60)).strftime('%Y-%m-%d')
+                    end_date = date_obj.strftime('%Y-%m-%d %H:%M:%S') if ' ' in date else date
                     
-                    # Get historical data up to the backtest date with retry logic
+                    # FIX: Get 30-minute intraday data up to the backtest datetime
+                    # IMPORTANT: interval="30m" for intraday, end=date ensures point-in-time data
+                    # This prevents look-ahead bias by ensuring indicators are calculated with point-in-time data
                     hist_data = None
                     for attempt in range(3):  # Try up to 3 times
                         try:
                             ticker_obj = yf.Ticker(ticker)
-                            hist_data = ticker_obj.history(start=start_date, end=date)
+                            hist_data = ticker_obj.history(start=start_date, end=end_date, interval="30m")
                             if not hist_data.empty:
                                 break
                         except Exception as e:
@@ -3349,12 +3849,55 @@ EVR Aggregated Summary:
             max_positions: Maximum number of positions
         """
         try:
-            # Close existing positions that are no longer recommended
+            # FIX: Smart rebalancing with cost-benefit analysis
             current_tickers = set(portfolio['positions'].keys())
             recommended_tickers = set(rec['ticker'] for rec in recommendations[:max_positions])
             
-            # Close positions not in recommendations
-            positions_to_close = current_tickers - recommended_tickers
+            # Evaluate which positions to close based on multiple criteria
+            positions_to_close = []
+            for ticker in current_tickers:
+                if ticker not in recommended_tickers:
+                    position = portfolio['positions'][ticker]
+                    
+                    # Get current price to evaluate P&L
+                    current_price = self._get_historical_price(ticker, current_date, portfolio.get('price_cache'))
+                    if current_price is None:
+                        # Can't get price, close it
+                        positions_to_close.append(ticker)
+                        continue
+                    
+                    # Calculate current P&L
+                    entry_price = position['entry_price']
+                    direction = position['direction']
+                    if direction == 'LONG':
+                        pnl_pct = (current_price - entry_price) / entry_price
+                    else:
+                        pnl_pct = (entry_price - current_price) / entry_price
+                    
+                    # Calculate holding period
+                    entry_date = datetime.strptime(position['entry_date'], '%Y-%m-%d')
+                    holding_days = (current_date - entry_date).days
+                    
+                    # Decision criteria for closing:
+                    # 1. Large loss (>-10%) - cut losses
+                    # 2. Been holding for a long time (>30 days) without great performance
+                    # 3. Small position (<1% of portfolio) - clean up
+                    position_value = abs(position['shares'] * current_price)
+                    position_pct = position_value / portfolio['capital']
+                    
+                    should_close = (
+                        pnl_pct < -0.10 or  # Large loss
+                        (holding_days > 30 and pnl_pct < 0.05) or  # Stale position
+                        position_pct < 0.01  # Very small position
+                    )
+                    
+                    if should_close:
+                        positions_to_close.append(ticker)
+                    else:
+                        # Keep position even though not in top recommendations
+                        self.logger.debug(f"Keeping {ticker} despite not in top recs (P&L: {pnl_pct:.1%}, Days: {holding_days})")
+            
+            # Close selected positions
             for ticker in positions_to_close:
                 self._close_position(portfolio, ticker, current_date)
             
@@ -3363,6 +3906,9 @@ EVR Aggregated Summary:
                 ticker = rec['ticker']
                 
                 if ticker not in portfolio['positions']:
+                    # Check if we have room for more positions
+                    if len(portfolio['positions']) >= max_positions:
+                        break
                     # Open new position
                     self._open_position(portfolio, rec, current_date)
                 else:
@@ -3384,55 +3930,102 @@ EVR Aggregated Summary:
         try:
             ticker = recommendation['ticker']
             entry_price = recommendation['entry_price']
+            stop_loss = recommendation['stop_loss']
             direction = recommendation['primary_direction']
             
-            # Calculate position size based on Kelly fraction and available capital
-            kelly_fraction = recommendation['weighted_kelly_fraction']
-            position_size = min(kelly_fraction * portfolio['cash'], portfolio['cash'] * 0.1)  # Max 10% per position
-            
-            if position_size < 100:  # Minimum position size
+            # FIX: Proper position sizing with portfolio heat limits
+            # Calculate risk per share
+            risk_per_share = abs(entry_price - stop_loss)
+            if risk_per_share <= 0:
                 return
             
-            shares = int(position_size / entry_price)
+            # FIX: Check portfolio-level risk limits before opening position
+            # Calculate current total risk across all positions
+            total_risk = 0
+            for pos_ticker, pos in portfolio['positions'].items():
+                pos_risk = pos['shares'] * pos.get('risk_per_share', abs(pos['entry_price'] - pos.get('stop_loss', pos['entry_price'] * 0.95)))
+                total_risk += pos_risk
+            
+            # Max total portfolio risk: 20% of capital
+            max_total_risk = portfolio['capital'] * 0.20
+            if total_risk >= max_total_risk:
+                self.logger.debug(f"Portfolio risk limit reached ({total_risk/portfolio['capital']:.1%}), skipping {ticker}")
+                return
+            
+            # Get Kelly fraction but apply conservative limits
+            kelly_fraction = recommendation['weighted_kelly_fraction']
+            
+            # Apply portfolio heat constraints (max 2.5% risk per position)
+            max_risk_per_position = portfolio['capital'] * 0.025  # 2.5% max risk
+            
+            # Calculate position size based on risk
+            # Risk = shares * risk_per_share, so shares = max_risk / risk_per_share
+            shares_from_risk = int(max_risk_per_position / risk_per_share)
+            
+            # Also apply Kelly constraint (but capped at 10% of capital)
+            kelly_capped = min(kelly_fraction, 0.10)
+            shares_from_kelly = int((kelly_capped * portfolio['capital']) / entry_price)
+            
+            # Take the minimum of the two constraints
+            shares = min(shares_from_risk, shares_from_kelly)
+            
             if shares <= 0:
                 return
             
             actual_cost = shares * entry_price
             
+            # Minimum position size ($100)
+            if actual_cost < 100:
+                return
+            
             # Check if we have enough cash
             if actual_cost > portfolio['cash']:
                 return
             
-            # Record the trade
+            # INTRADAY: Record the trade with datetime
             trade = {
-                'date': current_date.strftime('%Y-%m-%d'),
+                'date': current_date.strftime('%Y-%m-%d %H:%M:%S'),
                 'ticker': ticker,
                 'action': 'BUY' if direction == 'LONG' else 'SELL',
                 'shares': shares,
                 'price': entry_price,
                 'value': actual_cost,
-                'direction': direction
+                'direction': direction,
+                'stop_loss': stop_loss,
+                'risk_per_share': risk_per_share
             }
             
             portfolio['trades'].append(trade)
             
-            # Update portfolio
+            # INTRADAY: Update portfolio - store stop loss and target for exit monitoring
             portfolio['positions'][ticker] = {
                 'shares': shares,
                 'entry_price': entry_price,
-                'entry_date': current_date.strftime('%Y-%m-%d'),
-                'direction': direction
+                'entry_date': current_date.strftime('%Y-%m-%d %H:%M:%S'),
+                'direction': direction,
+                'stop_loss': stop_loss,
+                'take_profit': recommendation.get('take_profit', None),
+                'risk_per_share': risk_per_share  # Store for risk tracking
             }
             
-            # For LONG: pay cash for shares
-            # For SHORT: receive cash from short sale (plus margin requirement - simplified here)
+            # FIX: Proper cash handling for LONG and SHORT positions
             if direction == 'LONG':
+                # LONG: pay cash for shares
                 portfolio['cash'] -= actual_cost
             else:  # SHORT
-                # SHORT: receive proceeds from sale, but need to hold margin (simplified as 50% collateral)
-                portfolio['cash'] += actual_cost - (actual_cost * 0.5)  # Net: 50% cash increase, 50% as margin
+                # SHORT: Receive proceeds from short sale, but must post margin
+                # Reg T requires 150% of short value (100% proceeds + 50% additional margin)
+                margin_required = actual_cost * 1.5
+                if margin_required > portfolio['cash']:
+                    # Not enough cash for margin, skip this trade
+                    portfolio['trades'].pop()  # Remove the trade we just added
+                    return
+                # Lock up margin requirement (proceeds go to broker, we post additional margin)
+                portfolio['cash'] -= margin_required
+                # Track the short liability separately
+                portfolio['positions'][ticker]['short_liability'] = actual_cost
             
-            self.logger.debug(f"Opened position: {ticker} {shares} shares @ ${entry_price:.2f}")
+            self.logger.debug(f"Opened {direction} position: {ticker} {shares} shares @ ${entry_price:.2f}, stop: ${stop_loss:.2f}")
         
         except Exception as e:
             self.logger.error(f"Error opening position for {recommendation['ticker']}: {e}")
@@ -3455,7 +4048,7 @@ EVR Aggregated Summary:
             direction = position['direction']
             
             # Get actual historical price for the date
-            current_price = self._get_historical_price(ticker, current_date)
+            current_price = self._get_historical_price(ticker, current_date, portfolio.get('price_cache'))
             if current_price is None:
                 self.logger.warning(f"No price data for {ticker} on {current_date.strftime('%Y-%m-%d')}")
                 return
@@ -3466,16 +4059,23 @@ EVR Aggregated Summary:
             else:  # SHORT
                 pnl = (entry_price - current_price) * shares
             
-            # Calculate transaction costs
+            # FIX: Calculate transaction costs using actual ATR from historical data
             trade_value = shares * current_price
+            
+            # Get actual ATR for this ticker
+            atr = self._get_ticker_atr(ticker, current_date)
+            if atr is None:
+                # Fallback to 2% of price if ATR not available
+                atr = current_price * 0.02
+            
             commission_cost, slippage_cost = self.cost_model.calculate_costs(
-                current_price, 2.0, trade_value  # 2% ATR assumption
+                current_price, atr, trade_value
             )
             total_cost = commission_cost + slippage_cost
             
-            # Record the trade
+            # INTRADAY: Record the trade with datetime
             trade = {
-                'date': current_date.strftime('%Y-%m-%d'),
+                'date': current_date.strftime('%Y-%m-%d %H:%M:%S'),
                 'ticker': ticker,
                 'action': 'SELL' if direction == 'LONG' else 'BUY',
                 'shares': shares,
@@ -3490,18 +4090,25 @@ EVR Aggregated Summary:
             
             portfolio['trades'].append(trade)
             
-            # Update portfolio cash based on direction
+            # FIX: Proper cash handling for closing LONG and SHORT positions
             if direction == 'LONG':
                 # LONG: receive cash from sale, minus costs
                 portfolio['cash'] += trade_value - total_cost
             else:  # SHORT
-                # SHORT: pay cash to buy back shares (cover short), minus costs
-                # Add back the margin we held initially
-                portfolio['cash'] -= trade_value - total_cost + (trade_value * 0.5)  # Pay buyback + return margin
+                # SHORT: Buy back shares to cover, pay from cash
+                # Return the margin locked up (150% of original short value)
+                original_short_value = shares * entry_price
+                margin_locked = original_short_value * 1.5
+                
+                # Cost to buy back shares
+                buyback_cost = trade_value + total_cost
+                
+                # Net cash change: return margin, pay for buyback
+                portfolio['cash'] += margin_locked - buyback_cost
             
             del portfolio['positions'][ticker]
             
-            self.logger.debug(f"Closed position: {ticker} {shares} shares @ ${current_price:.2f}, P&L: ${pnl:.2f}, Net: ${pnl - total_cost:.2f}")
+            self.logger.debug(f"Closed {direction} position: {ticker} {shares} shares @ ${current_price:.2f}, P&L: ${pnl:.2f}, Net: ${pnl - total_cost:.2f}")
         
         except Exception as e:
             self.logger.error(f"Error closing position for {ticker}: {e}")
@@ -3515,37 +4122,184 @@ EVR Aggregated Summary:
             recommendation: New recommendation
             current_date: Current date
         """
+        # FIX: Implement position adjustment logic
+        # For now, we could update stop-loss to new recommendation's stop
+        # But to keep it simple and avoid over-trading, we'll just hold the position
         pass
     
-    def _get_historical_price(self, ticker: str, date: datetime) -> Optional[float]:
-        """Get historical price for a ticker on a specific date with retry logic.
+    def _check_exit_conditions(self, portfolio: Dict[str, Any], current_date: datetime) -> None:
+        """Check stop-loss and take-profit conditions for all positions.
+        
+        Args:
+            portfolio: Portfolio tracking dictionary
+            current_date: Current date
+        """
+        try:
+            tickers_to_close = []
+            
+            for ticker, position in portfolio['positions'].items():
+                # Get current price
+                current_price = self._get_historical_price(ticker, current_date, portfolio.get('price_cache'))
+                if current_price is None:
+                    continue
+                
+                direction = position['direction']
+                entry_price = position['entry_price']
+                stop_loss = position.get('stop_loss')
+                take_profit = position.get('take_profit')
+                
+                should_close = False
+                reason = ""
+                
+                if direction == 'LONG':
+                    # Check stop-loss for long
+                    if stop_loss and current_price <= stop_loss:
+                        should_close = True
+                        reason = "STOPPED_OUT"
+                    # Check take-profit for long
+                    elif take_profit and current_price >= take_profit:
+                        should_close = True
+                        reason = "TARGET_HIT"
+                else:  # SHORT
+                    # Check stop-loss for short (price goes above stop)
+                    if stop_loss and current_price >= stop_loss:
+                        should_close = True
+                        reason = "STOPPED_OUT"
+                    # Check take-profit for short (price goes below target)
+                    elif take_profit and current_price <= take_profit:
+                        should_close = True
+                        reason = "TARGET_HIT"
+                
+                if should_close:
+                    tickers_to_close.append((ticker, reason))
+            
+            # Close positions that hit exit conditions
+            for ticker, reason in tickers_to_close:
+                self.logger.debug(f"Exit condition triggered for {ticker}: {reason}")
+                self._close_position(portfolio, ticker, current_date)
+        
+        except Exception as e:
+            self.logger.error(f"Error checking exit conditions: {e}")
+    
+    def _is_market_open(self, dt: datetime) -> bool:
+        """Check if the market is open at the given datetime.
+        
+        Args:
+            dt: Datetime to check
+            
+        Returns:
+            True if market is open, False otherwise
+        """
+        # Check if it's a weekend
+        if dt.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        
+        # Market hours: 9:30 AM - 4:00 PM ET (naive datetime, assuming ET)
+        market_open = dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = dt.replace(hour=16, minute=0, second=0, microsecond=0)
+        
+        return market_open <= dt < market_close
+    
+    def _get_next_market_time(self, dt: datetime, interval_minutes: int = 30) -> datetime:
+        """Get the next market time after the given datetime.
+        
+        Args:
+            dt: Current datetime
+            interval_minutes: Interval in minutes (default 30)
+            
+        Returns:
+            Next market datetime
+        """
+        next_dt = dt + timedelta(minutes=interval_minutes)
+        
+        # If we've moved past market close, jump to next day's open
+        market_close = next_dt.replace(hour=16, minute=0, second=0, microsecond=0)
+        if next_dt >= market_close:
+            # Move to next day at market open
+            next_dt = next_dt + timedelta(days=1)
+            next_dt = next_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        
+        # Skip weekends
+        while next_dt.weekday() >= 5:
+            next_dt = next_dt + timedelta(days=1)
+            next_dt = next_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+        
+        return next_dt
+    
+    def _get_ticker_atr(self, ticker: str, date: datetime, period: int = 14) -> Optional[float]:
+        """Get ATR (Average True Range) for a ticker at a specific date.
+        
+        Args:
+            ticker: Ticker symbol
+            date: Date to get ATR for
+            period: ATR period (default 14)
+            
+        Returns:
+            ATR value or None if not available
+        """
+        try:
+            import yfinance as yf
+            
+            # INTRADAY: Get 30-minute data for ATR calculation (need more data points)
+            start_date = (date - timedelta(days=period * 2)).strftime('%Y-%m-%d')
+            end_date = (date + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            ticker_obj = yf.Ticker(ticker)
+            hist_data = ticker_obj.history(start=start_date, end=end_date, interval="30m")
+            
+            if hist_data.empty or len(hist_data) < period:
+                return None
+            
+            # Calculate True Range
+            hist_data['H-L'] = hist_data['High'] - hist_data['Low']
+            hist_data['H-PC'] = abs(hist_data['High'] - hist_data['Close'].shift(1))
+            hist_data['L-PC'] = abs(hist_data['Low'] - hist_data['Close'].shift(1))
+            hist_data['TR'] = hist_data[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+            
+            # Calculate ATR (simple moving average of TR)
+            atr = hist_data['TR'].rolling(window=period).mean().iloc[-1]
+            
+            return float(atr) if not np.isnan(atr) else None
+            
+        except Exception as e:
+            self.logger.debug(f"Error calculating ATR for {ticker}: {e}")
+            return None
+    
+    def _get_historical_price(self, ticker: str, date: datetime, price_cache: Optional[Dict] = None) -> Optional[float]:
+        """Get historical price for a ticker on a specific date with retry logic and caching.
         
         Args:
             ticker: Ticker symbol
             date: Date to get price for
+            price_cache: Optional price cache dictionary
             
         Returns:
             Price on that date or None if not available
         """
+        # FIX: Use cache if available - INTRADAY: include time in cache key
+        cache_key = (ticker, date.strftime('%Y-%m-%d %H:%M:%S'))
+        if price_cache is not None and cache_key in price_cache:
+            return price_cache[cache_key]
+        
         import yfinance as yf
         
         for attempt in range(3):  # Try up to 3 times
             try:
-                # Format date for yfinance
-                start_date = date.strftime('%Y-%m-%d')
-                end_date = (date + timedelta(days=1)).strftime('%Y-%m-%d')
+                # INTRADAY: Format datetime for yfinance with time component
+                start_date = date.strftime('%Y-%m-%d %H:%M:%S')
+                end_date = (date + timedelta(minutes=30)).strftime('%Y-%m-%d %H:%M:%S')
                 
-                # Get data for the specific date
+                # INTRADAY: Get 30-minute bar data for the specific datetime
                 ticker_obj = yf.Ticker(ticker)
-                hist_data = ticker_obj.history(start=start_date, end=end_date)
+                hist_data = ticker_obj.history(start=start_date, end=end_date, interval="30m")
                 
                 if hist_data.empty:
-                    # If no data for that specific date, try to get the closest available date
-                    # Get a wider range and find the closest date
-                    wider_start = (date - timedelta(days=30)).strftime('%Y-%m-%d')
-                    wider_end = (date + timedelta(days=30)).strftime('%Y-%m-%d')
+                    # If no data for that specific time, try to get the closest available time
+                    # Get a wider range and find the closest datetime
+                    wider_start = (date - timedelta(days=7)).strftime('%Y-%m-%d')
+                    wider_end = (date + timedelta(days=7)).strftime('%Y-%m-%d')
                     
-                    hist_data = ticker_obj.history(start=wider_start, end=wider_end)
+                    hist_data = ticker_obj.history(start=wider_start, end=wider_end, interval="30m")
                     
                     if hist_data.empty:
                         return None
@@ -3556,8 +4310,14 @@ EVR Aggregated Summary:
                         return None
                 
                 # Return the closing price for the date
+                price = float(hist_data['Close'].iloc[-1])
+                
+                # Store in cache
+                if price_cache is not None:
+                    price_cache[cache_key] = price
+                
                 time.sleep(0.3)  # Rate limiting between successful requests
-                return float(hist_data['Close'].iloc[-1])
+                return price
             
             except Exception as e:
                 if "Too Many Requests" in str(e) or "Rate limited" in str(e):
@@ -3582,29 +4342,39 @@ EVR Aggregated Summary:
         try:
             total_value = portfolio['cash']
             
-            # Add value of all positions using actual historical prices
+            # FIX: Properly calculate position values including short positions
             for ticker, position in portfolio['positions'].items():
                 shares = position['shares']
                 direction = position['direction']
+                entry_price = position['entry_price']
                 
                 # Get actual historical price
-                current_price = self._get_historical_price(ticker, current_date)
+                current_price = self._get_historical_price(ticker, current_date, portfolio.get('price_cache'))
                 if current_price is None:
                     # If no price data, use entry price as fallback
-                    current_price = position['entry_price']
+                    current_price = entry_price
                 
-                # For LONG: position value is shares * price
-                # For SHORT: position value is -(shares * price) since we owe shares
                 if direction == 'LONG':
+                    # LONG: position value is simply shares * current price
                     position_value = shares * current_price
                 else:  # SHORT
-                    position_value = -(shares * current_price)  # Negative value for shorts
+                    # SHORT: We have margin locked (150% of original value)
+                    # Current P&L = (entry_price - current_price) * shares
+                    # Our equity = margin_locked + P&L - current_liability
+                    original_short_value = shares * entry_price
+                    current_liability = shares * current_price
+                    margin_locked = original_short_value * 1.5
+                    
+                    # The short position's contribution to portfolio value
+                    # is the margin minus the current liability
+                    position_value = margin_locked - current_liability
                 
                 total_value += position_value
             
             portfolio['total_value'] = total_value
             portfolio['daily_values'].append(total_value)
-            portfolio['dates'].append(current_date.strftime('%Y-%m-%d'))
+            # INTRADAY: Use datetime format with time component
+            portfolio['dates'].append(current_date.strftime('%Y-%m-%d %H:%M:%S'))
         
         except Exception as e:
             self.logger.error(f"Error updating portfolio value: {e}")
@@ -3647,17 +4417,21 @@ EVR Aggregated Summary:
             else:
                 max_drawdown = 0
             
-            # Calculate Sharpe ratio (simplified)
+            # INTRADAY: Calculate Sharpe ratio (annualized for 30-minute bars)
+            # 30-min bars: 13 bars/day * 252 trading days = 3,276 bars/year
+            bars_per_year = 13 * 252  # 3,276 for 30-minute bars
             if daily_values and len(daily_values) > 1:
                 returns = []
                 for i in range(1, len(daily_values)):
-                    daily_return = (daily_values[i] - daily_values[i-1]) / daily_values[i-1]
-                    returns.append(daily_return)
+                    bar_return = (daily_values[i] - daily_values[i-1]) / daily_values[i-1]
+                    returns.append(bar_return)
                 
                 if returns:
                     avg_return = sum(returns) / len(returns)
                     return_std = (sum((r - avg_return) ** 2 for r in returns) / len(returns)) ** 0.5
-                    sharpe_ratio = avg_return / return_std if return_std > 0 else 0
+                    # Annualize: multiply by sqrt(bars_per_year)
+                    annualized_sharpe = (avg_return * bars_per_year) / (return_std * (bars_per_year ** 0.5)) if return_std > 0 else 0
+                    sharpe_ratio = annualized_sharpe
                 else:
                     sharpe_ratio = 0
             else:
@@ -3785,8 +4559,10 @@ EVR Aggregated Summary:
             var_95 = np.percentile(daily_returns, 5) if len(daily_returns) > 0 else 0
             var_99 = np.percentile(daily_returns, 1) if len(daily_returns) > 0 else 0
             
-            # Calmar ratio (annualized return / max drawdown)
-            annualized_return = mean_return * 252  # Assuming 252 trading days
+            # INTRADAY: Calmar ratio (annualized return / max drawdown)
+            # 30-min bars: 13 bars/day * 252 trading days = 3,276 bars/year
+            bars_per_year = 13 * 252
+            annualized_return = mean_return * bars_per_year
             max_drawdown = 0
             peak = daily_values[0]
             for value in daily_values:
@@ -3797,15 +4573,16 @@ EVR Aggregated Summary:
             
             calmar_ratio = annualized_return / max_drawdown if max_drawdown > 0 else 0
             
-            # Information ratio (vs benchmark)
+            # INTRADAY: Information ratio (vs benchmark)
             benchmark_return = benchmark_metrics.get('benchmark_return', 0)
-            tracking_error = return_std  # Simplified
-            information_ratio = (mean_return * 252 - benchmark_return) / tracking_error if tracking_error > 0 else 0
+            tracking_error = return_std * (bars_per_year ** 0.5)  # Annualize tracking error
+            information_ratio = (mean_return * bars_per_year - benchmark_return) / tracking_error if tracking_error > 0 else 0
             
-            # Sortino ratio (downside deviation)
+            # INTRADAY: Sortino ratio (downside deviation)
             downside_returns = [r for r in daily_returns if r < 0]
             downside_std = (sum(r ** 2 for r in downside_returns) / len(downside_returns)) ** 0.5 if downside_returns else 0
-            sortino_ratio = annualized_return / downside_std if downside_std > 0 else 0
+            annualized_downside_std = downside_std * (bars_per_year ** 0.5)
+            sortino_ratio = annualized_return / annualized_downside_std if annualized_downside_std > 0 else 0
             
             return {
                 'mean_daily_return': mean_return,
@@ -4264,6 +5041,28 @@ This scanner implements the complete EVR framework with:
                 if cache_stats.get("total_files", 0) > 0:
                     console.print(f"\n[blue]Cache: {cache_stats['total_files']} files, {cache_stats['total_size_mb']} MB | Delisted: {cache_stats.get('delisted_tickers', 0)}[/blue]")
             
+            # Monitor and auto-close positions that hit stops/targets
+            console.print("\n[cyan]📊 Monitoring Open Positions...[/cyan]")
+            monitor_results = scanner.portfolio_manager.monitor_and_close_positions(scanner.data_fetcher)
+            
+            if monitor_results['monitored'] > 0:
+                console.print(
+                    f"[cyan]Monitored: {monitor_results['monitored']} | "
+                    f"Closed: {monitor_results['closed']} | "
+                    f"Stopped Out: {monitor_results['stopped_out']} | "
+                    f"Targets Hit: {monitor_results['targets_hit']} | "
+                    f"Errors: {monitor_results['errors']}[/cyan]"
+                )
+            else:
+                console.print("[dim]No open positions to monitor[/dim]")
+            
+            # Increment run count
+            scanner.portfolio_manager.increment_run_count()
+            
+            # Display portfolio status after monitoring
+            console.print("\n[cyan]💼 Current Portfolio Status:[/cyan]")
+            scanner.display_portfolio_status()
+            
             # Scan for trade plans
             console.print("\n[blue]Scanning for EVR trade plans...[/blue]")
             max_tickers = args.max_tickers if args.max_tickers is not None else len(tickers)
@@ -4284,6 +5083,14 @@ This scanner implements the complete EVR framework with:
                 
                 console.print(f"\n[green]✅ EVR aggregation completed successfully![/green]")
                 console.print(f"[green]Generated {len(aggregated_recommendations)} aggregated recommendations from {len(trade_plans)} trade plans[/green]")
+                
+                # Update portfolio with top recommendations
+                console.print("\n[cyan]💼 Updating portfolio with recommendations...[/cyan]")
+                scanner.update_portfolio_from_recommendations(
+                    aggregated_recommendations, 
+                    max_positions=5, 
+                    auto_add=True
+                )
                 
                 # Show top aggregated recommendation details
                 if aggregated_recommendations:

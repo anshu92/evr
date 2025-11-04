@@ -1,0 +1,20 @@
+# Requirements for Historical Parameter Training System
+# Install with: pip install -r requirements_training.txt
+
+# Core data science
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Data fetching
+yfinance>=0.2.28
+
+# Machine learning (optional but recommended)
+scikit-learn>=1.3.0
+
+# Rich terminal output
+rich>=13.0.0
+
+# For official scanner
+requests>=2.31.0
+
+
