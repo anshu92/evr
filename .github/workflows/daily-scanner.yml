@@ -37,8 +37,9 @@ jobs:
         path: |
           cache/
           trained_parameters/
-        key: ${{ runner.os }}-evr-cache-${{ github.run_number }}
+        key: ${{ runner.os }}-evr-cache-${{ github.sha }}
         restore-keys: |
+          ${{ runner.os }}-evr-cache-${{ github.ref_name }}-
           ${{ runner.os }}-evr-cache-
         
     - name: Install uv
