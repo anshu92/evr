@@ -295,33 +295,34 @@ jobs:
         
     - name: Check email configuration
       run: |
-        if [ -z "${{ secrets.EMAIL_USERNAME }}" ] || [ -z "${{ secrets.EMAIL_PASSWORD }}" ]; then
-          echo "⚠️  Email secrets not configured. Skipping email notification."
-          echo "📧 To enable email notifications:"
-          echo "   1. Go to Settings → Secrets and variables → Actions"
-          echo "   2. Add EMAIL_USERNAME (your Gmail address)"
-          echo "   3. Add EMAIL_PASSWORD (Gmail app-specific password)"
-          echo ""
-          echo "   How to get Gmail app password:"
-          echo "   - Enable 2FA on your Gmail account"
-          echo "   - Go to Google Account → Security → App Passwords"
-          echo "   - Generate a new app password for 'Mail'"
-          echo "   - Use that password for EMAIL_PASSWORD secret"
+        # Check for either EMAIL_* or MAIL_* secrets (for compatibility)
+        if [ -n "${{ secrets.MAIL_USERNAME }}" ] && [ -n "${{ secrets.MAIL_PASSWORD }}" ]; then
+          echo "✅ Email secrets configured (MAIL_USERNAME/MAIL_PASSWORD)"
+        elif [ -n "${{ secrets.EMAIL_USERNAME }}" ] && [ -n "${{ secrets.EMAIL_PASSWORD }}" ]; then
+          echo "✅ Email secrets configured (EMAIL_USERNAME/EMAIL_PASSWORD)"
         else
-          echo "✅ Email secrets configured. Email will be sent."
+          echo "⚠️  Email secrets not configured. Skipping email notification."
+          echo "📧 To enable email notifications, add ONE of these secret pairs:"
+          echo "   Option 1 (matches your other repo):"
+          echo "     - MAIL_USERNAME (your Gmail address)"
+          echo "     - MAIL_PASSWORD (Gmail app-specific password)"
+          echo "   Option 2:"
+          echo "     - EMAIL_USERNAME (your Gmail address)"
+          echo "     - EMAIL_PASSWORD (Gmail app-specific password)"
         fi
     
     - name: Send daily email notification
-      if: ${{ secrets.EMAIL_USERNAME != '' && secrets.EMAIL_PASSWORD != '' }}
+      if: ${{ (secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '') || (secrets.EMAIL_USERNAME != '' && secrets.EMAIL_PASSWORD != '') }}
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
-        server_port: 587
-        username: ${{ secrets.EMAIL_USERNAME }}
-        password: ${{ secrets.EMAIL_PASSWORD }}
+        server_port: 465
+        secure: true
+        username: ${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD || secrets.EMAIL_PASSWORD }}
         subject: "⚡ EVR Daily Action Plan + Portfolio Report"
         to: anshuman264@gmail.com
-        from: EVR Scanner <${{ secrets.EMAIL_USERNAME }}>
+        from: EVR Scanner <${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}>
         html_body: |
           EVR Daily Portfolio Report & Action Plan
           
@@ -407,16 +408,17 @@ jobs:
           }
           
     - name: Notify on Failure
-      if: failure() && secrets.EMAIL_USERNAME != '' && secrets.EMAIL_PASSWORD != ''
+      if: failure() && ((secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '') || (secrets.EMAIL_USERNAME != '' && secrets.EMAIL_PASSWORD != ''))
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
-        server_port: 587
-        username: ${{ secrets.EMAIL_USERNAME }}
-        password: ${{ secrets.EMAIL_PASSWORD }}
+        server_port: 465
+        secure: true
+        username: ${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD || secrets.EMAIL_PASSWORD }}
         subject: "🚨 EVR Daily Scanner Failed - Run #${{ github.run_number }}"
         to: anshuman264@gmail.com
-        from: EVR Scanner <${{ secrets.EMAIL_USERNAME }}>
+        from: EVR Scanner <${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}>
         html_body: |
           <h2>EVR Daily Scanner Failure Notification</h2>
           
