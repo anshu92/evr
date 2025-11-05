@@ -82,6 +82,7 @@ jobs:
         import json
         import glob
         from datetime import datetime
+        import os
         
         # Read portfolio state
         with open('portfolio_state.json', 'r') as f:
@@ -279,7 +280,54 @@ jobs:
         with open('portfolio_report.txt', 'w') as f:
             f.write('\n'.join(report))
         
+        # Export actions for email
+        with open('actions.json', 'w') as f:
+            json.dump(actions, f, indent=2)
+        
+        # Generate email-friendly action summary
+        email_actions = []
+        if actions:
+            for i, action in enumerate(actions, 1):
+                priority_symbol = '🔴' if action['priority'] == 'HIGH' else '🟡' if action['priority'] == 'MEDIUM' else '🟢'
+                
+                if action['type'] == 'SELL':
+                    email_actions.append(f\"{i}. {priority_symbol} <strong>SELL {action['shares']} shares of {action['ticker']}</strong>\")
+                    email_actions.append(f\"   └─ Reason: {action['reason']}\")
+                    email_actions.append(f\"   └─ Entry Price: \${action['price']:.2f}\")
+                    
+                elif action['type'] == 'BUY':
+                    cost = action['shares'] * action['price']
+                    email_actions.append(f\"{i}. {priority_symbol} <strong>BUY {action['shares']} shares of {action['ticker']}</strong>\")
+                    email_actions.append(f\"   └─ Entry: \${action['price']:.2f} | Stop: \${action['stop']:.2f} | Target: \${action['target']:.2f}\")
+                    email_actions.append(f\"   └─ Cost: \${cost:.2f} | Reason: {action['reason']}\")
+                    
+                elif action['type'] == 'REVIEW':
+                    email_actions.append(f\"{i}. {priority_symbol} <strong>REVIEW {action['ticker']}</strong>\")
+                    email_actions.append(f\"   └─ {action['reason']}\")
+        else:
+            email_actions.append('✅ <strong>No immediate actions required.</strong>')
+            email_actions.append('   Portfolio is optimally allocated.')
+        
+        # Save email actions
+        with open('email_actions.txt', 'w') as f:
+            f.write('<br>'.join(email_actions))
+        
+        # Save portfolio summary for email
+        portfolio_summary = {
+            'total_capital': portfolio['total_capital'],
+            'available_capital': portfolio['available_capital'],
+            'allocated_capital': portfolio['allocated_capital'],
+            'total_pnl': portfolio['total_pnl'],
+            'total_return_pct': portfolio['total_return_pct'],
+            'open_positions': len(open_positions),
+            'action_count': len(actions)
+        }
+        with open('portfolio_summary.json', 'w') as f:
+            json.dump(portfolio_summary, f, indent=2)
+        
         print('Portfolio report generated successfully.')
+        print(f'Actions: {len(actions)}')
+        print(f'Open Positions: {len(open_positions)}')
         " || echo "Error generating portfolio report. Portfolio state may not exist yet."
         
     - name: Upload scan results
@@ -312,6 +360,57 @@ jobs:
           echo "     - EMAIL_PASSWORD (Gmail app-specific password)"
         fi
     
+    - name: Prepare email content
+      id: email_content
+      run: |
+        # Read email actions
+        if [ -f email_actions.txt ]; then
+          ACTIONS=$(cat email_actions.txt)
+        else
+          ACTIONS="✅ <strong>No actions available yet.</strong><br>Portfolio report will be generated on next run."
+        fi
+        
+        # Read portfolio summary
+        if [ -f portfolio_summary.json ]; then
+          TOTAL_CAPITAL=$(jq -r '.total_capital' portfolio_summary.json)
+          AVAILABLE=$(jq -r '.available_capital' portfolio_summary.json)
+          ALLOCATED=$(jq -r '.allocated_capital' portfolio_summary.json)
+          PNL=$(jq -r '.total_pnl' portfolio_summary.json)
+          RETURN=$(jq -r '.total_return_pct' portfolio_summary.json)
+          OPEN_POS=$(jq -r '.open_positions' portfolio_summary.json)
+          ACTION_COUNT=$(jq -r '.action_count' portfolio_summary.json)
+          
+          # Format numbers
+          RETURN_PCT=$(echo "$RETURN * 100" | bc -l | xargs printf "%.2f")
+          AVAIL_PCT=$(echo "$AVAILABLE / $TOTAL_CAPITAL * 100" | bc -l | xargs printf "%.1f")
+          ALLOC_PCT=$(echo "$ALLOCATED / $TOTAL_CAPITAL * 100" | bc -l | xargs printf "%.1f")
+        else
+          TOTAL_CAPITAL="0"
+          AVAILABLE="0"
+          ALLOCATED="0"
+          PNL="0"
+          RETURN_PCT="0"
+          OPEN_POS="0"
+          ACTION_COUNT="0"
+          AVAIL_PCT="0"
+          ALLOC_PCT="0"
+        fi
+        
+        # Save to environment file
+        echo "ACTIONS<<EOF" >> $GITHUB_OUTPUT
+        echo "$ACTIONS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "TOTAL_CAPITAL=$TOTAL_CAPITAL" >> $GITHUB_OUTPUT
+        echo "AVAILABLE=$AVAILABLE" >> $GITHUB_OUTPUT
+        echo "ALLOCATED=$ALLOCATED" >> $GITHUB_OUTPUT
+        echo "PNL=$PNL" >> $GITHUB_OUTPUT
+        echo "RETURN_PCT=$RETURN_PCT" >> $GITHUB_OUTPUT
+        echo "OPEN_POS=$OPEN_POS" >> $GITHUB_OUTPUT
+        echo "ACTION_COUNT=$ACTION_COUNT" >> $GITHUB_OUTPUT
+        echo "AVAIL_PCT=$AVAIL_PCT" >> $GITHUB_OUTPUT
+        echo "ALLOC_PCT=$ALLOC_PCT" >> $GITHUB_OUTPUT
+    
     - name: Send daily email notification
       if: always()
       continue-on-error: true
@@ -322,7 +421,7 @@ jobs:
         secure: true
         username: ${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}
         password: ${{ secrets.MAIL_PASSWORD || secrets.EMAIL_PASSWORD }}
-        subject: "⚡ EVR Daily Action Plan + Portfolio Report"
+        subject: "⚡ EVR Daily Action Plan (${{ steps.email_content.outputs.ACTION_COUNT }} Actions)"
         to: anshuman264@gmail.com
         from: EVR Scanner <${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}>
         html_body: |
@@ -334,67 +433,62 @@ jobs:
             </h1>
             
             <p style="font-size: 16px; margin: 20px 0;">
-              Your daily portfolio scan is complete with <strong>actionable recommendations</strong>.
+              Your daily portfolio scan is complete with <strong>${{ steps.email_content.outputs.ACTION_COUNT }} recommended action(s)</strong>.
             </p>
             
             <div style="background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 15px; margin: 20px 0;">
               <h2 style="margin-top: 0; color: #b45309;">⚡ RECOMMENDED ACTIONS</h2>
-              <p style="margin: 10px 0;"><strong>See attached report for complete details!</strong></p>
-              <ul style="margin: 10px 0; padding-left: 20px;">
-                <li>🔴 <strong>HIGH PRIORITY</strong> - Immediate action recommended</li>
-                <li>🟡 <strong>MEDIUM PRIORITY</strong> - Review within 1-2 days</li>
-                <li>🟢 <strong>LOW PRIORITY</strong> - Monitor and consider</li>
+              <div style="font-family: 'Courier New', monospace; font-size: 14px; background-color: #fff; padding: 15px; border-radius: 5px; margin-top: 10px;">
+                ${{ steps.email_content.outputs.ACTIONS }}
+              </div>
+              <p style="margin: 10px 0; font-size: 12px; color: #78716c;">
+                Priority: 🔴 HIGH (now) | 🟡 MEDIUM (1-2 days) | 🟢 LOW (monitor)
+              </p>
+            </div>
+            
+            <div style="background-color: #e0f2fe; border-left: 4px solid #0891b2; padding: 15px; margin: 20px 0;">
+              <h2 style="margin-top: 0; color: #0c4a6e;">📊 Portfolio Summary</h2>
+              <table style="width: 100%; font-size: 14px;">
+                <tr>
+                  <td style="padding: 5px 0;"><strong>Total Capital:</strong></td>
+                  <td style="text-align: right; padding: 5px 0;">\$${{ steps.email_content.outputs.TOTAL_CAPITAL }}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 5px 0;"><strong>Available:</strong></td>
+                  <td style="text-align: right; padding: 5px 0;">\$${{ steps.email_content.outputs.AVAILABLE }} (${{ steps.email_content.outputs.AVAIL_PCT }}%)</td>
+                </tr>
+                <tr>
+                  <td style="padding: 5px 0;"><strong>Allocated:</strong></td>
+                  <td style="text-align: right; padding: 5px 0;">\$${{ steps.email_content.outputs.ALLOCATED }} (${{ steps.email_content.outputs.ALLOC_PCT }}%)</td>
+                </tr>
+                <tr style="border-top: 2px solid #0891b2;">
+                  <td style="padding: 5px 0;"><strong>Total P&L:</strong></td>
+                  <td style="text-align: right; padding: 5px 0; color: #059669; font-weight: bold;">\$${{ steps.email_content.outputs.PNL }}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 5px 0;"><strong>Total Return:</strong></td>
+                  <td style="text-align: right; padding: 5px 0; color: #059669; font-weight: bold;">${{ steps.email_content.outputs.RETURN_PCT }}%</td>
+                </tr>
+                <tr>
+                  <td style="padding: 5px 0;"><strong>Open Positions:</strong></td>
+                  <td style="text-align: right; padding: 5px 0;">${{ steps.email_content.outputs.OPEN_POS }} / 5</td>
+                </tr>
+              </table>
+            </div>
+            
+            <div style="background-color: #f3f4f6; border-radius: 8px; padding: 15px; margin: 20px 0;">
+              <h3 style="margin-top: 0; color: #374151;">📎 Attached Report Contains Full Details:</h3>
+              <ul style="margin: 10px 0; padding-left: 20px; font-size: 14px; color: #4b5563;">
+                <li>Complete position details (entry/stop/target prices, days held)</li>
+                <li>Recently closed positions with P&amp;L breakdown</li>
+                <li>Performance statistics (win rate, profitability by exit type)</li>
+                <li>Detailed reasoning for each recommendation</li>
               </ul>
             </div>
             
-            <h2 style="color: #0891b2; margin-top: 30px;">📊 The Attached Report Contains:</h2>
-            
-            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-              <tr style="background-color: #f3f4f6;">
-                <td style="padding: 12px; border: 1px solid #d1d5db; font-weight: bold;">1️⃣</td>
-                <td style="padding: 12px; border: 1px solid #d1d5db;">
-                  <strong>RECOMMENDED ACTIONS (AT THE TOP!)</strong>
-                  <ul style="margin: 5px 0; padding-left: 20px;">
-                    <li>Specific BUY/SELL instructions with share quantities</li>
-                    <li>Entry prices, stops, and targets for new positions</li>
-                    <li>Reasons for each recommendation</li>
-                    <li>Priority levels for each action</li>
-                  </ul>
-                </td>
-              </tr>
-              <tr>
-                <td style="padding: 12px; border: 1px solid #d1d5db; font-weight: bold;">2️⃣</td>
-                <td style="padding: 12px; border: 1px solid #d1d5db;">
-                  <strong>Portfolio Summary</strong><br>
-                  Capital allocation, P&amp;L, returns
-                </td>
-              </tr>
-              <tr style="background-color: #f3f4f6;">
-                <td style="padding: 12px; border: 1px solid #d1d5db; font-weight: bold;">3️⃣</td>
-                <td style="padding: 12px; border: 1px solid #d1d5db;">
-                  <strong>Open Positions</strong><br>
-                  Current holdings with entry/stop/target and days held
-                </td>
-              </tr>
-              <tr>
-                <td style="padding: 12px; border: 1px solid #d1d5db; font-weight: bold;">4️⃣</td>
-                <td style="padding: 12px; border: 1px solid #d1d5db;">
-                  <strong>Recently Closed Positions</strong><br>
-                  P&amp;L by exit reason (time, stops, targets, replacements)
-                </td>
-              </tr>
-              <tr style="background-color: #f3f4f6;">
-                <td style="padding: 12px; border: 1px solid #d1d5db; font-weight: bold;">5️⃣</td>
-                <td style="padding: 12px; border: 1px solid #d1d5db;">
-                  <strong>Performance Statistics</strong><br>
-                  Win rate, closed trades, profitability
-                </td>
-              </tr>
-            </table>
-            
             <div style="background-color: #dcfce7; border-left: 4px solid #16a34a; padding: 15px; margin: 20px 0;">
               <p style="margin: 0; font-size: 16px; font-weight: bold;">
-                📋 PLEASE REVIEW THE ATTACHED REPORT AND EXECUTE RECOMMENDED ACTIONS
+                💡 Execute the recommended actions above and review the attached report for full context.
               </p>
             </div>
             
