@@ -79,18 +79,133 @@ jobs:
         source .venv/bin/activate
         python -c "
         import json
+        import glob
         from datetime import datetime
         
         # Read portfolio state
         with open('portfolio_state.json', 'r') as f:
             portfolio = json.load(f)
         
+        # Read latest scan results
+        scan_files = glob.glob('scans/daily_*.json')
+        recommendations = []
+        if scan_files:
+            latest_scan = max(scan_files, key=lambda x: x.split('_')[-1])
+            with open(latest_scan, 'r') as f:
+                recommendations = json.load(f)
+        
         # Generate report
         report = []
         report.append('=' * 70)
-        report.append('EVR DAILY PORTFOLIO REPORT')
+        report.append('EVR DAILY PORTFOLIO REPORT & ACTION PLAN')
         report.append('=' * 70)
         report.append(f'Generated: {datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")}')
+        report.append('')
+        
+        # ACTION ITEMS SECTION - FIRST!
+        report.append('⚡ RECOMMENDED ACTIONS')
+        report.append('=' * 70)
+        
+        actions = []
+        action_num = 1
+        
+        # Get open positions
+        open_positions = [p for p in portfolio['positions'] if p['status'] == 'OPEN']
+        
+        # 1. Check for positions to sell (time exits, near stops, etc.)
+        for pos in open_positions:
+            entry_date = datetime.fromisoformat(pos['entry_date'])
+            days_held = (datetime.now() - entry_date).days
+            
+            # Flag positions near time exit (6+ days)
+            if days_held >= 6:
+                actions.append({
+                    'type': 'SELL',
+                    'ticker': pos['ticker'],
+                    'shares': pos['shares'],
+                    'reason': f'Time exit (held {days_held} days)',
+                    'priority': 'HIGH' if days_held >= 7 else 'MEDIUM',
+                    'price': pos['entry_price']
+                })
+            
+            # Flag positions with low expected return
+            if pos.get('expected_return', 0) < 0.03:  # Less than 3%
+                actions.append({
+                    'type': 'REVIEW',
+                    'ticker': pos['ticker'],
+                    'shares': pos['shares'],
+                    'reason': f'Low expected return ({pos[\"expected_return\"]*100:.1f}%)',
+                    'priority': 'LOW',
+                    'price': pos['entry_price']
+                })
+        
+        # 2. Check for positions to buy from recommendations
+        available_cash = portfolio['available_capital']
+        position_slots = 5 - len(open_positions)
+        
+        if recommendations and position_slots > 0:
+            # Get top recommendations not already in portfolio
+            open_tickers = {p['ticker'] for p in open_positions}
+            new_recs = [r for r in recommendations if r.get('ticker') not in open_tickers][:position_slots]
+            
+            for rec in new_recs:
+                if rec.get('action') in ['BUY', 'SHORT']:
+                    entry_price = rec.get('entry_price', 0)
+                    stop_loss = rec.get('stop_loss', entry_price * 0.95)
+                    risk_per_share = abs(entry_price - stop_loss)
+                    
+                    # Calculate shares based on risk (2.5% of available capital)
+                    max_risk = available_cash * 0.025
+                    shares = int(max_risk / risk_per_share) if risk_per_share > 0 else 0
+                    cost = shares * entry_price
+                    
+                    if shares > 0 and cost <= available_cash:
+                        actions.append({
+                            'type': 'BUY',
+                            'ticker': rec['ticker'],
+                            'shares': shares,
+                            'reason': f'EVR Score: {rec.get(\"evr_score\", 0):.3f}, {rec.get(\"total_signals\", 0)} signals',
+                            'priority': 'HIGH' if rec.get('evr_score', 0) > 0.7 else 'MEDIUM',
+                            'price': entry_price,
+                            'stop': stop_loss,
+                            'target': rec.get('take_profit', entry_price * 1.1)
+                        })
+                        available_cash -= cost
+        
+        # Sort actions by priority and type
+        priority_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+        actions.sort(key=lambda x: (priority_order.get(x['priority'], 3), x['type']))
+        
+        # Display actions
+        if actions:
+            for action in actions:
+                priority_symbol = '🔴' if action['priority'] == 'HIGH' else '🟡' if action['priority'] == 'MEDIUM' else '🟢'
+                
+                if action['type'] == 'SELL':
+                    report.append(f\"{action_num}. {priority_symbol} SELL {action['shares']} shares of {action['ticker']}\")
+                    report.append(f\"   Reason: {action['reason']}\")
+                    report.append(f\"   Current Entry: \${action['price']:.2f}\")
+                    report.append('')
+                    action_num += 1
+                    
+                elif action['type'] == 'BUY':
+                    report.append(f\"{action_num}. {priority_symbol} BUY {action['shares']} shares of {action['ticker']}\")
+                    report.append(f\"   Entry: \${action['price']:.2f} | Stop: \${action['stop']:.2f} | Target: \${action['target']:.2f}\")
+                    report.append(f\"   Reason: {action['reason']}\")
+                    report.append(f\"   Cost: \${action['shares'] * action['price']:.2f}\")
+                    report.append('')
+                    action_num += 1
+                    
+                elif action['type'] == 'REVIEW':
+                    report.append(f\"{action_num}. {priority_symbol} REVIEW {action['ticker']} position\")
+                    report.append(f\"   Reason: {action['reason']}\")
+                    report.append('')
+                    action_num += 1
+        else:
+            report.append('✅ No immediate actions required.')
+            report.append('   Portfolio is optimally allocated.')
+            report.append('')
+        
         report.append('')
         
         # Portfolio Summary
@@ -185,32 +300,51 @@ jobs:
         server_port: 587
         username: ${{ secrets.EMAIL_USERNAME }}
         password: ${{ secrets.EMAIL_PASSWORD }}
-        subject: "EVR Daily Portfolio Report - Run #${{ github.run_number }}"
+        subject: "⚡ EVR Daily Action Plan + Portfolio Report"
         to: anshuman264@gmail.com
         from: ${{ secrets.EMAIL_USERNAME }}
         body: |
-          EVR Daily Portfolio Report
+          EVR Daily Portfolio Report & Action Plan
           
-          Your daily portfolio scan completed successfully.
+          Your daily portfolio scan is complete with actionable recommendations.
           
-          **Key Highlights:**
-          - Portfolio monitored for time exits (7 days max hold)
-          - Position replacement evaluated (20% threshold)
-          - Stop losses and targets checked
-          - New opportunities scanned
+          ⚡ RECOMMENDED ACTIONS (See attachment for details):
           
-          **Report Contents:**
-          📊 Portfolio Summary (capital, P&L, returns)
-          📍 Open Positions (entry, stop, target, days held)
-          ✅ Recently Closed Positions (P&L, exit reason)
-          📈 Performance Statistics (win rate, closed trades)
+          🔴 HIGH PRIORITY - Immediate action recommended
+          🟡 MEDIUM PRIORITY - Review within 1-2 days  
+          🟢 LOW PRIORITY - Monitor and consider
           
-          **Please review the attached portfolio report for complete details.**
+          The attached report contains:
+          
+          1️⃣ RECOMMENDED ACTIONS (AT THE TOP!)
+             - Specific BUY/SELL instructions with share quantities
+             - Entry prices, stops, and targets for new positions
+             - Reasons for each recommendation (time exits, low returns, high EVR scores)
+             - Priority levels for each action
+          
+          2️⃣ Portfolio Summary
+             - Capital allocation, P&L, returns
+          
+          3️⃣ Open Positions
+             - Current holdings with entry/stop/target and days held
+          
+          4️⃣ Recently Closed Positions
+             - P&L by exit reason (time, stops, targets, replacements)
+          
+          5️⃣ Performance Statistics
+             - Win rate, closed trades, profitability
+          
+          **📋 PLEASE REVIEW THE ATTACHED REPORT AND EXECUTE RECOMMENDED ACTIONS**
+          
+          Automated Analysis:
+          ✅ Portfolio monitored for time exits (7 days max hold)
+          ✅ Position replacement opportunities evaluated (20% threshold)
+          ✅ Stop losses and targets checked
+          ✅ New opportunities scanned and ranked by EVR score
+          ✅ Actionable buy/sell list generated with precise share counts
           
           Repository: https://github.com/${{ github.repository }}
           Workflow: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          
-          Full scan results (CSV/JSON) are available in GitHub Actions artifacts.
           
           ---
           Generated by EVR Scanner at 6:00 AM ET
