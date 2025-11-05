@@ -31,6 +31,8 @@ python official_scanner.py
 - **Walk-Forward Analysis**: Test strategy robustness over rolling windows
 - **Portfolio Management**: Track positions, capital, and returns
 - **Position Monitoring**: Real-time tracking of open positions
+- **Time-Based Exits**: Automatically close positions after max holding period (default: 7 days)
+- **Position Replacement**: Intelligently replace underperforming positions with better opportunities
 
 ## 📊 Output Formats
 
@@ -55,6 +57,7 @@ The scanner generates comprehensive reports in multiple formats:
 - [Changes Summary](docs/CHANGES_SUMMARY.md) - Recent updates
 
 ### Recent Improvements
+- [Position Management Enhancements](docs/POSITION_MANAGEMENT_ENHANCEMENTS.md) - Time exits & position replacement
 - [All Fixes Complete](docs/ALL_FIXES_COMPLETE.md) - Complete list of fixes
 - [Fixes Summary Nov 4](docs/FIXES_SUMMARY_NOV4.md) - Latest improvements
 - [Auto Position Monitoring](docs/AUTO_POSITION_MONITORING.md) - Position tracking feature
@@ -119,6 +122,21 @@ python official_scanner.py --backtest --walk-forward \
   --end-date 2023-12-31 \
   --training-window 90 \
   --testing-window 30
+```
+
+### Position Management
+```bash
+# Time-based exits (close after 5 days)
+python official_scanner.py --max-holding-days 5
+
+# Enable position replacement with 15% threshold
+python official_scanner.py --replacement-threshold 0.15
+
+# Disable position replacement (time exits only)
+python official_scanner.py --no-replacement
+
+# Aggressive management (3 day exits, 10% replacement threshold)
+python official_scanner.py --max-holding-days 3 --replacement-threshold 0.10
 ```
 
 ## 🏗️ Project Structure
