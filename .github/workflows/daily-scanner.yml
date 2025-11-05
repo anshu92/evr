@@ -51,7 +51,6 @@ jobs:
         uv venv
         source .venv/bin/activate
         uv pip install pandas numpy pyarrow yfinance requests rich matplotlib jinja2 seaborn lxml html5lib
-        uv pip install -e .
     
     - name: Check cache status
       run: |
