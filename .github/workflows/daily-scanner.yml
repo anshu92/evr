@@ -2,9 +2,10 @@ name: Daily EVR Scanner
 
 on:
   schedule:
-    # Run daily at 9:15 AM ET (2:15 PM UTC during EST, 1:15 PM UTC during EDT)
-    # Using 13:15 UTC to cover both EST and EDT (will be 8:15 AM EST or 9:15 AM EDT)
-    - cron: '15 13 * * 1-5'  # Monday to Friday at 1:15 PM UTC
+    # Run daily at 6:00 AM ET (10:00 AM UTC during EDT, 11:00 AM UTC during EST)
+    # Using 10:00 UTC to hit 6AM EDT (most of trading year: March-November)
+    # During EST (winter), this will be 5AM ET, still before market open
+    - cron: '0 10 * * 1-5'  # Monday to Friday at 10:00 AM UTC = 6:00 AM EDT
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
@@ -19,6 +20,26 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+    
+    - name: Cache Python dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/uv
+          .venv
+        key: ${{ runner.os }}-python-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-python-
+    
+    - name: Cache ticker data
+      uses: actions/cache@v4
+      with:
+        path: |
+          cache/
+          trained_parameters/
+        key: ${{ runner.os }}-evr-cache-${{ github.run_number }}
+        restore-keys: |
+          ${{ runner.os }}-evr-cache-
         
     - name: Install uv
       uses: astral-sh/setup-uv@v3
@@ -31,6 +52,17 @@ jobs:
         source .venv/bin/activate
         uv pip install pandas numpy pyarrow yfinance requests rich matplotlib jinja2 seaborn lxml html5lib
         uv pip install -e .
+    
+    - name: Check cache status
+      run: |
+        echo "Cache directories:"
+        ls -lah cache/ 2>/dev/null || echo "No cache directory yet (will be created by scanner)"
+        ls -lah trained_parameters/ 2>/dev/null || echo "No trained_parameters directory yet"
+        echo ""
+        echo "This workflow uses cache to persist:"
+        echo "  - Ticker lists (cache/official_tickers.json, cache/delisted_tickers.json)"
+        echo "  - Trained parameters (trained_parameters/)"
+        echo "  - Python dependencies (.venv/)"
         
     - name: Run EVR Scanner
       run: |
@@ -38,7 +70,10 @@ jobs:
         python official_scanner.py \
           --top 30 \
           --output-prefix "daily_$(date +%Y%m%d)" \
-          --log-level INFO
+          --log-level INFO \
+          --max-holding-days 7 \
+          --enable-replacement \
+          --replacement-threshold 0.20
         
     - name: Generate Summary Report
       run: |
