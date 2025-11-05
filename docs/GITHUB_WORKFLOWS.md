@@ -2,11 +2,9 @@
 
 ## Overview
 
-The EVR scanner includes three automated GitHub Actions workflows that run the scanner automatically and send results via email.
+The EVR scanner includes an automated GitHub Actions workflow that runs daily at 6:00 AM Eastern Time, monitors your portfolio, and sends a detailed portfolio report via email.
 
-## Workflows
-
-### 1. Daily Scanner
+## Daily Scanner Workflow
 **File:** `.github/workflows/daily-scanner.yml`
 
 **Schedule:** Monday-Friday at 6:00 AM Eastern Time (10:00 AM UTC)
@@ -34,60 +32,9 @@ Top Results: 30
 
 ---
 
-### 2. Weekly Scanner
-**File:** `.github/workflows/weekly-scanner.yml`
-
-**Schedule:** Every Monday at 1:15 PM UTC
-
-**Features:**
-- Comprehensive weekly scan with top 50 recommendations
-- Caches ticker lists and trained parameters
-- Sends weekly summary email
-- Creates GitHub issue on failure
-
-**Configuration:**
-```yaml
-Schedule: '15 13 * * 1'  # Mondays only
-Top Results: 50
-```
-
-**Trigger manually:**
-```bash
-# Via GitHub UI: Actions → Weekly EVR Scanner → Run workflow
-```
-
----
-
-### 3. Manual Scanner
-**File:** `.github/workflows/manual-scanner.yml`
-
-**Schedule:** Manual trigger only (no automatic schedule)
-
-**Features:**
-- Customizable parameters via UI
-- Can specify max tickers, top signals, log level
-- Optional email notification
-- Cache control
-- Caches ticker lists and trained parameters
-
-**Available Parameters:**
-- `max_tickers`: Limit number of tickers to scan (default: all)
-- `top_signals`: Number of results to show (default: 20)
-- `log_level`: DEBUG, INFO, WARNING, ERROR (default: INFO)
-- `use_cache`: Enable/disable cache (default: true)
-- `email_notification`: Send email (default: true)
-
-**Trigger manually:**
-```bash
-# Via GitHub UI: Actions → Manual EVR Scanner → Run workflow
-# Fill in desired parameters and click "Run workflow"
-```
-
----
-
 ## Cache Strategy
 
-All workflows implement intelligent caching to improve performance and reduce API calls:
+The daily workflow implements intelligent caching to improve performance and reduce API calls:
 
 ### What's Cached
 
@@ -228,36 +175,19 @@ GitHub → Actions → Select Workflow Run → Artifacts section → Download
 
 ---
 
-## Manual Trigger Examples
+## Manual Trigger
 
-### Quick Daily Scan
-```
-Workflow: Daily EVR Scanner
-Action: Run workflow
-Branch: main
-```
+You can manually trigger the daily scanner at any time:
 
-### Custom Manual Scan
 ```
-Workflow: Manual EVR Scanner
-Parameters:
-  - max_tickers: 200
-  - top_signals: 50
-  - log_level: DEBUG
-  - use_cache: true
-  - email_notification: true
+GitHub → Actions → Daily EVR Scanner → Run workflow → Select branch (main) → Run workflow
 ```
 
-### Test Run (No Email)
-```
-Workflow: Manual EVR Scanner
-Parameters:
-  - max_tickers: 50
-  - top_signals: 10
-  - log_level: DEBUG
-  - use_cache: false
-  - email_notification: false
-```
+This will:
+- Run the full daily scan immediately
+- Monitor and update your portfolio
+- Send the portfolio report via email
+- Use cached data for faster execution
 
 ---
 
@@ -406,11 +336,9 @@ Edit scanner command:
 
 ### Typical Run Times
 
-| Workflow | First Run | Cached Run | Speedup |
-|----------|-----------|------------|---------|
+| Run Type | First Run (Cold Cache) | Subsequent Runs (Warm Cache) | Speedup |
+|----------|----------------------|------------------------------|---------|
 | Daily (all tickers) | ~15-20 min | ~8-10 min | 2x faster |
-| Weekly (all tickers) | ~15-20 min | ~8-10 min | 2x faster |
-| Manual (100 tickers) | ~5-8 min | ~3-4 min | 2x faster |
 
 ### Cache Impact
 
