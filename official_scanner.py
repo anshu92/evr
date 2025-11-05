@@ -1114,11 +1114,12 @@ class PortfolioManager:
                 return position
         return None
     
-    def monitor_and_close_positions(self, data_fetcher) -> Dict[str, Any]:
-        """Monitor all open positions and automatically close those that hit stops or targets.
+    def monitor_and_close_positions(self, data_fetcher, max_holding_days: int = 7) -> Dict[str, Any]:
+        """Monitor all open positions and automatically close those that hit stops, targets, or exceed holding period.
         
         Args:
             data_fetcher: ParallelDataFetcher instance to fetch current prices
+            max_holding_days: Maximum days to hold a position (default: 7 days)
             
         Returns:
             Dictionary with monitoring results
@@ -1131,6 +1132,7 @@ class PortfolioManager:
                 'closed': 0,
                 'stopped_out': 0,
                 'targets_hit': 0,
+                'time_exited': 0,
                 'errors': 0
             }
         
@@ -1145,6 +1147,7 @@ class PortfolioManager:
             'closed': 0,
             'stopped_out': 0,
             'targets_hit': 0,
+            'time_exited': 0,
             'errors': 0
         }
         
@@ -1159,6 +1162,20 @@ class PortfolioManager:
             try:
                 # Get current price (latest close)
                 current_price = float(data['Close'].iloc[-1])
+                
+                # Check if position has exceeded max holding period (Option 3: Time-based exit)
+                days_held = (datetime.now() - position.entry_date).days
+                if days_held >= max_holding_days:
+                    closed_pos = self.close_position(position.ticker, current_price, "TIME_EXIT")
+                    if closed_pos:
+                        results['closed'] += 1
+                        results['time_exited'] += 1
+                        pnl_str = f"${closed_pos.pnl:+,.2f}" if closed_pos.pnl else "N/A"
+                        self.logger.info(
+                            f"⏰ Time exit {position.ticker} @ ${current_price:.2f} (held {days_held} days) - "
+                            f"Entry: ${position.entry_price:.2f}, P&L: {pnl_str}"
+                        )
+                    continue  # Skip stop/target checks if time-exited
                 
                 # Determine if long or short based on entry/stop relationship
                 is_long = position.entry_price > position.stop_price
@@ -3490,13 +3507,17 @@ EVR Aggregated Summary:
         self.console.print(table)
     
     def update_portfolio_from_recommendations(self, recommendations: List[Dict[str, Any]], 
-                                             max_positions: int = 5, auto_add: bool = True) -> None:
-        """Update portfolio with positions from recommendations.
+                                             max_positions: int = 5, auto_add: bool = True,
+                                             enable_replacement: bool = True,
+                                             replacement_threshold: float = 0.20) -> None:
+        """Update portfolio with positions from recommendations, with option to replace underperforming positions.
         
         Args:
             recommendations: List of aggregated recommendations
             max_positions: Maximum number of positions to add
             auto_add: Whether to automatically add positions
+            enable_replacement: Whether to replace underperforming positions with better opportunities
+            replacement_threshold: Minimum EVR score improvement required to replace (0.20 = 20% improvement)
         """
         if not recommendations:
             self.console.print("[yellow]⚠️  No recommendations to process[/yellow]")
@@ -3518,8 +3539,91 @@ EVR Aggregated Summary:
         
         self.console.print(f"[cyan]Available Capital: ${available_capital:,.2f} | Open Positions: {open_positions}[/cyan]")
         
-        if open_positions >= max_positions:
+        # Option 2: Position replacement logic
+        if open_positions >= max_positions and enable_replacement:
             self.console.print(f"[yellow]⚠️  Portfolio full ({open_positions}/{max_positions} positions)[/yellow]")
+            self.console.print(f"[cyan]🔄 Evaluating position replacement opportunities...[/cyan]")
+            
+            # Get current open positions with their "EVR scores"
+            current_positions = [p for p in self.portfolio_manager.state.positions if p.status == "OPEN"]
+            
+            # Calculate EVR-like scores for current positions (simplified: p_win * expected_return * kelly)
+            position_scores = []
+            for pos in current_positions:
+                evr_score = pos.p_win * pos.expected_return * pos.kelly_fraction
+                days_held = (datetime.now() - pos.entry_date).days
+                position_scores.append({
+                    'position': pos,
+                    'evr_score': evr_score,
+                    'days_held': days_held,
+                    'ticker': pos.ticker
+                })
+            
+            # Sort by EVR score (ascending - worst first)
+            position_scores.sort(key=lambda x: x['evr_score'])
+            
+            # Get top new recommendations
+            top_new_recs = actionable_recs[:3]  # Look at top 3 new opportunities
+            
+            replaced_count = 0
+            for new_rec in top_new_recs:
+                if replaced_count >= 2:  # Max 2 replacements per run to avoid excessive churn
+                    break
+                
+                new_evr = new_rec.get('evr_score', 0)
+                
+                # Find the worst existing position
+                if position_scores:
+                    worst_position = position_scores[0]
+                    
+                    # Check if new opportunity is significantly better (20% improvement by default)
+                    improvement = (new_evr - worst_position['evr_score']) / worst_position['evr_score'] if worst_position['evr_score'] > 0 else float('inf')
+                    
+                    if improvement >= replacement_threshold:
+                        # Fetch current price to close position
+                        try:
+                            ticker_data = self.data_fetcher.fetch_multiple_tickers([worst_position['ticker']], period="1d")
+                            if worst_position['ticker'] in ticker_data and not ticker_data[worst_position['ticker']].empty:
+                                current_price = float(ticker_data[worst_position['ticker']]['Close'].iloc[-1])
+                                
+                                # Close the underperforming position
+                                closed_pos = self.portfolio_manager.close_position(
+                                    worst_position['ticker'], 
+                                    current_price, 
+                                    "REPLACED"
+                                )
+                                
+                                if closed_pos:
+                                    replaced_count += 1
+                                    pnl_str = f"${closed_pos.pnl:+,.2f}" if closed_pos.pnl else "N/A"
+                                    self.console.print(
+                                        f"[yellow]🔄 Replaced {worst_position['ticker']} (EVR: {worst_position['evr_score']:.3f}, held {worst_position['days_held']}d) "
+                                        f"with {new_rec['ticker']} (EVR: {new_evr:.3f}, +{improvement:.1%} better) - P&L: {pnl_str}[/yellow]"
+                                    )
+                                    
+                                    # Remove from position_scores so we don't replace it again
+                                    position_scores.pop(0)
+                                    
+                                    # Update available capital
+                                    available_capital = self.portfolio_manager.state.available_capital
+                                    open_positions -= 1
+                        except Exception as e:
+                            self.logger.error(f"Error replacing position {worst_position['ticker']}: {e}")
+            
+            if replaced_count == 0:
+                self.console.print("[dim]No positions replaced (no significant improvements found)[/dim]")
+            else:
+                self.console.print(f"[green]✅ Replaced {replaced_count} position(s)[/green]")
+            
+            # Update summary after replacements
+            summary = self.portfolio_manager.get_portfolio_summary()
+            available_capital = summary['available_capital']
+            open_positions = summary['open_positions']
+        
+        # If still full after replacement attempts, return
+        if open_positions >= max_positions:
+            if not enable_replacement:
+                self.console.print(f"[yellow]⚠️  Portfolio full ({open_positions}/{max_positions} positions)[/yellow]")
             return
         
         # Add positions up to max_positions limit
@@ -4876,6 +4980,12 @@ def main():
     parser.add_argument('--training-window', type=int, default=90, help='Training window in days for walk-forward analysis')
     parser.add_argument('--testing-window', type=int, default=30, help='Testing window in days for walk-forward analysis')
     
+    # Portfolio management options
+    parser.add_argument('--max-holding-days', type=int, default=7, help='Maximum days to hold a position before time exit (default: 7)')
+    parser.add_argument('--enable-replacement', action='store_true', default=True, help='Enable position replacement when better opportunities appear')
+    parser.add_argument('--no-replacement', action='store_false', dest='enable_replacement', help='Disable position replacement')
+    parser.add_argument('--replacement-threshold', type=float, default=0.20, help='Minimum EVR improvement to replace position (default: 0.20 = 20%%)')
+    
     # Liquidity guardrails arguments
     parser.add_argument('--min-volume', type=int, default=100000, help='Minimum average daily volume for liquidity')
     parser.add_argument('--min-price', type=float, default=1.0, help='Minimum stock price for liquidity')
@@ -5041,9 +5151,12 @@ This scanner implements the complete EVR framework with:
                 if cache_stats.get("total_files", 0) > 0:
                     console.print(f"\n[blue]Cache: {cache_stats['total_files']} files, {cache_stats['total_size_mb']} MB | Delisted: {cache_stats.get('delisted_tickers', 0)}[/blue]")
             
-            # Monitor and auto-close positions that hit stops/targets
+            # Monitor and auto-close positions that hit stops/targets/time
             console.print("\n[cyan]📊 Monitoring Open Positions...[/cyan]")
-            monitor_results = scanner.portfolio_manager.monitor_and_close_positions(scanner.data_fetcher)
+            monitor_results = scanner.portfolio_manager.monitor_and_close_positions(
+                scanner.data_fetcher, 
+                max_holding_days=args.max_holding_days
+            )
             
             if monitor_results['monitored'] > 0:
                 console.print(
@@ -5051,6 +5164,7 @@ This scanner implements the complete EVR framework with:
                     f"Closed: {monitor_results['closed']} | "
                     f"Stopped Out: {monitor_results['stopped_out']} | "
                     f"Targets Hit: {monitor_results['targets_hit']} | "
+                    f"Time Exits: {monitor_results['time_exited']} | "
                     f"Errors: {monitor_results['errors']}[/cyan]"
                 )
             else:
@@ -5089,7 +5203,9 @@ This scanner implements the complete EVR framework with:
                 scanner.update_portfolio_from_recommendations(
                     aggregated_recommendations, 
                     max_positions=5, 
-                    auto_add=True
+                    auto_add=True,
+                    enable_replacement=args.enable_replacement,
+                    replacement_threshold=args.replacement_threshold
                 )
                 
                 # Show top aggregated recommendation details
