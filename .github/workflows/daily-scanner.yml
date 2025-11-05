@@ -312,7 +312,8 @@ jobs:
         fi
     
     - name: Send daily email notification
-      if: ${{ (secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '') || (secrets.EMAIL_USERNAME != '' && secrets.EMAIL_PASSWORD != '') }}
+      if: always()
+      continue-on-error: true
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
@@ -408,7 +409,8 @@ jobs:
           }
           
     - name: Notify on Failure
-      if: failure() && ((secrets.MAIL_USERNAME != '' && secrets.MAIL_PASSWORD != '') || (secrets.EMAIL_USERNAME != '' && secrets.EMAIL_PASSWORD != ''))
+      if: failure()
+      continue-on-error: true
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
