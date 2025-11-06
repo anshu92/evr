@@ -1114,6 +1114,113 @@ class PortfolioManager:
                 return position
         return None
     
+    def _calculate_atr_percentage(self, data: pd.DataFrame, period: int = 14) -> Optional[float]:
+        """ATR percentage from price data."""
+        if data is None or data.empty:
+            return None
+        
+        required = {'High', 'Low', 'Close'}
+        if not required.issubset(data.columns):
+            return None
+        
+        if len(data) <= period:
+            return None
+        
+        high = data['High']
+        low = data['Low']
+        close = data['Close']
+        
+        current_price = float(close.iloc[-1])
+        if current_price <= 0:
+            return None
+        
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr_series = true_range.rolling(period).mean()
+        atr_value = atr_series.iloc[-1]
+        
+        if pd.isna(atr_value) or atr_value <= 0:
+            return None
+        
+        return float((atr_value / current_price) * 100)
+    
+    def _update_position_levels_from_data(self, position: PortfolioPosition, data: pd.DataFrame) -> bool:
+        """Refresh stop and targets for a position."""
+        atr_pct = self._calculate_atr_percentage(data)
+        if atr_pct is None:
+            return False
+        
+        close_series = data['Close']
+        current_price = float(close_series.iloc[-1])
+        if current_price <= 0:
+            return False
+        
+        is_long = position.entry_price > position.stop_price
+        stop_multiplier = 2.0
+        target_multiplier = 4.0
+        
+        if is_long:
+            candidate_stop = current_price * (1 - (atr_pct / 100.0) * stop_multiplier)
+            candidate_target = current_price * (1 + (atr_pct / 100.0) * target_multiplier)
+            new_stop = max(position.stop_price, candidate_stop)
+            existing_target = position.target_prices[0] if position.target_prices else candidate_target
+            new_target = max(existing_target, candidate_target)
+        else:
+            candidate_stop = current_price * (1 + (atr_pct / 100.0) * stop_multiplier)
+            candidate_target = current_price * (1 - (atr_pct / 100.0) * target_multiplier)
+            new_stop = min(position.stop_price, candidate_stop)
+            existing_target = position.target_prices[0] if position.target_prices else candidate_target
+            new_target = min(existing_target, candidate_target)
+        
+        updated = False
+        
+        if abs(new_stop - position.stop_price) > 1e-4:
+            old_stop = position.stop_price
+            position.stop_price = float(new_stop)
+            updated = True
+            self.logger.info(
+                f"Updated stop for {position.ticker}: {old_stop:.4f} -> {position.stop_price:.4f}"
+            )
+        
+        targets = list(position.target_prices) if position.target_prices else []
+        if not targets:
+            targets = [float(new_target)]
+            updated = True
+        else:
+            if abs(targets[0] - new_target) > 1e-4:
+                old_target = targets[0]
+                targets[0] = float(new_target)
+                updated = True
+                self.logger.info(
+                    f"Updated target for {position.ticker}: {old_target:.4f} -> {targets[0]:.4f}"
+                )
+        position.target_prices = targets
+        
+        if updated:
+            if position.shares > 0:
+                if is_long:
+                    risk_per_share = max(position.entry_price - position.stop_price, 0.0)
+                else:
+                    risk_per_share = max(position.stop_price - position.entry_price, 0.0)
+                position.risk_dollars = risk_per_share * position.shares
+            else:
+                position.risk_dollars = 0.0
+            
+            if position.entry_price > 0:
+                if is_long:
+                    potential_return = max(targets[0] - position.entry_price, 0.0) / position.entry_price
+                    potential_loss = max(position.entry_price - position.stop_price, 0.0) / position.entry_price
+                else:
+                    potential_return = max(position.entry_price - targets[0], 0.0) / position.entry_price
+                    potential_loss = max(position.stop_price - position.entry_price, 0.0) / position.entry_price
+                position.expected_return = position.p_win * potential_return - (1 - position.p_win) * potential_loss
+            else:
+                position.expected_return = 0.0
+        
+        return updated
+    
     def monitor_and_close_positions(self, data_fetcher, max_holding_days: int = 7) -> Dict[str, Any]:
         """Monitor all open positions and automatically close those that hit stops, targets, or exceed holding period.
         
@@ -1132,6 +1239,7 @@ class PortfolioManager:
                 'closed': 0,
                 'stopped_out': 0,
                 'targets_hit': 0,
+                'updated': 0,
                 'time_exited': 0,
                 'errors': 0
             }
@@ -1140,7 +1248,7 @@ class PortfolioManager:
         tickers = [p.ticker for p in open_positions]
         self.logger.info(f"Monitoring {len(tickers)} open positions: {', '.join(tickers)}")
         
-        ticker_data = data_fetcher.fetch_multiple_tickers(tickers, period="5d")
+        ticker_data = data_fetcher.fetch_multiple_tickers(tickers, period="1mo")
         
         results = {
             'monitored': len(tickers),
@@ -1148,8 +1256,11 @@ class PortfolioManager:
             'stopped_out': 0,
             'targets_hit': 0,
             'time_exited': 0,
+            'updated': 0,
             'errors': 0
         }
+        
+        updates_made = False
         
         for position in open_positions:
             data = ticker_data.get(position.ticker)
@@ -1176,6 +1287,10 @@ class PortfolioManager:
                             f"Entry: ${position.entry_price:.2f}, P&L: {pnl_str}"
                         )
                     continue  # Skip stop/target checks if time-exited
+                
+                if self._update_position_levels_from_data(position, data):
+                    results['updated'] += 1
+                    updates_made = True
                 
                 # Determine if long or short based on entry/stop relationship
                 is_long = position.entry_price > position.stop_price
@@ -1217,6 +1332,10 @@ class PortfolioManager:
             except Exception as e:
                 self.logger.error(f"Error monitoring position {position.ticker}: {e}")
                 results['errors'] += 1
+        
+        if updates_made:
+            self.state.last_updated = datetime.now()
+            self._save_state()
         
         return results
     
