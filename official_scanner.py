@@ -190,6 +190,10 @@ class TradePlan:
     action: str = "NULL"
     # Liquidity score (0-1, higher is better)
     liquidity_score: float = 0.0
+    # Time horizon and time-adjusted returns
+    expected_holding_days: int = 7  # Expected days to target
+    time_adjusted_return: float = 0.0  # Expected return adjusted for time and certainty
+    annualized_return: float = 0.0  # Annualized expected return
 
 
 @dataclass
@@ -951,6 +955,20 @@ class PortfolioState:
     last_updated: datetime
     run_count: int
     performance_history: List[Dict[str, Any]]
+    # Time-weighted return tracking
+    twr: float = 0.0  # Portfolio-level TWR
+    ticker_twr: Dict[str, float] = None  # Per-ticker TWR
+    ticker_trade_history: Dict[str, List[Dict[str, Any]]] = None  # Trade history for TWR calculation
+    cash_flow_events: List[Dict[str, Any]] = None  # Track all cash flows for portfolio TWR
+    
+    def __post_init__(self):
+        """Initialize mutable default values."""
+        if self.ticker_twr is None:
+            self.ticker_twr = {}
+        if self.ticker_trade_history is None:
+            self.ticker_trade_history = {}
+        if self.cash_flow_events is None:
+            self.cash_flow_events = []
 
 
 class PortfolioManager:
@@ -1003,7 +1021,11 @@ class PortfolioManager:
                     positions=positions,
                     last_updated=last_updated or datetime.now(),
                     run_count=data.get('run_count', 0),
-                    performance_history=data.get('performance_history', [])
+                    performance_history=data.get('performance_history', []),
+                    twr=data.get('twr', 0.0),
+                    ticker_twr=data.get('ticker_twr', {}),
+                    ticker_trade_history=data.get('ticker_trade_history', {}),
+                    cash_flow_events=data.get('cash_flow_events', [])
                 )
             except Exception as e:
                 print(f"Error loading portfolio state: {e}")
@@ -1022,7 +1044,11 @@ class PortfolioManager:
             positions=[],
             last_updated=datetime.now(),
             run_count=0,
-            performance_history=[]
+            performance_history=[],
+            twr=0.0,
+            ticker_twr={},
+            ticker_trade_history={},
+            cash_flow_events=[]
         )
     
     def _save_state(self) -> None:
@@ -1146,8 +1172,9 @@ class PortfolioManager:
         
         return float((atr_value / current_price) * 100)
     
-    def _update_position_levels_from_data(self, position: PortfolioPosition, data: pd.DataFrame) -> bool:
-        """Refresh stop and targets for a position."""
+    def _update_position_levels_from_data(self, position: PortfolioPosition, data: pd.DataFrame,
+                                          max_holding_days: int) -> bool:
+        """Refresh stop and targets with time weighting."""
         atr_pct = self._calculate_atr_percentage(data)
         if atr_pct is None:
             return False
@@ -1160,19 +1187,42 @@ class PortfolioManager:
         is_long = position.entry_price > position.stop_price
         stop_multiplier = 2.0
         target_multiplier = 4.0
+        days_held = 0
+        if position.entry_date:
+            days_held = max((datetime.now() - position.entry_date).days, 0)
+        holding_window = max(max_holding_days, 1)
+        holding_ratio = min(days_held / holding_window, 1.0)
+        min_weight = 0.25
+        weight = min_weight + (1.0 - min_weight) * holding_ratio
         
         if is_long:
             candidate_stop = current_price * (1 - (atr_pct / 100.0) * stop_multiplier)
             candidate_target = current_price * (1 + (atr_pct / 100.0) * target_multiplier)
-            new_stop = max(position.stop_price, candidate_stop)
+            if candidate_stop > position.stop_price + 1e-6:
+                delta = candidate_stop - position.stop_price
+                new_stop = position.stop_price + delta * weight
+            else:
+                new_stop = position.stop_price
             existing_target = position.target_prices[0] if position.target_prices else candidate_target
-            new_target = max(existing_target, candidate_target)
+            if candidate_target > existing_target + 1e-6:
+                target_delta = candidate_target - existing_target
+                new_target = existing_target + target_delta * weight
+            else:
+                new_target = existing_target
         else:
             candidate_stop = current_price * (1 + (atr_pct / 100.0) * stop_multiplier)
             candidate_target = current_price * (1 - (atr_pct / 100.0) * target_multiplier)
-            new_stop = min(position.stop_price, candidate_stop)
+            if candidate_stop < position.stop_price - 1e-6:
+                delta = position.stop_price - candidate_stop
+                new_stop = position.stop_price - delta * weight
+            else:
+                new_stop = position.stop_price
             existing_target = position.target_prices[0] if position.target_prices else candidate_target
-            new_target = min(existing_target, candidate_target)
+            if candidate_target < existing_target - 1e-6:
+                target_delta = existing_target - candidate_target
+                new_target = existing_target - target_delta * weight
+            else:
+                new_target = existing_target
         
         updated = False
         
@@ -1188,6 +1238,9 @@ class PortfolioManager:
         if not targets:
             targets = [float(new_target)]
             updated = True
+            self.logger.info(
+                f"Initialized target for {position.ticker}: {targets[0]:.4f}"
+            )
         else:
             if abs(targets[0] - new_target) > 1e-4:
                 old_target = targets[0]
@@ -1288,7 +1341,7 @@ class PortfolioManager:
                         )
                     continue  # Skip stop/target checks if time-exited
                 
-                if self._update_position_levels_from_data(position, data):
+                if self._update_position_levels_from_data(position, data, max_holding_days):
                     results['updated'] += 1
                     updates_made = True
                 
@@ -1361,6 +1414,9 @@ class PortfolioManager:
                 # Update return percentage
                 self.state.total_return_pct = (self.state.total_capital - self.initial_capital) / self.initial_capital
                 
+                # Update TWR tracking
+                self._update_twr_on_close(position)
+                
                 # Record performance
                 self._record_performance()
                 self._save_state()
@@ -1376,9 +1432,99 @@ class PortfolioManager:
             'total_pnl': self.state.total_pnl,
             'total_return_pct': self.state.total_return_pct,
             'open_positions': len([p for p in self.state.positions if p.status == "OPEN"]),
-            'run_count': self.state.run_count
+            'run_count': self.state.run_count,
+            'twr': self.state.twr
         }
         self.state.performance_history.append(performance)
+    
+    def _calculate_ticker_twr(self, ticker: str) -> float:
+        """Calculate time-weighted return for a specific ticker across all trades."""
+        if ticker not in self.state.ticker_trade_history:
+            return 0.0
+        
+        trades = self.state.ticker_trade_history[ticker]
+        if not trades:
+            return 0.0
+        
+        # TWR = Product of (1 + return for each trade) - 1
+        cumulative_return = 1.0
+        for trade in trades:
+            trade_return = trade.get('return_pct', 0.0)
+            cumulative_return *= (1.0 + trade_return)
+        
+        twr = cumulative_return - 1.0
+        return twr
+    
+    def _calculate_portfolio_twr(self) -> float:
+        """Calculate portfolio-level time-weighted return."""
+        if not self.state.cash_flow_events:
+            return self.state.total_return_pct
+        
+        # Sort events by timestamp
+        events = sorted(self.state.cash_flow_events, key=lambda x: x['timestamp'])
+        
+        if not events:
+            return 0.0
+        
+        # Calculate sub-period returns between cash flows
+        cumulative_return = 1.0
+        
+        for i in range(len(events)):
+            event = events[i]
+            if event['type'] == 'close':
+                # Sub-period return for this trade
+                period_return = event.get('return_pct', 0.0)
+                cumulative_return *= (1.0 + period_return)
+        
+        portfolio_twr = cumulative_return - 1.0
+        return portfolio_twr
+    
+    def _update_twr_on_close(self, position: PortfolioPosition) -> None:
+        """Update TWR tracking when a position is closed."""
+        ticker = position.ticker
+        
+        # Record trade in ticker history
+        if ticker not in self.state.ticker_trade_history:
+            self.state.ticker_trade_history[ticker] = []
+        
+        trade_record = {
+            'entry_date': position.entry_date.isoformat() if position.entry_date else None,
+            'exit_date': position.exit_date.isoformat() if position.exit_date else None,
+            'entry_price': position.entry_price,
+            'exit_price': position.exit_price,
+            'return_pct': position.return_pct,
+            'pnl': position.pnl,
+            'setup': position.setup,
+            'status': position.status
+        }
+        self.state.ticker_trade_history[ticker].append(trade_record)
+        
+        # Recalculate ticker TWR
+        self.state.ticker_twr[ticker] = self._calculate_ticker_twr(ticker)
+        
+        # Record cash flow event for portfolio TWR
+        cash_flow_event = {
+            'timestamp': position.exit_date.isoformat() if position.exit_date else datetime.now().isoformat(),
+            'type': 'close',
+            'ticker': ticker,
+            'amount': position.position_size,
+            'return_pct': position.return_pct,
+            'pnl': position.pnl
+        }
+        self.state.cash_flow_events.append(cash_flow_event)
+        
+        # Recalculate portfolio TWR
+        self.state.twr = self._calculate_portfolio_twr()
+    
+    def get_ticker_twr(self, ticker: str) -> float:
+        """Get time-weighted return for a specific ticker."""
+        return self.state.ticker_twr.get(ticker, 0.0)
+    
+    def get_top_tickers_by_twr(self, top_n: int = 10) -> List[Tuple[str, float]]:
+        """Get top N tickers ranked by TWR."""
+        ticker_twr_list = [(ticker, twr) for ticker, twr in self.state.ticker_twr.items()]
+        ticker_twr_list.sort(key=lambda x: x[1], reverse=True)
+        return ticker_twr_list[:top_n]
     
     def get_portfolio_summary(self) -> Dict[str, Any]:
         """Get portfolio summary statistics."""
@@ -1403,13 +1549,15 @@ class PortfolioManager:
             'allocated_capital': self.state.allocated_capital,
             'total_pnl': self.state.total_pnl,
             'total_return_pct': self.state.total_return_pct,
+            'twr': self.state.twr,
             'open_positions': len(open_positions),
             'closed_positions': len(closed_positions),
             'win_rate': win_rate,
             'avg_win': avg_win,
             'avg_loss': avg_loss,
             'run_count': self.state.run_count,
-            'last_updated': self.state.last_updated
+            'last_updated': self.state.last_updated,
+            'top_tickers_by_twr': self.get_top_tickers_by_twr(10)
         }
     
     def get_historical_performance(self) -> List[Dict[str, Any]]:
@@ -2478,6 +2626,62 @@ class OfficialTickerScanner:
             self.logger.debug(f"Error assigning action: {e}")
             trade_plan.action = "NULL"
     
+    def _calculate_time_adjusted_return(self, expected_return: float, p_win: float, 
+                                       potential_return: float, holding_days: int) -> Tuple[float, float]:
+        """Calculate time-adjusted expected return that prioritizes faster and more certain returns.
+        
+        This method applies:
+        1. Time discounting - faster returns are worth more
+        2. Certainty premium - higher probability trades get boosted
+        3. Annualization - to compare returns on equal footing
+        
+        Returns smaller but surer and faster returns higher than larger but uncertain slow returns.
+        """
+        try:
+            # Prevent division by zero
+            if holding_days <= 0:
+                holding_days = 1
+            
+            # Annual discount rate (opportunity cost of capital)
+            # Higher rate = stronger preference for near-term returns
+            annual_discount_rate = 0.15  # 15% annual discount rate
+            
+            # Calculate discount factor for time
+            # Future returns are worth less (time value of money)
+            days_per_year = 252  # Trading days
+            time_discount_factor = 1.0 / (1.0 + annual_discount_rate) ** (holding_days / days_per_year)
+            
+            # Certainty adjustment - rewards high probability
+            # p_win of 0.7 gets 1.0x, 0.8 gets 1.15x, 0.9 gets 1.35x
+            # p_win of 0.5 gets 0.7x, 0.4 gets 0.5x
+            certainty_multiplier = 0.5 + (p_win * 1.5)  # Range: 0.5 to 2.0
+            
+            # Speed bonus - rewards trades that resolve quickly
+            # Decays exponentially with time
+            speed_bonus = 1.0 + (0.3 * np.exp(-holding_days / 5))  # Max 1.3x for same-day, decays to 1.0
+            
+            # Apply adjustments to expected return
+            time_adjusted_return = (
+                expected_return * 
+                time_discount_factor * 
+                certainty_multiplier * 
+                speed_bonus
+            )
+            
+            # Calculate annualized return for comparison
+            # This helps compare a 5% return in 3 days vs 10% return in 30 days
+            if expected_return > 0:
+                annualized_return = ((1 + expected_return) ** (days_per_year / holding_days)) - 1
+            else:
+                # For negative returns, annualize the loss
+                annualized_return = -((1 + abs(expected_return)) ** (days_per_year / holding_days)) + 1
+            
+            return time_adjusted_return, annualized_return
+            
+        except Exception as e:
+            self.logger.debug(f"Error calculating time-adjusted return: {e}")
+            return expected_return, expected_return
+    
     def create_trade_plan(self, signal: Signal, data: pd.DataFrame) -> Optional[TradePlan]:
         """Create TradePlan from EVR Signal.
         
@@ -2551,6 +2755,13 @@ class OfficialTickerScanner:
             
             expected_return = p_win * potential_return - (1 - p_win) * potential_loss
             
+            # Calculate time-adjusted expected return
+            # Prioritizes: 1) Higher certainty (p_win), 2) Faster returns
+            expected_holding_days = 7  # Default 7 days, can be setup-specific
+            time_adjusted_return, annualized_return = self._calculate_time_adjusted_return(
+                expected_return, p_win, potential_return, expected_holding_days
+            )
+            
             # Calculate risk in dollars
             risk_dollars = abs(entry - stop) * shares
             
@@ -2580,7 +2791,10 @@ class OfficialTickerScanner:
                 confidence=signal.strength,
                 take_profit=take_profit,
                 cost_bps=cost_bps,
-                slippage_bps=slippage_bps
+                slippage_bps=slippage_bps,
+                expected_holding_days=expected_holding_days,
+                time_adjusted_return=time_adjusted_return,
+                annualized_return=annualized_return
             )
             
             # Compute R-unit metrics and assign action
@@ -3207,12 +3421,19 @@ EVR Trade Plan Summary:
             opposing_plan_count = len(opposing_plans)
 
             # FIX: Use weighted averages based on the primary-direction plans only
-            total_weight = sum(abs(plan.expected_return) for plan in primary_plans)
+            # Prioritize time-adjusted returns when available
+            def get_weight(plan):
+                """Get weighting value, prioritizing time-adjusted return."""
+                if hasattr(plan, 'time_adjusted_return') and plan.time_adjusted_return != 0.0:
+                    return abs(plan.time_adjusted_return)
+                return abs(plan.expected_return)
+            
+            total_weight = sum(get_weight(plan) for plan in primary_plans)
 
             if total_weight > 0:
-                weighted_p_win = sum(plan.p_win * abs(plan.expected_return) for plan in primary_plans) / total_weight
-                weighted_expected_return = sum(plan.expected_return * abs(plan.expected_return) for plan in primary_plans) / total_weight
-                weighted_kelly = sum(plan.kelly_fraction * abs(plan.expected_return) for plan in primary_plans) / total_weight
+                weighted_p_win = sum(plan.p_win * get_weight(plan) for plan in primary_plans) / total_weight
+                weighted_expected_return = sum(plan.expected_return * get_weight(plan) for plan in primary_plans) / total_weight
+                weighted_kelly = sum(plan.kelly_fraction * get_weight(plan) for plan in primary_plans) / total_weight
             else:
                 weighted_p_win = (
                     sum(plan.p_win for plan in primary_plans) / primary_plan_count
@@ -3228,10 +3449,11 @@ EVR Trade Plan Summary:
                 )
 
             # Get the best plan within the primary direction (fallback to any plan if needed)
+            # Prioritize based on time-adjusted return for faster, more certain trades
             if primary_plans:
-                best_plan = max(primary_plans, key=lambda p: p.kelly_fraction * p.expected_return)
+                best_plan = max(primary_plans, key=lambda p: get_weight(p) * p.p_win)
             else:
-                best_plan = max(plans, key=lambda p: p.kelly_fraction * p.expected_return)
+                best_plan = max(plans, key=lambda p: get_weight(p) * p.p_win)
 
             # Calculate signal diversity and consensus using primary-direction plans
             primary_signal_types = {}
@@ -3240,14 +3462,15 @@ EVR Trade Plan Summary:
             diversity_score = min(len(primary_signal_types) / 12.0, 1.0) if primary_plans else 0.0
             consensus_score = min(primary_plan_count / total_plans, 1.0) if total_plans else 0.0
 
-            # Calculate EVR composite score
+            # Calculate EVR composite score with TWR prioritization
             evr_composite_score = self._calculate_evr_composite_score(
                 weighted_p_win,
                 weighted_expected_return,
                 weighted_kelly,
                 diversity_score,
                 consensus_score,
-                best_plan
+                best_plan,
+                ticker=ticker
             )
 
             # Calculate aggregated risk metrics (report deployable risk and directional context)
@@ -3284,6 +3507,9 @@ EVR Trade Plan Summary:
             else:
                 aggregated_action = "NULL"
 
+            # Get ticker TWR for display
+            ticker_twr = self.portfolio_manager.get_ticker_twr(ticker) if self.portfolio_manager else 0.0
+            
             # Create aggregated recommendation
             aggregated_recommendation = {
                 'ticker': ticker,
@@ -3313,6 +3539,7 @@ EVR Trade Plan Summary:
                 'diversity_score': diversity_score,
                 'consensus_score': consensus_score,
                 'evr_composite_score': evr_composite_score,
+                'ticker_twr': ticker_twr,  # Historical time-weighted return
 
                 # Best plan details
                 'best_setup': best_plan.setup,
@@ -3336,7 +3563,8 @@ EVR Trade Plan Summary:
         return aggregated
     
     def _calculate_evr_composite_score(self, p_win: float, expected_return: float, kelly_fraction: float,
-                                     diversity_score: float, consensus_score: float, best_plan: TradePlan) -> float:
+                                     diversity_score: float, consensus_score: float, best_plan: TradePlan,
+                                     ticker: str = None) -> float:
         """Calculate EVR composite score using R-unit expectancy for aggregated recommendations.
         
         Args:
@@ -3346,14 +3574,38 @@ EVR Trade Plan Summary:
             diversity_score: Signal diversity score
             consensus_score: Direction consensus score
             best_plan: Best individual trade plan
+            ticker: Stock ticker for TWR lookup
             
         Returns:
-            EVR composite score based on R-unit expectancy
+            EVR composite score based on R-unit expectancy with TWR boost
         """
         try:
             # Clamp normalized components to 0-1 before combining
             diversity_score = max(0.0, min(diversity_score, 1.0))
             consensus_score = max(0.0, min(consensus_score, 1.0))
+            
+            # Get ticker TWR and calculate TWR boost
+            twr_boost = 0.0
+            if ticker and self.portfolio_manager:
+                ticker_twr = self.portfolio_manager.get_ticker_twr(ticker)
+                # Normalize TWR to 0-1 scale (assuming TWR typically ranges from -50% to +100%)
+                # Positive TWR gives boost, negative TWR gives penalty
+                if ticker_twr > 0:
+                    twr_boost = min(ticker_twr / 1.0, 0.12)  # Max 12% boost for 100%+ TWR
+                else:
+                    twr_boost = max(ticker_twr / 0.5, -0.08)  # Max -8% penalty for -50% TWR
+            
+            # Speed & Certainty bonus - prioritizes faster, more certain returns
+            speed_certainty_score = 0.0
+            if hasattr(best_plan, 'time_adjusted_return') and hasattr(best_plan, 'expected_holding_days'):
+                # Normalize time-adjusted return
+                time_adj_return = best_plan.time_adjusted_return
+                # Speed factor: faster = better (decay over days)
+                speed_factor = np.exp(-best_plan.expected_holding_days / 10)  # Decays from 1.0 to near 0
+                # Certainty factor: p_win boost
+                certainty_factor = p_win  # 0.5 to 1.0
+                # Combined speed & certainty score (0 to 0.15 range)
+                speed_certainty_score = min(0.15 * speed_factor * certainty_factor, 0.15)
 
             # FIX: Properly normalize all components before combining
             # Use R-unit expectancy from the best plan
@@ -3363,34 +3615,45 @@ EVR Trade Plan Summary:
                 # Normalize expectancy_r (typical range -1.0 to 3.0) to 0-1 scale
                 normalized_expectancy = max(0, min((expectancy_r + 1.0) / 4.0, 1.0))
                 
-                # Safety margin bonus (0 or 0.2 contribution)
+                # Safety margin bonus (0 or 0.15 contribution)
                 safety_bonus = 0.0
                 if hasattr(best_plan, 'required_win_rate') and p_win >= best_plan.required_win_rate:
-                    safety_bonus = 0.2
+                    safety_bonus = 0.15
                 
-                # FIX: Properly weight normalized components
-                # Expectancy is most important (40%), safety margin (20%), diversity (20%), consensus (20%)
+                # Properly weight normalized components
+                # Expectancy (30%), safety margin (15%), speed & certainty (15%), TWR (12%), 
+                # diversity (14%), consensus (14%)
                 composite_score = (
-                    normalized_expectancy * 0.40 +
+                    normalized_expectancy * 0.30 +
                     safety_bonus +
-                    diversity_score * 0.20 +
-                    consensus_score * 0.20
+                    speed_certainty_score +
+                    twr_boost +
+                    diversity_score * 0.14 +
+                    consensus_score * 0.14
                 )
                 
                 return max(0.0, min(composite_score, 1.0))
             else:
                 # Fallback to original scoring if R-unit metrics not available
                 probability_score = min(p_win, 1.0)
-                payoff_score = min(abs(expected_return) / 0.20, 1.0)
+                
+                # Use time-adjusted return if available, otherwise regular expected return
+                if hasattr(best_plan, 'time_adjusted_return') and best_plan.time_adjusted_return != 0.0:
+                    payoff_score = min(abs(best_plan.time_adjusted_return) / 0.15, 1.0)
+                else:
+                    payoff_score = min(abs(expected_return) / 0.20, 1.0)
+                
                 kelly_score = min(kelly_fraction / 0.25, 1.0)
                 
                 evr_score = (
-                    probability_score * 0.25 +
-                    payoff_score * 0.20 +
-                    kelly_score * 0.15 +
-                    diversity_score * 0.15 +
-                    consensus_score * 0.10 +
-                    min(1.0 / (1.0 + best_plan.risk_dollars / 1000), 1.0) * 0.10 +
+                    probability_score * 0.18 +
+                    payoff_score * 0.16 +
+                    kelly_score * 0.10 +
+                    diversity_score * 0.10 +
+                    consensus_score * 0.09 +
+                    speed_certainty_score +
+                    twr_boost +
+                    min(1.0 / (1.0 + best_plan.risk_dollars / 1000), 1.0) * 0.07 +
                     min(1.0 / (1.0 + best_plan.cost_bps / 100), 1.0) * 0.05
                 )
                 
@@ -4674,8 +4937,20 @@ EVR Aggregated Summary:
             total_slippage = sum(t.get('slippage', 0) for t in trades)
             total_costs = total_commission + total_slippage
             
+            # Calculate time-weighted return for backtest
+            twr = 0.0
+            if trades:
+                cumulative_return = 1.0
+                for trade in trades:
+                    if 'entry_price' in trade and 'exit_price' in trade:
+                        if trade['entry_price'] > 0:
+                            trade_return = (trade['exit_price'] - trade['entry_price']) / trade['entry_price']
+                            cumulative_return *= (1.0 + trade_return)
+                twr = cumulative_return - 1.0
+            
             return {
                 'total_return': total_return,
+                'twr': twr,
                 'annualized_return': annualized_return,
                 'max_drawdown': max_drawdown,
                 'sharpe_ratio': sharpe_ratio,
@@ -4882,6 +5157,7 @@ Backtest Summary:
   Initial Capital: ${metrics['initial_capital']:,.0f}
   Final Value: ${metrics['final_value']:,.0f}
   Total Return: {metrics['total_return']:.2%}
+  Time-Weighted Return: {metrics.get('twr', 0.0):.2%}
   Annualized Return: {metrics['annualized_return']:.2%}
   Maximum Drawdown: {metrics['max_drawdown']:.2%}
   Sharpe Ratio: {metrics['sharpe_ratio']:.3f}
@@ -4921,6 +5197,7 @@ Backtest Summary:
                 metrics = results['metrics']
                 f.write(f"Performance Metrics:\n")
                 f.write(f"  Total Return: {metrics['total_return']:.2%}\n")
+                f.write(f"  Time-Weighted Return: {metrics.get('twr', 0.0):.2%}\n")
                 f.write(f"  Annualized Return: {metrics['annualized_return']:.2%}\n")
                 f.write(f"  Maximum Drawdown: {metrics['max_drawdown']:.2%}\n")
                 f.write(f"  Sharpe Ratio: {metrics['sharpe_ratio']:.3f}\n")
@@ -5248,6 +5525,7 @@ This scanner implements the complete EVR framework with:
                 console.print(f"\n[green]✅ EVR backtest completed successfully![/green]")
                 console.print(f"[green]Final Value: ${backtest_results['metrics']['final_value']:,.0f}[/green]")
                 console.print(f"[green]Total Return: {backtest_results['metrics']['total_return']:.2%}[/green]")
+                console.print(f"[green]Time-Weighted Return: {backtest_results['metrics'].get('twr', 0.0):.2%}[/green]")
                 console.print(f"[green]Annualized Return: {backtest_results['metrics']['annualized_return']:.2%}[/green]")
                 console.print(f"[green]Max Drawdown: {backtest_results['metrics']['max_drawdown']:.2%}[/green]")
                 console.print(f"[green]Sharpe Ratio: {backtest_results['metrics']['sharpe_ratio']:.3f}[/green]")
