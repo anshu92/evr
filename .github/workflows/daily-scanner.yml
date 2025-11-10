@@ -68,12 +68,17 @@ jobs:
       run: |
         source .venv/bin/activate
         python official_scanner.py \
+          --initial-capital 1000 \
           --top 30 \
           --output-prefix "daily_$(date +%Y%m%d)" \
           --log-level INFO \
           --max-holding-days 7 \
           --enable-replacement \
-          --replacement-threshold 0.20
+          --replacement-threshold 0.20 \
+          --min-volume 250000 \
+          --min-price 5.0 \
+          --max-price 200.0 \
+          --max-spread 0.03
         
     - name: Generate Portfolio Report
       run: |
