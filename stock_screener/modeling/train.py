@@ -46,7 +46,7 @@ def _build_panel_features(prices: pd.DataFrame, fx_usdcad: pd.Series) -> pd.Data
         fx_factor = 1.0 if is_tsx else fx
         close_cad = close * fx_factor
 
-        rets = close.pct_change()
+        rets = close.pct_change(fill_method=None)
         vol_20 = rets.rolling(20).std(ddof=0) * np.sqrt(252.0)
         vol_60 = rets.rolling(60).std(ddof=0) * np.sqrt(252.0)
 
@@ -70,9 +70,9 @@ def _build_panel_features(prices: pd.DataFrame, fx_usdcad: pd.Series) -> pd.Data
                 "is_tsx": int(is_tsx),
                 "last_close_cad": close_cad.values,
                 "avg_dollar_volume_cad": (close_cad * vol).rolling(30).mean().values,
-                "ret_20d": close.pct_change(20).values,
-                "ret_60d": close.pct_change(60).values,
-                "ret_120d": close.pct_change(120).values,
+                "ret_20d": close.pct_change(20, fill_method=None).values,
+                "ret_60d": close.pct_change(60, fill_method=None).values,
+                "ret_120d": close.pct_change(120, fill_method=None).values,
                 "vol_20d_ann": vol_20.values,
                 "vol_60d_ann": vol_60.values,
                 "rsi_14": rsi_14.values,
