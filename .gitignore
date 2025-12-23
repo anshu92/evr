@@ -183,8 +183,8 @@ config_local.yml
 .local.yaml
 .local.yml
 
-# Data files
-data/
+# Data files (top-level only)
+/data/
 *.parquet
 *.feather
 *.h5
