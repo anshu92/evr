@@ -1,0 +1,102 @@
+name: AI Market Timing
+
+on:
+  schedule:
+    # Run daily at 6:30 AM ET (10:30 UTC)
+    - cron: '30 10 * * 1-5'
+    # Train twice a week: Wednesday and Sunday at 2:00 AM UTC (9:00 PM ET / 10:00 PM ET)
+    - cron: '0 2 * * 0,3'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode to run (update_and_predict or train)'
+        required: true
+        default: 'update_and_predict'
+        type: choice
+        options:
+        - update_and_predict
+        - train
+
+jobs:
+  market_timing:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Cache Python dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements_timing.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Cache Data & Model
+      uses: actions/cache@v4
+      with:
+        path: |
+          trained_parameters/
+          cache/
+          portfolio_state.json
+        key: ${{ runner.os }}-market-data-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-market-data-
+        
+    - name: Install dependencies
+      run: |
+        pip install -r requirements_timing.txt
+    
+    - name: Determine Mode
+      id: mode
+      run: |
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "MODE=${{ inputs.mode }}" >> $GITHUB_OUTPUT
+        elif [ "${{ github.event.schedule }}" == "0 2 * * 0,3" ]; then
+          echo "MODE=train" >> $GITHUB_OUTPUT
+        else
+          echo "MODE=update_and_predict" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Run Market Timing Service
+      run: |
+        python market_timing/service.py --mode ${{ steps.mode.outputs.MODE }}
+      env:
+        PYTHONPATH: ${{ github.workspace }}
+        
+    - name: Prepare Email Body
+      if: steps.mode.outputs.MODE == 'update_and_predict'
+      run: |
+        if [ -f email_body.html ]; then
+          echo "Email body found."
+        else
+          echo "<h2>Error: No report generated</h2>" > email_body.html
+        fi
+        
+    - name: Send AI Market Timing Email
+      if: steps.mode.outputs.MODE == 'update_and_predict'
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD || secrets.EMAIL_PASSWORD }}
+        subject: "🤖 AI Market Portfolio Update"
+        to: anshuman264@gmail.com
+        from: AI Market Timer <${{ secrets.MAIL_USERNAME || secrets.EMAIL_USERNAME }}>
+        html_body: file://email_body.html
+        attachments: market_report.txt
+
+    - name: Commit Portfolio State & Cache
+      if: always()
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: "🤖 AI: Update Portfolio & Cache [${{ steps.mode.outputs.MODE }}]"
+        file_pattern: "portfolio_state.json trained_parameters/ cache/"

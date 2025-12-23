@@ -4,6 +4,12 @@
 
 The EVR scanner can automatically send daily portfolio reports via email. This requires setting up GitHub Secrets with your email credentials.
 
+This repository also includes a **Daily Stock Screener (CAD) + Portfolio Weights** workflow that emails:
+- `reports/daily_report.txt`
+- `reports/portfolio_weights.csv`
+
+If you enable ML scoring (default in the daily screener workflow), make sure you run the training workflow at least once so the model exists.
+
 ## Quick Setup (5 minutes)
 
 ### Step 1: Enable 2-Factor Authentication on Gmail
@@ -47,6 +53,11 @@ The EVR scanner can automatically send daily portfolio reports via email. This r
 - Name: `EMAIL_PASSWORD`
 - Value: The 16-character app password from Step 2 (remove spaces)
 - Click **Add secret**
+
+**Optional Secret (Recipient):**
+- Name: `EMAIL_TO`
+- Value: Your recipient email address
+- If not set, the workflows default to sending to `EMAIL_USERNAME`
 
 ---
 

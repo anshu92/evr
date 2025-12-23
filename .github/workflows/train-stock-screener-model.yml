@@ -1,0 +1,64 @@
+name: Train Stock Screener Model (XGBoost)
+
+on:
+  schedule:
+    - cron: '0 2 * * 0' # Weekly Sunday 02:00 UTC
+  workflow_dispatch:
+
+jobs:
+  train_model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache universe/data/models
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            data_cache/
+            models/
+          key: ${{ runner.os }}-screener-model-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-screener-model-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Train model
+        env:
+          MODEL_PATH: "models/ensemble/manifest.json"
+          LABEL_HORIZON_DAYS: "20"
+          # Keep limits reasonable for GitHub Actions; increase if needed.
+          MAX_TICKERS: "2500"
+          FEATURE_LOOKBACK_DAYS: "365"
+          BATCH_SIZE: "200"
+        run: |
+          python -m stock_screener.cli train-model --log-level INFO
+
+      - name: Upload trained model artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-model-${{ github.run_number }}
+          path: |
+            models/ensemble/
+          retention-days: 90
+
+

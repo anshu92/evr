@@ -196,6 +196,9 @@ models/
 *.pickle
 *.joblib
 
+# Large Torch models (GitHub limit is 100MB). Keep locally; do not commit.
+trained_parameters/*.pt
+
 # Backtest results
 backtests/
 backtest_*.csv

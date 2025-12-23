@@ -30,17 +30,17 @@
       "ticker": "GGLL",
       "setup": "bb_breakout",
       "entry_price": 83.9000015258789,
-      "stop_price": 75.571286882673,
+      "stop_price": 76.65485545567104,
       "target_prices": [
-        100.55743081229073
+        103.65528542654855
       ],
       "position_size": 167.8000030517578,
       "shares": 2,
       "entry_date": "2025-11-04T12:13:20.182516",
       "p_win": 0.569202008473428,
-      "expected_return": 0.07024372536776201,
+      "expected_return": 0.09682422826125987,
       "kelly_fraction": 0.07614190285577366,
-      "risk_dollars": 16.657429286411826,
+      "risk_dollars": 14.490292140415733,
       "status": "OPEN",
       "exit_price": null,
       "exit_date": null,
@@ -51,7 +51,7 @@
       "ticker": "LOB",
       "setup": "support_bounce",
       "entry_price": 31.290000915527344,
-      "stop_price": 28.712156568254745,
+      "stop_price": 29.25215721130371,
       "target_prices": [
         36.44568961007254
       ],
@@ -59,9 +59,9 @@
       "shares": 5,
       "entry_date": "2025-11-04T12:13:20.183444",
       "p_win": 0.5615211288158399,
-      "expected_return": 0.05639814012366531,
+      "expected_return": 0.06396537775469177,
       "kelly_fraction": 0.07269715556515763,
-      "risk_dollars": 12.889221736362995,
+      "risk_dollars": 10.189218521118164,
       "status": "OPEN",
       "exit_price": null,
       "exit_date": null,
@@ -93,17 +93,17 @@
       "ticker": "AMH",
       "setup": "support_bounce",
       "entry_price": 31.450000762939453,
-      "stop_price": 30.10157258169992,
+      "stop_price": 30.43335805620466,
       "target_prices": [
-        34.14685712541852
+        34.38328388759068
       ],
       "position_size": 188.70000457763672,
       "shares": 6,
       "entry_date": "2025-11-04T12:13:20.185310",
       "p_win": 0.5564294992062346,
-      "expected_return": 0.02869594434579526,
+      "expected_return": 0.03755842660954831,
       "kelly_fraction": 0.07041420118343197,
-      "risk_dollars": 8.090569087437203,
+      "risk_dollars": 6.099856240408755,
       "status": "OPEN",
       "exit_price": null,
       "exit_date": null,
@@ -111,7 +111,7 @@
       "return_pct": null
     }
   ],
-  "last_updated": "2025-11-04T19:05:33.514050",
-  "run_count": 5,
+  "last_updated": "2025-11-06T15:41:08.795167",
+  "run_count": 6,
   "performance_history": []
 }

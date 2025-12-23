@@ -1,0 +1,109 @@
+name: Daily Stock Screener (CAD) + Email
+
+on:
+  schedule:
+    - cron: '0 10 * * 1-5' # Weekdays 10:00 UTC ~= 6:00 AM EDT / 5:00 AM EST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  daily_screener:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache universe/data
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            data_cache/
+            models/
+          key: ${{ runner.os }}-daily-screener-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-daily-screener-
+            ${{ runner.os }}-screener-model-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run daily screener
+        env:
+          # Safety default to avoid runaway runs; you can override in repo variables if desired.
+          MAX_TICKERS: "4000"
+          TOP_N: "50"
+          PORTFOLIO_SIZE: "20"
+          WEIGHT_CAP: "0.10"
+          MIN_PRICE_CAD: "2.0"
+          MIN_AVG_DOLLAR_VOLUME_CAD: "250000"
+          # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
+          USE_ML: "1"
+          MODEL_PATH: "models/ensemble/manifest.json"
+        run: |
+          python -m stock_screener.cli daily --log-level INFO
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-stock-screener-${{ github.run_number }}
+          path: |
+            reports/
+            cache/last_run_meta.json
+          retention-days: 30
+
+      - name: Send daily email
+        if: always()
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Daily Stock Screener + Portfolio Weights (CAD)"
+          to: ${{ secrets.EMAIL_TO || secrets.EMAIL_USERNAME }}
+          from: Stock Screener Bot <${{ secrets.EMAIL_USERNAME }}>
+          html_body: file://reports/daily_email.html
+          attachments: reports/daily_report.txt,reports/portfolio_weights.csv
+
+      - name: Create GitHub Issue on Failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Daily Stock Screener Failed - ${new Date().toISOString().split('T')[0]}`,
+                body: `The daily stock screener failed.\n\n**Workflow URL:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nPlease check the run logs for details.`,
+                labels: ['bug', 'automation', 'screener']
+              });
+              console.log(`Created issue ${issue.data.number}`);
+            } catch (error) {
+              console.log(`Could not create issue: ${error.message}`);
+            }
+
+

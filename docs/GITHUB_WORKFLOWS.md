@@ -32,6 +32,31 @@ Top Results: 30
 
 ---
 
+## Daily Stock Screener (CAD) + Portfolio Weights
+**File:** `.github/workflows/daily-stock-screener.yml`
+
+**Schedule:** Monday-Friday at 6:00 AM Eastern Time (10:00 AM UTC)
+
+**What it does:**
+- Builds a **US + TSX** ticker universe
+- Pulls daily data from Yahoo Finance (`yfinance`)
+- Screens/ranks candidates
+- Computes **inverse-vol (risk parity style) weights** in **CAD base currency**
+- Produces:
+  - `reports/daily_email.html` (email body)
+  - `reports/daily_report.txt` (full text report)
+  - `reports/portfolio_weights.csv` (weights + metrics)
+- Emails the report and uploads artifacts
+
+**Secrets required:**
+- `EMAIL_USERNAME`
+- `EMAIL_PASSWORD`
+- Optional: `EMAIL_TO` (defaults to `EMAIL_USERNAME`)
+
+### Optional ML scoring
+The daily screener can optionally blend an ML-predicted return signal into the ranking.\n\n- Train the model (manual run):\n  - `python -m stock_screener.cli train-model`\n- Enable ML for daily runs:\n  - Set `USE_ML=1`\n  - Ensure the model artifact exists at `MODEL_PATH` (default: `models/ensemble/manifest.json`)\n\nIf the model is missing or fails to load, the pipeline automatically falls back to baseline factor scoring.\n\n**GitHub Actions training workflow:**\n- **File:** `.github/workflows/train-stock-screener-model.yml`\n- **Schedule:** Weekly (Sunday 02:00 UTC) + manual trigger\n- Produces and caches: `models/ensemble/` (manifest + member models)\n
+---
+
 ## Cache Strategy
 
 The daily workflow implements intelligent caching to improve performance and reduce API calls:
