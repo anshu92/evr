@@ -101,7 +101,10 @@ def save_model(model, path: str | Path) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     # Save as JSON (non-pickle, portable).
-    model.save_model(str(p))
+    # XGBoost's sklearn wrapper can raise `_estimator_type` errors in some envs when calling save_model().
+    # Saving the underlying Booster is stable across environments (including GitHub Actions).
+    booster = model.get_booster() if hasattr(model, "get_booster") else model
+    booster.save_model(str(p))
 
 
 def save_ensemble(manifest_path: str | Path, model_rel_paths: list[str], weights: list[float] | None = None) -> None:
