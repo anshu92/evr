@@ -34,6 +34,7 @@ def render_reports(
     universe_meta: dict[str, Any],
     screened: pd.DataFrame,
     weights: pd.DataFrame,
+    trade_actions: list[Any] | None,
     logger,
 ) -> None:
     """Write daily email HTML + text report + weights CSV to reports_dir."""
@@ -111,11 +112,27 @@ def render_reports(
     lines.extend(weights_view[weights_cols].to_string().splitlines())
     lines.append("")
 
+    if trade_actions:
+        lines.append("RECOMMENDED ACTIONS (max hold)")
+        lines.append("-" * 78)
+        for a in trade_actions:
+            # Support both dataclass actions and dict-like actions.
+            ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
+            action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
+            reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
+            shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
+            px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
+            days = getattr(a, "days_held", None) or (a.get("days_held") if isinstance(a, dict) else "")
+            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px} days_held={days} reason={reason}")
+        lines.append("")
+
     lines.append("FILES")
     lines.append("-" * 78)
     lines.append("reports/daily_email.html")
     lines.append("reports/daily_report.txt")
     lines.append("reports/portfolio_weights.csv")
+    if trade_actions:
+        lines.append("reports/trade_actions.json")
     lines.append("")
     (reports_dir / "daily_report.txt").write_text("\n".join(lines), encoding="utf-8")
 
@@ -143,12 +160,29 @@ def render_reports(
         for row in weights_table.itertuples(index=False, name=None)
     )
 
+    # Build actions block outside the f-string to avoid complex nested expressions.
+    if trade_actions:
+        parts: list[str] = []
+        for a in trade_actions:
+            ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
+            action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
+            reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
+            parts.append(_html_escape(f"{action} {ticker} ({reason})"))
+        actions_html = "<br/>".join(parts) if parts else _html_escape("No actions (portfolio already aligned).")
+    else:
+        actions_html = _html_escape("No actions (portfolio already aligned).")
+
     html = f"""<html>
 <body style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827; max-width: 900px; margin: 0 auto; padding: 20px;">
   <h2 style="margin: 0 0 10px 0;">Daily Screener + Risk Parity Portfolio (CAD)</h2>
   <p style="margin: 0 0 16px 0; color: #374151;">
     Generated: <strong>{_html_escape(now)}</strong>
   </p>
+
+  <h3 style="margin: 0 0 10px 0;">Recommended Actions (max hold)</h3>
+  <div style="background:#fef3c7;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
+    {actions_html}
+  </div>
 
   <div style="background:#f3f4f6;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
     <div><strong>Universe:</strong> US + TSX</div>
@@ -180,6 +214,29 @@ def render_reports(
 </html>"""
 
     (reports_dir / "daily_email.html").write_text(html, encoding="utf-8")
+    if trade_actions:
+        # Persist as JSON for debugging/auditing.
+        try:
+            import json
+
+            payload = []
+            for a in trade_actions:
+                if isinstance(a, dict):
+                    payload.append(a)
+                else:
+                    payload.append(
+                        {
+                            "ticker": getattr(a, "ticker", None),
+                            "action": getattr(a, "action", None),
+                            "reason": getattr(a, "reason", None),
+                            "shares": getattr(a, "shares", None),
+                            "price_cad": getattr(a, "price_cad", None),
+                            "days_held": getattr(a, "days_held", None),
+                        }
+                    )
+            (reports_dir / "trade_actions.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Could not write trade_actions.json: %s", e)
     logger.info("Rendered reports: %s", str(reports_dir))
 
 

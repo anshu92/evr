@@ -36,6 +36,7 @@ jobs:
             cache/
             data_cache/
             models/
+            screener_portfolio_state.json
           key: ${{ runner.os }}-daily-screener-${{ github.run_id }}
           restore-keys: |
             ${{ runner.os }}-daily-screener-
@@ -58,6 +59,9 @@ jobs:
           # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
           USE_ML: "1"
           MODEL_PATH: "models/ensemble/manifest.json"
+          # Short-horizon trading goal
+          MAX_HOLDING_DAYS: "5"
+          PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
         run: |
           python -m stock_screener.cli daily --log-level INFO
 
@@ -69,6 +73,7 @@ jobs:
           path: |
             reports/
             cache/last_run_meta.json
+            screener_portfolio_state.json
           retention-days: 30
 
       - name: Send daily email
@@ -85,7 +90,7 @@ jobs:
           to: ${{ secrets.EMAIL_TO || secrets.EMAIL_USERNAME }}
           from: Stock Screener Bot <${{ secrets.EMAIL_USERNAME }}>
           html_body: file://reports/daily_email.html
-          attachments: reports/daily_report.txt,reports/portfolio_weights.csv
+          attachments: reports/daily_report.txt,reports/portfolio_weights.csv,reports/trade_actions.json
 
       - name: Create GitHub Issue on Failure
         if: failure()

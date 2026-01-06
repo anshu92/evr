@@ -16,6 +16,8 @@ from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json
 from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble
+from stock_screener.portfolio.manager import PortfolioManager
+from stock_screener.portfolio.state import load_portfolio_state
 
 
 def run_daily(cfg: Config, logger) -> None:
@@ -93,9 +95,41 @@ def run_daily(cfg: Config, logger) -> None:
         logger=logger,
     )
 
-    weights = compute_inverse_vol_weights(
+    target_weights = compute_inverse_vol_weights(
         features=screened,
         portfolio_size=cfg.portfolio_size,
+        weight_cap=cfg.weight_cap,
+        logger=logger,
+    )
+
+    # Portfolio actions (stateful)
+    prices_cad = screened["last_close_cad"].astype(float)
+    state = load_portfolio_state(cfg.portfolio_state_path)
+    pm = PortfolioManager(
+        state_path=cfg.portfolio_state_path,
+        max_holding_days=cfg.max_holding_days,
+        max_positions=cfg.portfolio_size,
+        stop_loss_pct=cfg.stop_loss_pct,
+        take_profit_pct=cfg.take_profit_pct,
+        logger=logger,
+    )
+    exit_actions = pm.apply_exits(state, prices_cad=prices_cad)
+    if exit_actions:
+        logger.info("Exited %s position(s) (time/stop/target).", len([a for a in exit_actions if a.action == "SELL"]))
+
+    trade_plan = pm.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=target_weights,
+        prices_cad=prices_cad,
+    )
+
+    open_tickers = [p.ticker for p in state.positions if p.status == "OPEN"]
+    holdings_features = screened.loc[screened.index.intersection(open_tickers)].copy()
+    holdings_features = holdings_features.sort_values("score", ascending=False)
+    holdings_weights = compute_inverse_vol_weights(
+        features=holdings_features,
+        portfolio_size=len(holdings_features),
         weight_cap=cfg.weight_cap,
         logger=logger,
     )
@@ -105,7 +139,8 @@ def run_daily(cfg: Config, logger) -> None:
         run_meta=run_meta,
         universe_meta=universe.meta,
         screened=screened,
-        weights=weights,
+        weights=holdings_weights,
+        trade_actions=trade_plan.actions,
         logger=logger,
     )
 

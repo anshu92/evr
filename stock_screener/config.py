@@ -29,7 +29,13 @@ class Config:
     # ML model (optional)
     use_ml: bool = False
     model_path: str = "models/ensemble/manifest.json"
-    label_horizon_days: int = 20
+    label_horizon_days: int = 5
+
+    # Portfolio/trading (stateful)
+    max_holding_days: int = 5
+    portfolio_state_path: str = "screener_portfolio_state.json"
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
 
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
@@ -82,7 +88,15 @@ class Config:
             weight_cap=_get_float("WEIGHT_CAP", 0.10),
             use_ml=os.getenv("USE_ML", "0").strip() in {"1", "true", "True"},
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
-            label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 20) or 20,
+            label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 5) or 5,
+            max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
+            portfolio_state_path=_get_str("PORTFOLIO_STATE_PATH", "screener_portfolio_state.json"),
+            stop_loss_pct=(
+                _get_float("STOP_LOSS_PCT", 0.0) if os.getenv("STOP_LOSS_PCT") not in {None, ""} else None
+            ),
+            take_profit_pct=(
+                _get_float("TAKE_PROFIT_PCT", 0.0) if os.getenv("TAKE_PROFIT_PCT") not in {None, ""} else None
+            ),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(
