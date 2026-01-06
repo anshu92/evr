@@ -103,17 +103,23 @@ def run_daily(cfg: Config, logger) -> None:
     )
 
     # Portfolio actions (stateful)
-    prices_cad = screened["last_close_cad"].astype(float)
+    # Use full `features` for exits so we can manage holdings even if they are not in today's top-N.
+    prices_cad = features["last_close_cad"].astype(float)
+    pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
+    score = screened["score"].astype(float) if "score" in screened.columns else None
     state = load_portfolio_state(cfg.portfolio_state_path)
     pm = PortfolioManager(
         state_path=cfg.portfolio_state_path,
         max_holding_days=cfg.max_holding_days,
+        max_holding_days_hard=cfg.max_holding_days_hard,
+        extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
+        extend_hold_min_score=cfg.extend_hold_min_score,
         max_positions=cfg.portfolio_size,
         stop_loss_pct=cfg.stop_loss_pct,
         take_profit_pct=cfg.take_profit_pct,
         logger=logger,
     )
-    exit_actions = pm.apply_exits(state, prices_cad=prices_cad)
+    exit_actions = pm.apply_exits(state, prices_cad=prices_cad, pred_return=pred_return, score=score)
     if exit_actions:
         logger.info("Exited %s position(s) (time/stop/target).", len([a for a in exit_actions if a.action == "SELL"]))
 

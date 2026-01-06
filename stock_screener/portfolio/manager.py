@@ -34,6 +34,9 @@ class PortfolioManager:
         *,
         state_path: str,
         max_holding_days: int,
+        max_holding_days_hard: int,
+        extend_hold_min_pred_return: float | None,
+        extend_hold_min_score: float | None,
         max_positions: int,
         stop_loss_pct: float | None,
         take_profit_pct: float | None,
@@ -41,6 +44,9 @@ class PortfolioManager:
     ) -> None:
         self.state_path = state_path
         self.max_holding_days = max(1, int(max_holding_days))
+        self.max_holding_days_hard = max(self.max_holding_days, int(max_holding_days_hard))
+        self.extend_hold_min_pred_return = extend_hold_min_pred_return
+        self.extend_hold_min_score = extend_hold_min_score
         self.max_positions = max(1, int(max_positions))
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
@@ -60,7 +66,14 @@ class PortfolioManager:
         p.exit_reason = reason
         return p
 
-    def apply_exits(self, state: PortfolioState, prices_cad: pd.Series) -> list[TradeAction]:
+    def apply_exits(
+        self,
+        state: PortfolioState,
+        prices_cad: pd.Series,
+        *,
+        pred_return: pd.Series | None = None,
+        score: pd.Series | None = None,
+    ) -> list[TradeAction]:
         actions: list[TradeAction] = []
         now = _utcnow()
         open_positions: list[Position] = [p for p in state.positions if p.status == "OPEN"]
@@ -73,11 +86,61 @@ class PortfolioManager:
                 continue
 
             days = p.days_held(now)
-            # Priority: time exit first (enforces <= max_holding_days).
+            # Time exits:
+            # - Default behavior: exit at max_holding_days.
+            # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
             if days >= self.max_holding_days:
+                if days >= self.max_holding_days_hard:
+                    self._close_position(p, price_cad=px, reason="TIME_EXIT_HARD")
+                    actions.append(
+                        TradeAction(
+                            ticker=p.ticker,
+                            action="SELL",
+                            reason="TIME_EXIT_HARD",
+                            shares=p.shares,
+                            price_cad=px,
+                            days_held=days,
+                        )
+                    )
+                    continue
+
+                strong = False
+                strong_reason = None
+                if pred_return is not None and self.extend_hold_min_pred_return is not None:
+                    pr = float(pred_return.get(p.ticker, float("nan")))
+                    if not pd.isna(pr) and pr >= float(self.extend_hold_min_pred_return):
+                        strong = True
+                        strong_reason = f"EXTEND_PRED_RETURN>={self.extend_hold_min_pred_return}"
+                if (not strong) and score is not None and self.extend_hold_min_score is not None:
+                    sc = float(score.get(p.ticker, float("nan")))
+                    if not pd.isna(sc) and sc >= float(self.extend_hold_min_score):
+                        strong = True
+                        strong_reason = f"EXTEND_SCORE>={self.extend_hold_min_score}"
+
+                if strong:
+                    keep.append(p)
+                    actions.append(
+                        TradeAction(
+                            ticker=p.ticker,
+                            action="HOLD",
+                            reason=strong_reason or "EXTENDED",
+                            shares=p.shares,
+                            price_cad=px,
+                            days_held=days,
+                        )
+                    )
+                    continue
+
                 self._close_position(p, price_cad=px, reason="TIME_EXIT")
                 actions.append(
-                    TradeAction(ticker=p.ticker, action="SELL", reason="TIME_EXIT", shares=p.shares, price_cad=px, days_held=days)
+                    TradeAction(
+                        ticker=p.ticker,
+                        action="SELL",
+                        reason="TIME_EXIT",
+                        shares=p.shares,
+                        price_cad=px,
+                        days_held=days,
+                    )
                 )
                 continue
 

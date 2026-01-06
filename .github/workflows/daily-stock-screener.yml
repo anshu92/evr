@@ -61,6 +61,9 @@ jobs:
           MODEL_PATH: "models/ensemble/manifest.json"
           # Short-horizon trading goal
           MAX_HOLDING_DAYS: "5"
+          MAX_HOLDING_DAYS_HARD: "10"
+          # If the model is very confident, allow holding beyond 5 days up to the hard cap.
+          EXTEND_HOLD_MIN_PRED_RETURN: "0.03"
           PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
         run: |
           python -m stock_screener.cli daily --log-level INFO

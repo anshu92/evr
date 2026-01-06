@@ -33,6 +33,9 @@ class Config:
 
     # Portfolio/trading (stateful)
     max_holding_days: int = 5
+    max_holding_days_hard: int = 10
+    extend_hold_min_pred_return: float | None = 0.03
+    extend_hold_min_score: float | None = None
     portfolio_state_path: str = "screener_portfolio_state.json"
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
@@ -90,6 +93,15 @@ class Config:
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
             label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 5) or 5,
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
+            max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,
+            extend_hold_min_pred_return=(
+                _get_float("EXTEND_HOLD_MIN_PRED_RETURN", 0.0)
+                if os.getenv("EXTEND_HOLD_MIN_PRED_RETURN") not in {None, ""}
+                else None
+            ),
+            extend_hold_min_score=(
+                _get_float("EXTEND_HOLD_MIN_SCORE", 0.0) if os.getenv("EXTEND_HOLD_MIN_SCORE") not in {None, ""} else None
+            ),
             portfolio_state_path=_get_str("PORTFOLIO_STATE_PATH", "screener_portfolio_state.json"),
             stop_loss_pct=(
                 _get_float("STOP_LOSS_PCT", 0.0) if os.getenv("STOP_LOSS_PCT") not in {None, ""} else None
