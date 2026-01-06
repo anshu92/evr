@@ -47,6 +47,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Ensure ML model exists (train if missing)
+        shell: bash
+        env:
+          MODEL_PATH: "models/ensemble/manifest.json"
+          LABEL_HORIZON_DAYS: "5"
+          # Keep this lighter than the dedicated training workflow; it's only a fallback.
+          MAX_TICKERS: "1500"
+          FEATURE_LOOKBACK_DAYS: "365"
+          BATCH_SIZE: "200"
+        run: |
+          if [ -f "$MODEL_PATH" ]; then
+            echo "Model manifest found at $MODEL_PATH"
+          else
+            echo "Model manifest missing; training a fallback model..."
+            python -m stock_screener.cli train-model --log-level INFO
+          fi
+
       - name: Run daily screener
         env:
           # Safety default to avoid runaway runs; you can override in repo variables if desired.
