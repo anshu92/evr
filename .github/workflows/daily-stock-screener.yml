@@ -35,11 +35,18 @@ jobs:
           path: |
             cache/
             data_cache/
-            models/
             screener_portfolio_state.json
-          key: ${{ runner.os }}-daily-screener-${{ github.run_id }}
+          key: ${{ runner.os }}-daily-screener-data-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-daily-screener-
+            ${{ runner.os }}-daily-screener-data-
+
+      - name: Cache ML model
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/
+          key: ${{ runner.os }}-screener-model-${{ github.run_id }}
+          restore-keys: |
             ${{ runner.os }}-screener-model-
 
       - name: Install dependencies
