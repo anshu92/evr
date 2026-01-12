@@ -76,7 +76,7 @@ jobs:
           # Safety default to avoid runaway runs; you can override in repo variables if desired.
           MAX_TICKERS: "4000"
           TOP_N: "50"
-          PORTFOLIO_SIZE: "20"
+          PORTFOLIO_SIZE: "5"
           WEIGHT_CAP: "0.10"
           MIN_PRICE_CAD: "2.0"
           MIN_AVG_DOLLAR_VOLUME_CAD: "250000"

@@ -147,6 +147,7 @@ def run_daily(cfg: Config, logger) -> None:
         screened=screened,
         weights=holdings_weights,
         trade_actions=trade_plan.actions,
+        portfolio_pnl_history=state.pnl_history,
         logger=logger,
     )
 

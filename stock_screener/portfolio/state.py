@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -41,13 +41,14 @@ class PortfolioState:
     cash_cad: float
     positions: list[Position]
     last_updated: datetime
+    pnl_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 def load_portfolio_state(path: str | Path, initial_cash_cad: float = 100_000.0) -> PortfolioState:
     """Load portfolio state or create a new one."""
     p = Path(path)
     if not p.exists():
-        return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow())
+        return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
 
     data = json.loads(p.read_text(encoding="utf-8"))
     cash = float(data.get("cash_cad", initial_cash_cad))
@@ -73,7 +74,32 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 100_000.0) 
         if pos.ticker and pos.shares > 0:
             positions.append(pos)
 
-    return PortfolioState(cash_cad=cash, positions=positions, last_updated=last_updated)
+    pnl_history_raw = data.get("pnl_history", []) or []
+    pnl_history: list[dict[str, Any]] = []
+    if isinstance(pnl_history_raw, list):
+        for item in pnl_history_raw:
+            if not isinstance(item, dict):
+                continue
+            asof = item.get("asof_utc")
+            if not isinstance(asof, str) or not asof.strip():
+                continue
+            # Keep the payload small and robust to schema tweaks.
+            cleaned: dict[str, Any] = {"asof_utc": asof.strip()}
+            for k in [
+                "realized_pl_cad",
+                "unrealized_pl_cad",
+                "net_pl_cad",
+                "open_market_value_cad",
+                "open_cost_basis_cad",
+                "n_open",
+                "n_open_priced",
+                "n_closed",
+            ]:
+                if k in item:
+                    cleaned[k] = item[k]
+            pnl_history.append(cleaned)
+
+    return PortfolioState(cash_cad=cash, positions=positions, last_updated=last_updated, pnl_history=pnl_history)
 
 
 def save_portfolio_state(path: str | Path, state: PortfolioState) -> None:

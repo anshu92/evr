@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from stock_screener.portfolio.state import PortfolioState, Position, save_portfolio_state
+from typing import Any
 
 
 def _utcnow() -> datetime:
@@ -65,6 +66,64 @@ class PortfolioManager:
         p.exit_date = _utcnow()
         p.exit_reason = reason
         return p
+
+    def _compute_pnl_snapshot(self, state: PortfolioState, *, prices_cad: pd.Series) -> dict[str, Any]:
+        realized = 0.0
+        unrealized = 0.0
+        open_mkt_value = 0.0
+        open_cost_basis = 0.0
+        n_open = 0
+        n_open_priced = 0
+        n_closed = 0
+
+        for p in state.positions:
+            if not p.ticker or p.shares <= 0:
+                continue
+            sh = float(p.shares)
+            entry = float(p.entry_price or 0.0)
+
+            if p.status == "OPEN":
+                n_open += 1
+                px = float(prices_cad.get(p.ticker, float("nan")))
+                if pd.isna(px) or px <= 0:
+                    continue
+                n_open_priced += 1
+                open_mkt_value += px * sh
+                open_cost_basis += entry * sh
+                unrealized += (px - entry) * sh
+                continue
+
+            n_closed += 1
+            if p.exit_price is None:
+                continue
+            exit_px = float(p.exit_price)
+            if exit_px <= 0:
+                continue
+            realized += (exit_px - entry) * sh
+
+        return {
+            "realized_pl_cad": float(realized),
+            "unrealized_pl_cad": float(unrealized),
+            "net_pl_cad": float(realized + unrealized),
+            "open_market_value_cad": float(open_mkt_value),
+            "open_cost_basis_cad": float(open_cost_basis),
+            "n_open": int(n_open),
+            "n_open_priced": int(n_open_priced),
+            "n_closed": int(n_closed),
+        }
+
+    def _append_pnl_history(
+        self,
+        state: PortfolioState,
+        *,
+        asof_utc: datetime,
+        snapshot: dict[str, Any],
+        max_points: int = 365,
+    ) -> None:
+        item = {"asof_utc": asof_utc.isoformat(), **snapshot}
+        state.pnl_history.append(item)
+        if len(state.pnl_history) > int(max_points):
+            state.pnl_history = state.pnl_history[-int(max_points) :]
 
     def apply_exits(
         self,
@@ -252,6 +311,12 @@ class PortfolioManager:
                 holdings.loc[t, "entry_price_cad"] = float(p.entry_price)
 
         state.last_updated = now
+        try:
+            pnl = self._compute_pnl_snapshot(state, prices_cad=prices_cad)
+            self._append_pnl_history(state, asof_utc=now, snapshot=pnl)
+        except Exception as e:
+            # P&L tracking should never break the daily run; fall back gracefully.
+            self.logger.warning("Could not compute/append portfolio P&L snapshot: %s", e)
         save_portfolio_state(self.state_path, state)
         return TradePlan(actions=actions, holdings=holdings)
 

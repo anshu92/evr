@@ -23,7 +23,7 @@ class Config:
 
     # Screening + portfolio
     top_n: int = 50
-    portfolio_size: int = 20
+    portfolio_size: int = 5
     weight_cap: float = 0.10
 
     # ML model (optional)
@@ -78,6 +78,11 @@ class Config:
                 return default
             return raw
 
+        # Hard cap: keep the portfolio to <= 5 tickers.
+        # This enforces the strategy constraint even if an env var attempts to override it.
+        ps = _get_int("PORTFOLIO_SIZE", 5) or 5
+        ps = max(1, min(int(ps), 5))
+
         return Config(
             max_us_tickers=_get_int("MAX_US_TICKERS", None),
             max_tsx_tickers=_get_int("MAX_TSX_TICKERS", None),
@@ -87,7 +92,7 @@ class Config:
             min_price_cad=_get_float("MIN_PRICE_CAD", 2.0),
             min_avg_dollar_volume_cad=_get_float("MIN_AVG_DOLLAR_VOLUME_CAD", 250_000.0),
             top_n=_get_int("TOP_N", 50) or 50,
-            portfolio_size=_get_int("PORTFOLIO_SIZE", 20) or 20,
+            portfolio_size=ps,
             weight_cap=_get_float("WEIGHT_CAP", 0.10),
             use_ml=os.getenv("USE_ML", "0").strip() in {"1", "true", "True"},
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
