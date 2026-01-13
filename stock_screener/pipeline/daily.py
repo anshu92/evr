@@ -17,7 +17,7 @@ from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json
 from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble
 from stock_screener.portfolio.manager import PortfolioManager
-from stock_screener.portfolio.state import load_portfolio_state
+from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
 
 
 def run_daily(cfg: Config, logger) -> None:
@@ -108,6 +108,29 @@ def run_daily(cfg: Config, logger) -> None:
     pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
     score = screened["score"].astype(float) if "score" in screened.columns else None
     state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+    # Migration safeguard:
+    # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,
+    # without debiting cash on buys. If we now run with a small configured budget (e.g., 500 CAD), the cached
+    # state would show misleading "cash" and P&L. Detect this legacy pattern and reset once so accounting is sane.
+    try:
+        budget = float(cfg.portfolio_budget_cad)
+        open_positions = [p for p in state.positions if p.status == "OPEN"]
+        legacy_placeholder = bool(open_positions) and all(int(p.shares) == 1 for p in open_positions)
+        if budget > 0 and legacy_placeholder and float(state.cash_cad) >= budget * 25.0:
+            logger.warning(
+                "Portfolio state appears legacy (cash_cad=%s, budget_cad=%s, open_positions=%s). "
+                "Resetting state to configured budget and rebuilding sized positions.",
+                state.cash_cad,
+                budget,
+                len(open_positions),
+            )
+            state.cash_cad = float(budget)
+            state.positions = []
+            state.pnl_history = []
+            state.last_updated = datetime.now(tz=timezone.utc)
+            save_portfolio_state(cfg.portfolio_state_path, state)
+    except Exception as e:
+        logger.warning("Could not evaluate/reset legacy portfolio state: %s", e)
     pm = PortfolioManager(
         state_path=cfg.portfolio_state_path,
         max_holding_days=cfg.max_holding_days,
