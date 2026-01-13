@@ -67,6 +67,19 @@ class PortfolioManager:
         p.exit_reason = reason
         return p
 
+    def _sell_position(self, state: PortfolioState, p: Position, *, price_cad: float, reason: str, days_held: int | None) -> TradeAction:
+        self._close_position(p, price_cad=price_cad, reason=reason)
+        proceeds = float(price_cad) * float(p.shares)
+        state.cash_cad = float(state.cash_cad) + float(proceeds)
+        return TradeAction(
+            ticker=p.ticker,
+            action="SELL",
+            reason=reason,
+            shares=p.shares,
+            price_cad=float(price_cad),
+            days_held=days_held,
+        )
+
     def _compute_pnl_snapshot(self, state: PortfolioState, *, prices_cad: pd.Series) -> dict[str, Any]:
         realized = 0.0
         unrealized = 0.0
@@ -107,6 +120,8 @@ class PortfolioManager:
             "net_pl_cad": float(realized + unrealized),
             "open_market_value_cad": float(open_mkt_value),
             "open_cost_basis_cad": float(open_cost_basis),
+            "cash_cad": float(state.cash_cad),
+            "equity_cad": float(state.cash_cad) + float(open_mkt_value),
             "n_open": int(n_open),
             "n_open_priced": int(n_open_priced),
             "n_closed": int(n_closed),
@@ -150,17 +165,7 @@ class PortfolioManager:
             # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
             if days >= self.max_holding_days:
                 if days >= self.max_holding_days_hard:
-                    self._close_position(p, price_cad=px, reason="TIME_EXIT_HARD")
-                    actions.append(
-                        TradeAction(
-                            ticker=p.ticker,
-                            action="SELL",
-                            reason="TIME_EXIT_HARD",
-                            shares=p.shares,
-                            price_cad=px,
-                            days_held=days,
-                        )
-                    )
+                    actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT_HARD", days_held=days))
                     continue
 
                 strong = False
@@ -190,17 +195,7 @@ class PortfolioManager:
                     )
                     continue
 
-                self._close_position(p, price_cad=px, reason="TIME_EXIT")
-                actions.append(
-                    TradeAction(
-                        ticker=p.ticker,
-                        action="SELL",
-                        reason="TIME_EXIT",
-                        shares=p.shares,
-                        price_cad=px,
-                        days_held=days,
-                    )
-                )
+                actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT", days_held=days))
                 continue
 
             # Optional stop/target exits.
@@ -210,17 +205,11 @@ class PortfolioManager:
                 ret = 0.0
 
             if self.stop_loss_pct is not None and ret <= -abs(float(self.stop_loss_pct)):
-                self._close_position(p, price_cad=px, reason="STOP_LOSS")
-                actions.append(
-                    TradeAction(ticker=p.ticker, action="SELL", reason="STOP_LOSS", shares=p.shares, price_cad=px, days_held=days)
-                )
+                actions.append(self._sell_position(state, p, price_cad=px, reason="STOP_LOSS", days_held=days))
                 continue
 
             if self.take_profit_pct is not None and ret >= abs(float(self.take_profit_pct)):
-                self._close_position(p, price_cad=px, reason="TAKE_PROFIT")
-                actions.append(
-                    TradeAction(ticker=p.ticker, action="SELL", reason="TAKE_PROFIT", shares=p.shares, price_cad=px, days_held=days)
-                )
+                actions.append(self._sell_position(state, p, price_cad=px, reason="TAKE_PROFIT", days_held=days))
                 continue
 
             keep.append(p)
@@ -255,8 +244,7 @@ class PortfolioManager:
                 if pd.isna(px) or px <= 0:
                     continue
                 days = p.days_held(now)
-                self._close_position(p, price_cad=px, reason="ROTATION")
-                actions.append(TradeAction(ticker=t, action="SELL", reason="ROTATION", shares=p.shares, price_cad=px, days_held=days))
+                actions.append(self._sell_position(state, p, price_cad=px, reason="ROTATION", days_held=days))
                 open_tickers.discard(t)
 
         # Update state positions after rotation sells.
@@ -267,6 +255,17 @@ class PortfolioManager:
         open_tickers = set(open_by_ticker.keys())
 
         # BUY missing target tickers up to max_positions
+        # Size positions using current portfolio equity (cash + market value of open positions) and target weights.
+        open_mkt_value = 0.0
+        for p in state.positions:
+            if p.status != "OPEN" or not p.ticker or p.shares <= 0:
+                continue
+            px = float(prices_cad.get(p.ticker, float("nan")))
+            if pd.isna(px) or px <= 0:
+                continue
+            open_mkt_value += float(px) * float(p.shares)
+        equity_cad = float(state.cash_cad) + float(open_mkt_value)
+
         slots = max(self.max_positions - len(open_tickers), 0)
         if slots > 0:
             for t in target_tickers:
@@ -277,18 +276,35 @@ class PortfolioManager:
                 px = float(prices_cad.get(t, float("nan")))
                 if pd.isna(px) or px <= 0:
                     continue
-                # Shares are a placeholder for now; we treat weights as the executable sizing instruction.
-                # Keep shares=1 to avoid implying a specific capital sizing scheme.
+                if float(state.cash_cad) < float(px):
+                    continue
+
+                w = 0.0
+                try:
+                    w = float(weights.loc[t, "weight"]) if "weight" in weights.columns else 0.0
+                except Exception:
+                    w = 0.0
+
+                target_value = float(equity_cad) * float(w) if w > 0 else float(state.cash_cad) / max(slots, 1)
+                target_shares = int(max(0.0, target_value) // float(px))
+                affordable_shares = int(float(state.cash_cad) // float(px))
+                shares = min(affordable_shares, max(1, target_shares))
+                if shares <= 0:
+                    continue
+                cost = float(px) * float(shares)
+                state.cash_cad = float(state.cash_cad) - float(cost)
                 pos = Position(
                     ticker=t,
                     entry_price=px,
                     entry_date=now,
-                    shares=1,
+                    shares=int(shares),
                     stop_loss_pct=self.stop_loss_pct,
                     take_profit_pct=self.take_profit_pct,
                 )
                 state.positions.append(pos)
-                actions.append(TradeAction(ticker=t, action="BUY", reason="TOP_RANKED", shares=1, price_cad=px, days_held=0))
+                actions.append(
+                    TradeAction(ticker=t, action="BUY", reason="TOP_RANKED", shares=int(shares), price_cad=px, days_held=0)
+                )
                 open_tickers.add(t)
                 slots -= 1
 

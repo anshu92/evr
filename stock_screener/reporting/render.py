@@ -36,7 +36,9 @@ def render_reports(
     weights: pd.DataFrame,
     trade_actions: list[Any] | None,
     logger,
+    *,
     portfolio_pnl_history: list[dict[str, Any]] | None = None,
+    fx_usdcad_rate: float | None = None,
 ) -> None:
     """Write daily email HTML + text report + weights CSV to reports_dir."""
 
@@ -113,11 +115,17 @@ def render_reports(
     lines.append("PORTFOLIO WEIGHTS (inverse-vol, capped)")
     lines.append("-" * 78)
     weights_view = weights.copy()
+    fx_rate = _to_float(fx_usdcad_rate)
+    if fx_rate is not None and fx_rate > 0 and "last_close_cad" in weights_view.columns:
+        weights_view["last_close_usd"] = pd.to_numeric(weights_view["last_close_cad"], errors="coerce") / float(fx_rate)
+    else:
+        weights_view["last_close_usd"] = pd.NA
     weights_view["weight"] = weights_view["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_view["last_close_cad"] = weights_view["last_close_cad"].map(_fmt_money)
+    weights_view["last_close_usd"] = weights_view["last_close_usd"].map(_fmt_money)
     weights_view["ret_60d"] = weights_view["ret_60d"].map(_fmt_pct)
     weights_view["vol_60d_ann"] = weights_view["vol_60d_ann"].map(_fmt_pct)
-    weights_cols = ["weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann", "avg_dollar_volume_cad"]
+    weights_cols = ["weight", "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann", "avg_dollar_volume_cad"]
     lines.extend(weights_view[weights_cols].to_string().splitlines())
     lines.append("")
 
@@ -145,6 +153,8 @@ def render_reports(
         realized = _to_float(latest.get("realized_pl_cad"))
         unrealized = _to_float(latest.get("unrealized_pl_cad"))
         mv = _to_float(latest.get("open_market_value_cad"))
+        cash = _to_float(latest.get("cash_cad"))
+        equity = _to_float(latest.get("equity_cad"))
 
         delta_1d = None
         if prev is not None:
@@ -153,6 +163,12 @@ def render_reports(
                 delta_1d = net - prev_net
 
         parts: list[str] = []
+        if equity is not None:
+            parts.append(f"Equity: {_fmt_money(equity)}")
+            if fx_rate is not None and fx_rate > 0:
+                parts.append(f"Equity USD: {_fmt_money(equity / fx_rate)}")
+        if cash is not None:
+            parts.append(f"Cash: {_fmt_money(cash)}")
         if net is not None:
             parts.append(f"Net: {_fmt_money(net)}")
         if delta_1d is not None:
@@ -203,11 +219,20 @@ def render_reports(
         )
 
     weights_table = weights.reset_index()[["ticker", "weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]].copy()
+    fx_rate = _to_float(fx_usdcad_rate)
+    if fx_rate is not None and fx_rate > 0:
+        weights_table["last_close_usd"] = pd.to_numeric(weights_table["last_close_cad"], errors="coerce") / float(fx_rate)
+    else:
+        weights_table["last_close_usd"] = pd.NA
     weights_table["weight"] = weights_table["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_table["last_close_cad"] = weights_table["last_close_cad"].map(_fmt_money)
+    weights_table["last_close_usd"] = weights_table["last_close_usd"].map(_fmt_money)
     weights_table["ret_60d"] = weights_table["ret_60d"].map(_fmt_pct)
     weights_table["vol_60d_ann"] = weights_table["vol_60d_ann"].map(_fmt_pct)
     weights_table["score"] = weights_table["score"].map(_fmt_num)
+    weights_table = weights_table[
+        ["ticker", "weight", "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann"]
+    ].copy()
 
     rows_html = "\n".join(
         "<tr>"
@@ -236,6 +261,8 @@ def render_reports(
         realized = _to_float(latest.get("realized_pl_cad"))
         unrealized = _to_float(latest.get("unrealized_pl_cad"))
         mv = _to_float(latest.get("open_market_value_cad"))
+        cash = _to_float(latest.get("cash_cad"))
+        equity = _to_float(latest.get("equity_cad"))
         delta_1d = None
         if prev is not None:
             prev_net = _to_float(prev.get("net_pl_cad"))
@@ -243,6 +270,13 @@ def render_reports(
                 delta_1d = net - prev_net
 
         summary_parts: list[str] = []
+        if equity is not None:
+            summary_parts.append(f"Equity: {_fmt_money(equity)}")
+            fx_rate = _to_float(fx_usdcad_rate)
+            if fx_rate is not None and fx_rate > 0:
+                summary_parts.append(f"Equity USD: {_fmt_money(equity / fx_rate)}")
+        if cash is not None:
+            summary_parts.append(f"Cash: {_fmt_money(cash)}")
         if net is not None:
             summary_parts.append(f"Net: {_fmt_money(net)}")
         if delta_1d is not None:
@@ -318,6 +352,7 @@ def render_reports(
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Weight</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Score</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Price (CAD)</th>
+        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Price (USD)</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Ret 60d</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Vol 60d (ann)</th>
       </tr>

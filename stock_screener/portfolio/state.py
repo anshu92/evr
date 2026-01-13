@@ -44,7 +44,7 @@ class PortfolioState:
     pnl_history: list[dict[str, Any]] = field(default_factory=list)
 
 
-def load_portfolio_state(path: str | Path, initial_cash_cad: float = 100_000.0) -> PortfolioState:
+def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> PortfolioState:
     """Load portfolio state or create a new one."""
     p = Path(path)
     if not p.exists():
@@ -91,6 +91,8 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 100_000.0) 
                 "net_pl_cad",
                 "open_market_value_cad",
                 "open_cost_basis_cad",
+                "cash_cad",
+                "equity_cad",
                 "n_open",
                 "n_open_priced",
                 "n_closed",

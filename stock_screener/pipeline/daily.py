@@ -107,7 +107,7 @@ def run_daily(cfg: Config, logger) -> None:
     prices_cad = features["last_close_cad"].astype(float)
     pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
     score = screened["score"].astype(float) if "score" in screened.columns else None
-    state = load_portfolio_state(cfg.portfolio_state_path)
+    state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
     pm = PortfolioManager(
         state_path=cfg.portfolio_state_path,
         max_holding_days=cfg.max_holding_days,
@@ -147,8 +147,9 @@ def run_daily(cfg: Config, logger) -> None:
         screened=screened,
         weights=holdings_weights,
         trade_actions=trade_plan.actions,
-        portfolio_pnl_history=state.pnl_history,
         logger=logger,
+        portfolio_pnl_history=state.pnl_history,
+        fx_usdcad_rate=float(fx.dropna().iloc[-1]) if fx is not None and not fx.dropna().empty else None,
     )
 
     # Persist metadata for debugging/auditing

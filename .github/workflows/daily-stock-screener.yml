@@ -77,6 +77,7 @@ jobs:
           MAX_TICKERS: "4000"
           TOP_N: "50"
           PORTFOLIO_SIZE: "5"
+          PORTFOLIO_BUDGET_CAD: "500"
           WEIGHT_CAP: "0.10"
           MIN_PRICE_CAD: "2.0"
           MIN_AVG_DOLLAR_VOLUME_CAD: "250000"
