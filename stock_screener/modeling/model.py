@@ -78,6 +78,16 @@ def predict(model, features: pd.DataFrame) -> pd.Series:
     return pd.Series(preds, index=features.index, name="pred_return")
 
 
+def predict_score(model, features: pd.DataFrame) -> pd.Series:
+    _require_xgb()
+    x = _coerce_features(features)
+    if isinstance(model, xgb.Booster):
+        preds = model.predict(xgb.DMatrix(x))
+    else:
+        preds = model.predict(x)
+    return pd.Series(preds, index=features.index, name="pred_score")
+
+
 def predict_ensemble(models: list, weights: list[float] | None, features: pd.DataFrame) -> pd.Series:
     _require_xgb()
     if not models:
