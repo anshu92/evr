@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from stock_screener.config import Config
 from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.prices import download_price_history
@@ -162,6 +164,10 @@ def run_daily(cfg: Config, logger) -> None:
         weight_cap=cfg.weight_cap,
         logger=logger,
     )
+    # Attach current holdings sizing for reporting (shares + position value).
+    shares_by_ticker = {p.ticker: int(p.shares) for p in state.positions if p.status == "OPEN"}
+    holdings_weights = holdings_weights.copy()
+    holdings_weights["shares"] = [shares_by_ticker.get(str(t), pd.NA) for t in holdings_weights.index.astype(str)]
 
     render_reports(
         reports_dir=Path(cfg.reports_dir),

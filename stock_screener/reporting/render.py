@@ -120,12 +120,39 @@ def render_reports(
         weights_view["last_close_usd"] = pd.to_numeric(weights_view["last_close_cad"], errors="coerce") / float(fx_rate)
     else:
         weights_view["last_close_usd"] = pd.NA
+    if "shares" in weights_view.columns and "last_close_cad" in weights_view.columns:
+        weights_view["position_value_cad"] = pd.to_numeric(weights_view["last_close_cad"], errors="coerce") * pd.to_numeric(
+            weights_view["shares"], errors="coerce"
+        )
+    else:
+        weights_view["position_value_cad"] = pd.NA
+    if fx_rate is not None and fx_rate > 0:
+        weights_view["position_value_usd"] = pd.to_numeric(weights_view["position_value_cad"], errors="coerce") / float(fx_rate)
+    else:
+        weights_view["position_value_usd"] = pd.NA
     weights_view["weight"] = weights_view["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_view["last_close_cad"] = weights_view["last_close_cad"].map(_fmt_money)
     weights_view["last_close_usd"] = weights_view["last_close_usd"].map(_fmt_money)
+    if "shares" in weights_view.columns:
+        weights_view["shares"] = weights_view["shares"].map(lambda x: str(int(x)) if _to_float(x) is not None else "N/A")
+    else:
+        weights_view["shares"] = pd.NA
+    weights_view["position_value_cad"] = weights_view["position_value_cad"].map(_fmt_money)
+    weights_view["position_value_usd"] = weights_view["position_value_usd"].map(_fmt_money)
     weights_view["ret_60d"] = weights_view["ret_60d"].map(_fmt_pct)
     weights_view["vol_60d_ann"] = weights_view["vol_60d_ann"].map(_fmt_pct)
-    weights_cols = ["weight", "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann", "avg_dollar_volume_cad"]
+    weights_cols = [
+        "weight",
+        "shares",
+        "position_value_cad",
+        "position_value_usd",
+        "score",
+        "last_close_cad",
+        "last_close_usd",
+        "ret_60d",
+        "vol_60d_ann",
+        "avg_dollar_volume_cad",
+    ]
     lines.extend(weights_view[weights_cols].to_string().splitlines())
     lines.append("")
 
@@ -224,14 +251,41 @@ def render_reports(
         weights_table["last_close_usd"] = pd.to_numeric(weights_table["last_close_cad"], errors="coerce") / float(fx_rate)
     else:
         weights_table["last_close_usd"] = pd.NA
+    if "shares" in weights.columns:
+        shares = weights["shares"].copy()
+        shares.index = weights.index.astype(str)
+        weights_table["shares"] = weights_table["ticker"].astype(str).map(shares)
+    else:
+        weights_table["shares"] = pd.NA
+    weights_table["position_value_cad"] = pd.to_numeric(weights_table["last_close_cad"], errors="coerce") * pd.to_numeric(
+        weights_table["shares"], errors="coerce"
+    )
+    if fx_rate is not None and fx_rate > 0:
+        weights_table["position_value_usd"] = pd.to_numeric(weights_table["position_value_cad"], errors="coerce") / float(fx_rate)
+    else:
+        weights_table["position_value_usd"] = pd.NA
     weights_table["weight"] = weights_table["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_table["last_close_cad"] = weights_table["last_close_cad"].map(_fmt_money)
     weights_table["last_close_usd"] = weights_table["last_close_usd"].map(_fmt_money)
+    weights_table["shares"] = weights_table["shares"].map(lambda x: str(int(x)) if _to_float(x) is not None else "N/A")
+    weights_table["position_value_cad"] = weights_table["position_value_cad"].map(_fmt_money)
+    weights_table["position_value_usd"] = weights_table["position_value_usd"].map(_fmt_money)
     weights_table["ret_60d"] = weights_table["ret_60d"].map(_fmt_pct)
     weights_table["vol_60d_ann"] = weights_table["vol_60d_ann"].map(_fmt_pct)
     weights_table["score"] = weights_table["score"].map(_fmt_num)
     weights_table = weights_table[
-        ["ticker", "weight", "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann"]
+        [
+            "ticker",
+            "weight",
+            "shares",
+            "position_value_cad",
+            "position_value_usd",
+            "score",
+            "last_close_cad",
+            "last_close_usd",
+            "ret_60d",
+            "vol_60d_ann",
+        ]
     ].copy()
 
     rows_html = "\n".join(
@@ -350,6 +404,9 @@ def render_reports(
       <tr>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Ticker</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Weight</th>
+        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Shares</th>
+        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Value (CAD)</th>
+        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Value (USD)</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Score</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Price (CAD)</th>
         <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Price (USD)</th>
