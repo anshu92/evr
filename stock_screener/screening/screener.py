@@ -38,7 +38,9 @@ def screen_universe(
     # Score:
     # - If ML predictions are available, blend them in as the primary alpha term.
     # - Otherwise use a robust baseline factor score.
-    has_ml = "pred_return" in df.columns and pd.to_numeric(df["pred_return"], errors="coerce").notna().any()
+    has_score = "pred_score" in df.columns and pd.to_numeric(df["pred_score"], errors="coerce").notna().any()
+    has_return = "pred_return" in df.columns and pd.to_numeric(df["pred_return"], errors="coerce").notna().any()
+    has_ml = has_score or has_return
 
     baseline = (
         0.60 * _zscore(df["ret_60d"])
@@ -49,7 +51,8 @@ def screen_universe(
     )
 
     if has_ml:
-        ml = _zscore(pd.to_numeric(df["pred_return"], errors="coerce"))
+        ml_signal = df["pred_score"] if has_score else df["pred_return"]
+        ml = _zscore(pd.to_numeric(ml_signal, errors="coerce"))
         score = 0.70 * ml + 0.30 * baseline
         logger.info("Scoring uses ML blend (70%% ML / 30%% baseline).")
     else:

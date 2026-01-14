@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from stock_screener.config import Config
+from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.technical import compute_features
@@ -17,7 +18,7 @@ from stock_screener.screening.screener import screen_universe
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json
-from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble
+from stock_screener.modeling.model import load_bundle, load_model, predict, predict_ensemble, predict_score
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
 
@@ -66,22 +67,29 @@ def run_daily(cfg: Config, logger) -> None:
         logger=logger,
     )
 
+    fundamentals = fetch_fundamentals(tickers=universe.tickers, cache_dir=data_cache_dir, logger=logger)
     features = compute_features(
         prices=prices,
         fx_usdcad=fx,
         liquidity_lookback_days=cfg.liquidity_lookback_days,
         feature_lookback_days=cfg.feature_lookback_days,
         logger=logger,
+        fundamentals=fundamentals,
     )
 
-    model = None
     if cfg.use_ml:
         try:
             mp = Path(cfg.model_path)
             if mp.name.lower() == "manifest.json":
-                models, weights = load_ensemble(mp)
-                logger.info("Loaded ML ensemble from %s (%s members)", cfg.model_path, len(models))
-                features["pred_return"] = predict_ensemble(models, weights, features)
+                bundle = load_bundle(mp)
+                if bundle.get("ranker") is not None:
+                    features["pred_score"] = predict_score(bundle["ranker"], features)
+                    logger.info("Loaded ML ranker from %s", cfg.model_path)
+                reg_models = bundle.get("regressor_models") or []
+                reg_weights = bundle.get("regressor_weights")
+                if reg_models:
+                    features["pred_return"] = predict_ensemble(reg_models, reg_weights, features)
+                    logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(reg_models))
             else:
                 model = load_model(cfg.model_path)
                 logger.info("Loaded ML model from %s", cfg.model_path)
