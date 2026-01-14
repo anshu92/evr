@@ -87,6 +87,26 @@ def render_reports(
         except Exception:
             return None
 
+    def _fmt_ic_summary(summary: dict[str, Any] | None) -> str:
+        if not summary:
+            return "N/A"
+        mean_ic = _fmt_num(summary.get("mean_ic"))
+        std_ic = _fmt_num(summary.get("std_ic"))
+        ic_ir = _fmt_num(summary.get("ic_ir"))
+        n_days = summary.get("n_days", "N/A")
+        return f"mean_ic={mean_ic} std_ic={std_ic} ic_ir={ic_ir} n_days={n_days}"
+
+    model_meta = run_meta.get("model", {})
+    model_metrics = model_meta.get("metadata") if isinstance(model_meta, dict) else None
+    if model_metrics:
+        lines.append("MODEL VALIDATION (Holdout IC)")
+        lines.append("-" * 78)
+        ranker_summary = model_metrics.get("ranker", {}).get("holdout")
+        reg_summary = model_metrics.get("regressor", {}).get("holdout")
+        lines.append(f"Ranker:    {_fmt_ic_summary(ranker_summary)}")
+        lines.append(f"Regressor: {_fmt_ic_summary(reg_summary)}")
+        lines.append("")
+
     def _top_table(df: pd.DataFrame, n: int) -> list[str]:
         cols = [
             "score",
@@ -224,6 +244,43 @@ def render_reports(
                 f"unrealized={_fmt_money(item_unreal) if item_unreal is not None else 'N/A'}"
             )
         lines.append("")
+
+    model_block = ""
+    if model_metrics:
+        ranker_summary = model_metrics.get("ranker", {}).get("holdout") or {}
+        reg_summary = model_metrics.get("regressor", {}).get("holdout") or {}
+        model_block = f"""
+  <div style="background:#ecfeff;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
+    <div style="font-weight:600;margin-bottom:6px;">Model Validation (Holdout IC)</div>
+    <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
+      <thead>
+        <tr>
+          <th style="text-align:left;padding:4px 6px;border-bottom:1px solid #0ea5e9;">Model</th>
+          <th style="text-align:left;padding:4px 6px;border-bottom:1px solid #0ea5e9;">Mean IC</th>
+          <th style="text-align:left;padding:4px 6px;border-bottom:1px solid #0ea5e9;">Std IC</th>
+          <th style="text-align:left;padding:4px 6px;border-bottom:1px solid #0ea5e9;">IC IR</th>
+          <th style="text-align:left;padding:4px 6px;border-bottom:1px solid #0ea5e9;">N Days</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td style="padding:4px 6px;">Ranker</td>
+          <td style="padding:4px 6px;">{_fmt_num(ranker_summary.get("mean_ic"))}</td>
+          <td style="padding:4px 6px;">{_fmt_num(ranker_summary.get("std_ic"))}</td>
+          <td style="padding:4px 6px;">{_fmt_num(ranker_summary.get("ic_ir"))}</td>
+          <td style="padding:4px 6px;">{ranker_summary.get("n_days", "N/A")}</td>
+        </tr>
+        <tr>
+          <td style="padding:4px 6px;">Regressor</td>
+          <td style="padding:4px 6px;">{_fmt_num(reg_summary.get("mean_ic"))}</td>
+          <td style="padding:4px 6px;">{_fmt_num(reg_summary.get("std_ic"))}</td>
+          <td style="padding:4px 6px;">{_fmt_num(reg_summary.get("ic_ir"))}</td>
+          <td style="padding:4px 6px;">{reg_summary.get("n_days", "N/A")}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+"""
 
     lines.append("FILES")
     lines.append("-" * 78)
@@ -395,6 +452,8 @@ def render_reports(
     <div><strong>Screened:</strong> {len(screened):,} tickers</div>
     <div><strong>Portfolio:</strong> {len(weights):,} tickers (inverse-vol weights)</div>
   </div>
+
+  {model_block}
 
   {pnl_block}
 

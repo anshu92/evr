@@ -17,7 +17,7 @@ from stock_screener.reporting.render import render_reports
 from stock_screener.screening.screener import screen_universe
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
-from stock_screener.utils import Universe, ensure_dir, write_json
+from stock_screener.utils import Universe, ensure_dir, read_json, write_json
 from stock_screener.modeling.model import load_bundle, load_model, predict, predict_ensemble, predict_score
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
@@ -90,6 +90,17 @@ def run_daily(cfg: Config, logger) -> None:
                 if reg_models:
                     features["pred_return"] = predict_ensemble(reg_models, reg_weights, features)
                     logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(reg_models))
+                metadata_rel = bundle.get("metadata")
+                if metadata_rel:
+                    metadata_path = mp.parent / str(metadata_rel)
+                    if metadata_path.is_file():
+                        run_meta["model"] = {
+                            "manifest_path": str(mp),
+                            "metadata_path": str(metadata_path),
+                            "metadata": read_json(metadata_path),
+                        }
+                    else:
+                        run_meta["model"] = {"manifest_path": str(mp), "metadata_path": str(metadata_path)}
             else:
                 model = load_model(cfg.model_path)
                 logger.info("Loaded ML model from %s", cfg.model_path)
