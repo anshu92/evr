@@ -37,6 +37,24 @@ def _hash_to_float(val: str | None) -> float:
     return float(int(h[:10], 16) % 1_000_000) / 1_000_000.0
 
 
+
+def _make_ranker_labels(df: pd.DataFrame, *, bins: int = 5) -> pd.Series:
+    """Convert continuous returns into integer relevance labels per date."""
+
+    if df.empty:
+        return pd.Series(dtype=int)
+
+    def _bin_group(group: pd.DataFrame) -> pd.Series:
+        if len(group) <= 1:
+            return pd.Series([0] * len(group), index=group.index, dtype=int)
+        ranks = group["future_ret"].rank(pct=True, method="average")
+        labels = (ranks * bins).fillna(0).astype(float)
+        labels = labels.clip(lower=0, upper=bins - 1).astype(int)
+        return pd.Series(labels, index=group.index, dtype=int)
+
+    return df.groupby("date", group_keys=False).apply(_bin_group)
+
+
 def _build_panel_features(
     prices: pd.DataFrame,
     fx_usdcad: pd.Series,
@@ -232,11 +250,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             model.set_params(**params, early_stopping_rounds=50)
             train_groups = train_df.groupby("date").size().to_numpy()
             val_groups = val_df.groupby("date").size().to_numpy()
+            train_labels = _make_ranker_labels(train_df)
+            val_labels = _make_ranker_labels(val_df)
             model.fit(
                 train_df[FEATURE_COLUMNS],
-                train_df["future_ret"].astype(float),
+                train_labels,
                 group=train_groups,
-                eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
+                eval_set=[(val_df[FEATURE_COLUMNS], val_labels)],
                 eval_group=[val_groups],
                 verbose=False,
             )
@@ -279,16 +299,19 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     ranker_groups = train_df.groupby("date").size().to_numpy()
     if not val_df.empty:
         val_groups = val_df.groupby("date").size().to_numpy()
+        train_labels = _make_ranker_labels(train_df)
+        val_labels = _make_ranker_labels(val_df)
         ranker.fit(
             train_df[FEATURE_COLUMNS],
-            train_df["future_ret"].astype(float),
+            train_labels,
             group=ranker_groups,
-            eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
+            eval_set=[(val_df[FEATURE_COLUMNS], val_labels)],
             eval_group=[val_groups],
             verbose=False,
         )
     else:
-        ranker.fit(train_df[FEATURE_COLUMNS], train_df["future_ret"].astype(float), group=ranker_groups)
+        train_labels = _make_ranker_labels(train_df)
+        ranker.fit(train_df[FEATURE_COLUMNS], train_labels, group=ranker_groups)
 
     ranker_holdout_preds = ranker.predict(holdout_df[FEATURE_COLUMNS]) if not holdout_df.empty else []
     ranker_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(ranker_holdout_preds, index=holdout_df.index))
