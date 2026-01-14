@@ -86,6 +86,14 @@ jobs:
 
       - name: Download latest trained model
         if: steps.model_artifact.outputs.artifact_id != ''
+        run: |
+          echo "Found latest model artifact: ${{ steps.model_artifact.outputs.artifact_name }} from run ${{ steps.model_artifact.outputs.run_id }}"
+          echo "Clearing cached model to use latest..."
+          rm -rf models/ensemble/
+          mkdir -p models/ensemble/
+
+      - name: Download artifact
+        if: steps.model_artifact.outputs.artifact_id != ''
         uses: actions/download-artifact@v4
         with:
           artifact-id: ${{ steps.model_artifact.outputs.artifact_id }}
