@@ -57,6 +57,25 @@ def build_model(random_state: int = 42):
     )
 
 
+def build_ranker(random_state: int = 42):
+    """Build a baseline learning-to-rank model for cross-sectional ordering."""
+
+    _require_xgb()
+    return xgb.XGBRanker(
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        min_child_weight=5,
+        objective="rank:pairwise",
+        eval_metric="ndcg",
+        n_jobs=0,
+        random_state=random_state,
+    )
+
+
 def _coerce_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     for c in FEATURE_COLUMNS:
