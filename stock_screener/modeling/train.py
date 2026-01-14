@@ -229,7 +229,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if train_df.empty or val_df.empty:
                 continue
             model = build_ranker(random_state=42)
-            model.set_params(**params)
+            model.set_params(**params, early_stopping_rounds=50)
             train_groups = train_df.groupby("date").size().to_numpy()
             val_groups = val_df.groupby("date").size().to_numpy()
             model.fit(
@@ -238,7 +238,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 group=train_groups,
                 eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
                 eval_group=[val_groups],
-                early_stopping_rounds=50,
                 verbose=False,
             )
             preds = model.predict(val_df[FEATURE_COLUMNS])
@@ -254,12 +253,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if train_df.empty or val_df.empty:
                 continue
             model = build_model(random_state=42)
-            model.set_params(**params)
+            model.set_params(**params, early_stopping_rounds=50)
             model.fit(
                 train_df[FEATURE_COLUMNS],
                 train_df["future_ret"].astype(float),
                 eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
-                early_stopping_rounds=50,
                 verbose=False,
             )
             preds = model.predict(val_df[FEATURE_COLUMNS])
@@ -277,7 +275,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     holdout_df = _subset_by_dates(holdout.holdout_dates)
 
     ranker = build_ranker(random_state=42)
-    ranker.set_params(**best_ranker_params)
+    ranker.set_params(**best_ranker_params, early_stopping_rounds=50)
     ranker_groups = train_df.groupby("date").size().to_numpy()
     if not val_df.empty:
         val_groups = val_df.groupby("date").size().to_numpy()
@@ -287,7 +285,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             group=ranker_groups,
             eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
             eval_group=[val_groups],
-            early_stopping_rounds=50,
             verbose=False,
         )
     else:
@@ -309,13 +306,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     )
     for s in seeds:
         m = build_model(random_state=s)
-        m.set_params(**best_regressor_params)
+        m.set_params(**best_regressor_params, early_stopping_rounds=50)
         if not val_df.empty:
             m.fit(
                 train_df[FEATURE_COLUMNS],
                 train_df["future_ret"].astype(float),
                 eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
-                early_stopping_rounds=50,
                 verbose=False,
             )
         else:
