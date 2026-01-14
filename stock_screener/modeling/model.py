@@ -118,6 +118,25 @@ def save_ensemble(manifest_path: str | Path, model_rel_paths: list[str], weights
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def save_bundle(
+    manifest_path: str | Path,
+    *,
+    ranker_rel_path: str | None,
+    regressor_rel_paths: list[str],
+    regressor_weights: list[float] | None = None,
+    metadata_rel_path: str | None = None,
+) -> None:
+    p = Path(manifest_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "type": "xgboost_dual_v1",
+        "ranker": ranker_rel_path,
+        "regressor": {"models": regressor_rel_paths, "weights": regressor_weights},
+        "metadata": metadata_rel_path,
+    }
+    p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def load_model(path: str | Path):
     # Security: Avoid pickle/joblib. XGBoost JSON is safe to load.
     _require_xgb()
@@ -139,3 +158,34 @@ def load_ensemble(manifest_path: str | Path) -> tuple[list, list[float] | None]:
     return models, weights
 
 
+
+
+def load_bundle(manifest_path: str | Path) -> dict[str, object]:
+    _require_xgb()
+    mp = Path(manifest_path)
+    manifest = json.loads(mp.read_text(encoding="utf-8"))
+    base = mp.parent
+    mtype = manifest.get("type")
+
+    if mtype == "xgboost_ensemble_v1":
+        models, weights = load_ensemble(mp)
+        return {"type": mtype, "ranker": None, "regressor_models": models, "regressor_weights": weights, "metadata": None}
+
+    if mtype != "xgboost_dual_v1":
+        raise ValueError("Unsupported ensemble manifest type")
+
+    ranker_rel = manifest.get("ranker")
+    reg_payload = manifest.get("regressor") or {}
+    reg_models = reg_payload.get("models") or []
+    reg_weights = reg_payload.get("weights")
+    metadata = manifest.get("metadata")
+
+    ranker = load_model(base / ranker_rel) if ranker_rel else None
+    regressor_models = [load_model(base / rel) for rel in reg_models]
+    return {
+        "type": mtype,
+        "ranker": ranker,
+        "regressor_models": regressor_models,
+        "regressor_weights": reg_weights,
+        "metadata": metadata,
+    }
