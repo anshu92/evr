@@ -327,9 +327,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     if reg_rel_paths:
         first_model = build_model()
         first_model.load_model(str(model_dir / reg_rel_paths[0]))
-        importance = first_model.get_score(importance_type="gain")
-        feature_importance = {k: float(v) for k, v in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]}
-        logger.info("Top 10 features by gain: %s", list(feature_importance.keys())[:10])
+        # Use get_booster().get_score() for XGBRegressor
+        try:
+            importance = first_model.get_booster().get_score(importance_type="gain")
+            feature_importance = {k: float(v) for k, v in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]}
+            logger.info("Top 10 features by gain: %s", list(feature_importance.keys())[:10])
+        except Exception as e:
+            logger.warning("Could not extract feature importance: %s", e)
 
     # Compute per-feature IC on holdout
     feature_ic = {}
