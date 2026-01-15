@@ -288,6 +288,30 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
 
 
+
+    # Compute feature importance from first regressor
+    feature_importance = {}
+    if reg_rel_paths:
+        first_model = build_model()
+        first_model.load_model(str(model_dir / reg_rel_paths[0]))
+        importance = first_model.get_score(importance_type="gain")
+        feature_importance = {k: float(v) for k, v in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]}
+        logger.info("Top 10 features by gain: %s", list(feature_importance.keys())[:10])
+
+    # Compute per-feature IC on holdout
+    feature_ic = {}
+    if not holdout_df.empty:
+        for col in FEATURE_COLUMNS:
+            if col in holdout_df.columns and holdout_df[col].notna().sum() > 10:
+                try:
+                    from scipy.stats import spearmanr
+                    ic, _ = spearmanr(holdout_df[col].fillna(0), holdout_df["future_ret"].fillna(0), nan_policy="omit")
+                    feature_ic[col] = float(ic)
+                except Exception:
+                    pass
+        top_features = sorted(feature_ic.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
+        logger.info("Top 10 features by |IC|: %s", [(k, f"{v:.3f}") for k, v in top_features])
+
     metadata = {
         "horizon_days": horizon,
         "feature_columns": FEATURE_COLUMNS,
@@ -367,4 +391,3 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
         metrics["regressor"] = evaluate_predictions(panel.assign(pred=preds), date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx")
 
     return metrics
-
