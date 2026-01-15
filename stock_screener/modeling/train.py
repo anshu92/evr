@@ -231,8 +231,11 @@ def _build_panel_features(
         # Compute composite fundamental features
         def _safe_zscore_panel(series: pd.Series) -> pd.Series:
             """Z-score with NaN handling for panel data."""
-            mu = series.mean()
-            sd = series.std()
+            clean = series.dropna()
+            if len(clean) == 0:
+                return pd.Series(0.0, index=series.index)
+            mu = clean.mean()
+            sd = clean.std()
             if sd == 0 or pd.isna(sd):
                 return pd.Series(0.0, index=series.index)
             return (series - mu) / sd
@@ -242,49 +245,52 @@ def _build_panel_features(
             value_components = []
             if "trailing_pe" in group.columns:
                 inv_pe = 1.0 / group["trailing_pe"].replace([0, np.inf, -np.inf], np.nan)
-                if inv_pe.notna().sum() > 0:
+                if inv_pe.notna().sum() > 1:  # Need at least 2 values
                     value_components.append(_safe_zscore_panel(inv_pe))
             if "price_to_book" in group.columns:
                 inv_pb = 1.0 / group["price_to_book"].replace([0, np.inf, -np.inf], np.nan)
-                if inv_pb.notna().sum() > 0:
+                if inv_pb.notna().sum() > 1:
                     value_components.append(_safe_zscore_panel(inv_pb))
             if "price_to_sales" in group.columns:
                 inv_ps = 1.0 / group["price_to_sales"].replace([0, np.inf, -np.inf], np.nan)
-                if inv_ps.notna().sum() > 0:
+                if inv_ps.notna().sum() > 1:
                     value_components.append(_safe_zscore_panel(inv_ps))
             if value_components:
-                return pd.concat(value_components, axis=1).mean(axis=1)
+                result = pd.concat(value_components, axis=1).mean(axis=1, skipna=True)
+                return result.fillna(0.0)
             return pd.Series(0.0, index=group.index)
         
-        panel["value_score"] = panel.groupby("date").apply(_compute_value_score).reset_index(level=0, drop=True)
+        panel["value_score"] = panel.groupby("date", group_keys=False).apply(_compute_value_score)
         
         # Quality score: profitability and efficiency (per date)
         def _compute_quality_score(group):
             quality_components = []
-            if "return_on_equity" in group.columns:
+            if "return_on_equity" in group.columns and group["return_on_equity"].notna().sum() > 1:
                 quality_components.append(_safe_zscore_panel(group["return_on_equity"]))
-            if "operating_margins" in group.columns:
+            if "operating_margins" in group.columns and group["operating_margins"].notna().sum() > 1:
                 quality_components.append(_safe_zscore_panel(group["operating_margins"]))
-            if "profit_margins" in group.columns:
+            if "profit_margins" in group.columns and group["profit_margins"].notna().sum() > 1:
                 quality_components.append(_safe_zscore_panel(group["profit_margins"]))
             if quality_components:
-                return pd.concat(quality_components, axis=1).mean(axis=1)
+                result = pd.concat(quality_components, axis=1).mean(axis=1, skipna=True)
+                return result.fillna(0.0)
             return pd.Series(0.0, index=group.index)
         
-        panel["quality_score"] = panel.groupby("date").apply(_compute_quality_score).reset_index(level=0, drop=True)
+        panel["quality_score"] = panel.groupby("date", group_keys=False).apply(_compute_quality_score)
         
         # Growth score: revenue and earnings growth (per date)
         def _compute_growth_score(group):
             growth_components = []
-            if "revenue_growth" in group.columns:
+            if "revenue_growth" in group.columns and group["revenue_growth"].notna().sum() > 1:
                 growth_components.append(_safe_zscore_panel(group["revenue_growth"]))
-            if "earnings_growth" in group.columns:
+            if "earnings_growth" in group.columns and group["earnings_growth"].notna().sum() > 1:
                 growth_components.append(_safe_zscore_panel(group["earnings_growth"]))
             if growth_components:
-                return pd.concat(growth_components, axis=1).mean(axis=1)
+                result = pd.concat(growth_components, axis=1).mean(axis=1, skipna=True)
+                return result.fillna(0.0)
             return pd.Series(0.0, index=group.index)
         
-        panel["growth_score"] = panel.groupby("date").apply(_compute_growth_score).reset_index(level=0, drop=True)
+        panel["growth_score"] = panel.groupby("date", group_keys=False).apply(_compute_growth_score)
         
         # Surprise factors: analyst expectations vs current price
         if "target_mean_price" in panel.columns and "last_close_cad" in panel.columns:
