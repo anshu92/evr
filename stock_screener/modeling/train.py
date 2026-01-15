@@ -103,6 +103,29 @@ def _build_panel_features(
         industry_hash = np.nan
         log_market_cap = np.nan
         beta = np.nan
+        # New fundamental fields
+        trailing_pe = np.nan
+        forward_pe = np.nan
+        price_to_book = np.nan
+        price_to_sales = np.nan
+        enterprise_to_revenue = np.nan
+        enterprise_to_ebitda = np.nan
+        profit_margins = np.nan
+        operating_margins = np.nan
+        return_on_equity = np.nan
+        return_on_assets = np.nan
+        revenue_growth = np.nan
+        earnings_growth = np.nan
+        earnings_quarterly_growth = np.nan
+        debt_to_equity = np.nan
+        current_ratio = np.nan
+        quick_ratio = np.nan
+        dividend_yield = np.nan
+        payout_ratio = np.nan
+        target_mean_price = np.nan
+        recommendation_mean = np.nan
+        num_analyst_opinions = np.nan
+        
         if fundamentals is not None and t in fundamentals.index:
             row = fundamentals.loc[t]
             sector_hash = _hash_to_float(str(row.get("sector"))) if row.get("sector") else np.nan
@@ -110,6 +133,28 @@ def _build_panel_features(
             market_cap = row.get("marketCap")
             log_market_cap = float(np.log10(market_cap)) if market_cap and float(market_cap) > 0 else np.nan
             beta = float(row.get("beta")) if row.get("beta") is not None else np.nan
+            # Extract new fundamental data
+            trailing_pe = float(row.get("trailingPE")) if row.get("trailingPE") is not None else np.nan
+            forward_pe = float(row.get("forwardPE")) if row.get("forwardPE") is not None else np.nan
+            price_to_book = float(row.get("priceToBook")) if row.get("priceToBook") is not None else np.nan
+            price_to_sales = float(row.get("priceToSalesTrailing12Months")) if row.get("priceToSalesTrailing12Months") is not None else np.nan
+            enterprise_to_revenue = float(row.get("enterpriseToRevenue")) if row.get("enterpriseToRevenue") is not None else np.nan
+            enterprise_to_ebitda = float(row.get("enterpriseToEbitda")) if row.get("enterpriseToEbitda") is not None else np.nan
+            profit_margins = float(row.get("profitMargins")) if row.get("profitMargins") is not None else np.nan
+            operating_margins = float(row.get("operatingMargins")) if row.get("operatingMargins") is not None else np.nan
+            return_on_equity = float(row.get("returnOnEquity")) if row.get("returnOnEquity") is not None else np.nan
+            return_on_assets = float(row.get("returnOnAssets")) if row.get("returnOnAssets") is not None else np.nan
+            revenue_growth = float(row.get("revenueGrowth")) if row.get("revenueGrowth") is not None else np.nan
+            earnings_growth = float(row.get("earningsGrowth")) if row.get("earningsGrowth") is not None else np.nan
+            earnings_quarterly_growth = float(row.get("earningsQuarterlyGrowth")) if row.get("earningsQuarterlyGrowth") is not None else np.nan
+            debt_to_equity = float(row.get("debtToEquity")) if row.get("debtToEquity") is not None else np.nan
+            current_ratio = float(row.get("currentRatio")) if row.get("currentRatio") is not None else np.nan
+            quick_ratio = float(row.get("quickRatio")) if row.get("quickRatio") is not None else np.nan
+            dividend_yield = float(row.get("dividendYield")) if row.get("dividendYield") is not None else np.nan
+            payout_ratio = float(row.get("payoutRatio")) if row.get("payoutRatio") is not None else np.nan
+            target_mean_price = float(row.get("targetMeanPrice")) if row.get("targetMeanPrice") is not None else np.nan
+            recommendation_mean = float(row.get("recommendationMean")) if row.get("recommendationMean") is not None else np.nan
+            num_analyst_opinions = float(row.get("numberOfAnalystOpinions")) if row.get("numberOfAnalystOpinions") is not None else np.nan
 
         fx_ret_5d_series = 0.0 if is_tsx else fx_ret_5d
         fx_ret_20d_series = 0.0 if is_tsx else fx_ret_20d
@@ -145,6 +190,28 @@ def _build_panel_features(
                 "fx_ret_5d": fx_ret_5d_series.values if hasattr(fx_ret_5d_series, "values") else fx_ret_5d_series,
                 "fx_ret_20d": fx_ret_20d_series.values if hasattr(fx_ret_20d_series, "values") else fx_ret_20d_series,
                 "n_days": n_days.values,
+                # Raw fundamental features
+                "trailing_pe": trailing_pe,
+                "forward_pe": forward_pe,
+                "price_to_book": price_to_book,
+                "price_to_sales": price_to_sales,
+                "enterprise_to_revenue": enterprise_to_revenue,
+                "enterprise_to_ebitda": enterprise_to_ebitda,
+                "profit_margins": profit_margins,
+                "operating_margins": operating_margins,
+                "return_on_equity": return_on_equity,
+                "return_on_assets": return_on_assets,
+                "revenue_growth": revenue_growth,
+                "earnings_growth": earnings_growth,
+                "earnings_quarterly_growth": earnings_quarterly_growth,
+                "debt_to_equity": debt_to_equity,
+                "current_ratio": current_ratio,
+                "quick_ratio": quick_ratio,
+                "dividend_yield": dividend_yield,
+                "payout_ratio": payout_ratio,
+                "target_mean_price": target_mean_price,
+                "recommendation_mean": recommendation_mean,
+                "num_analyst_opinions": num_analyst_opinions,
             }
         )
         frames.append(df)
@@ -160,6 +227,94 @@ def _build_panel_features(
         for col, out_col in rank_map.items():
             if col in panel.columns:
                 panel[out_col] = panel.groupby("date")[col].rank(pct=True)
+        
+        # Compute composite fundamental features
+        def _safe_zscore_panel(series: pd.Series) -> pd.Series:
+            """Z-score with NaN handling for panel data."""
+            mu = series.mean()
+            sd = series.std()
+            if sd == 0 or pd.isna(sd):
+                return pd.Series(0.0, index=series.index)
+            return (series - mu) / sd
+        
+        # Value score: inverse of valuation ratios (per date)
+        def _compute_value_score(group):
+            value_components = []
+            if "trailing_pe" in group.columns:
+                inv_pe = 1.0 / group["trailing_pe"].replace([0, np.inf, -np.inf], np.nan)
+                if inv_pe.notna().sum() > 0:
+                    value_components.append(_safe_zscore_panel(inv_pe))
+            if "price_to_book" in group.columns:
+                inv_pb = 1.0 / group["price_to_book"].replace([0, np.inf, -np.inf], np.nan)
+                if inv_pb.notna().sum() > 0:
+                    value_components.append(_safe_zscore_panel(inv_pb))
+            if "price_to_sales" in group.columns:
+                inv_ps = 1.0 / group["price_to_sales"].replace([0, np.inf, -np.inf], np.nan)
+                if inv_ps.notna().sum() > 0:
+                    value_components.append(_safe_zscore_panel(inv_ps))
+            if value_components:
+                return pd.concat(value_components, axis=1).mean(axis=1)
+            return pd.Series(0.0, index=group.index)
+        
+        panel["value_score"] = panel.groupby("date").apply(_compute_value_score).reset_index(level=0, drop=True)
+        
+        # Quality score: profitability and efficiency (per date)
+        def _compute_quality_score(group):
+            quality_components = []
+            if "return_on_equity" in group.columns:
+                quality_components.append(_safe_zscore_panel(group["return_on_equity"]))
+            if "operating_margins" in group.columns:
+                quality_components.append(_safe_zscore_panel(group["operating_margins"]))
+            if "profit_margins" in group.columns:
+                quality_components.append(_safe_zscore_panel(group["profit_margins"]))
+            if quality_components:
+                return pd.concat(quality_components, axis=1).mean(axis=1)
+            return pd.Series(0.0, index=group.index)
+        
+        panel["quality_score"] = panel.groupby("date").apply(_compute_quality_score).reset_index(level=0, drop=True)
+        
+        # Growth score: revenue and earnings growth (per date)
+        def _compute_growth_score(group):
+            growth_components = []
+            if "revenue_growth" in group.columns:
+                growth_components.append(_safe_zscore_panel(group["revenue_growth"]))
+            if "earnings_growth" in group.columns:
+                growth_components.append(_safe_zscore_panel(group["earnings_growth"]))
+            if growth_components:
+                return pd.concat(growth_components, axis=1).mean(axis=1)
+            return pd.Series(0.0, index=group.index)
+        
+        panel["growth_score"] = panel.groupby("date").apply(_compute_growth_score).reset_index(level=0, drop=True)
+        
+        # Surprise factors: analyst expectations vs current price
+        if "target_mean_price" in panel.columns and "last_close_cad" in panel.columns:
+            panel["pe_discount"] = (panel["target_mean_price"] - panel["last_close_cad"]) / panel["last_close_cad"].replace(0, np.nan)
+            panel["pe_discount"] = panel["pe_discount"].replace([np.inf, -np.inf], np.nan)
+        else:
+            panel["pe_discount"] = 0.0
+        
+        # Fundamental momentum (simplified)
+        if "earnings_quarterly_growth" in panel.columns:
+            panel["roc_growth"] = panel["earnings_quarterly_growth"]
+        else:
+            panel["roc_growth"] = 0.0
+        
+        # Interaction features
+        if "value_score" in panel.columns and "ret_120d" in panel.columns:
+            panel["value_momentum"] = panel["value_score"] * panel["ret_120d"]
+        else:
+            panel["value_momentum"] = 0.0
+        
+        if "vol_60d_ann" in panel.columns and "log_market_cap" in panel.columns:
+            panel["vol_size"] = panel["vol_60d_ann"] * panel["log_market_cap"]
+        else:
+            panel["vol_size"] = 0.0
+        
+        if "quality_score" in panel.columns and "growth_score" in panel.columns:
+            panel["quality_growth"] = panel["quality_score"] * panel["growth_score"]
+        else:
+            panel["quality_growth"] = 0.0
+    
     return panel
 
 
