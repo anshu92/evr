@@ -164,16 +164,60 @@ def compute_features(
         fx_ret_5d = float(fx.pct_change(5).iloc[-1]) if not is_tsx and len(fx) >= 6 else 0.0
         fx_ret_20d = float(fx.pct_change(20).iloc[-1]) if not is_tsx and len(fx) >= 21 else 0.0
 
+        # Extract fundamental data
         sector = None
         industry = None
         market_cap = float("nan")
         beta = float("nan")
+        trailing_pe = float("nan")
+        forward_pe = float("nan")
+        price_to_book = float("nan")
+        price_to_sales = float("nan")
+        enterprise_to_revenue = float("nan")
+        enterprise_to_ebitda = float("nan")
+        profit_margins = float("nan")
+        operating_margins = float("nan")
+        return_on_equity = float("nan")
+        return_on_assets = float("nan")
+        revenue_growth = float("nan")
+        earnings_growth = float("nan")
+        earnings_quarterly_growth = float("nan")
+        debt_to_equity = float("nan")
+        current_ratio = float("nan")
+        quick_ratio = float("nan")
+        dividend_yield = float("nan")
+        payout_ratio = float("nan")
+        target_mean_price = float("nan")
+        recommendation_mean = float("nan")
+        num_analyst_opinions = float("nan")
+        
         if fundamentals is not None and t in fundamentals.index:
             row = fundamentals.loc[t]
             sector = row.get("sector") if isinstance(row, pd.Series) else None
             industry = row.get("industry") if isinstance(row, pd.Series) else None
             market_cap = float(row.get("marketCap")) if row.get("marketCap") is not None else float("nan")
             beta = float(row.get("beta")) if row.get("beta") is not None else float("nan")
+            trailing_pe = float(row.get("trailingPE")) if row.get("trailingPE") is not None else float("nan")
+            forward_pe = float(row.get("forwardPE")) if row.get("forwardPE") is not None else float("nan")
+            price_to_book = float(row.get("priceToBook")) if row.get("priceToBook") is not None else float("nan")
+            price_to_sales = float(row.get("priceToSalesTrailing12Months")) if row.get("priceToSalesTrailing12Months") is not None else float("nan")
+            enterprise_to_revenue = float(row.get("enterpriseToRevenue")) if row.get("enterpriseToRevenue") is not None else float("nan")
+            enterprise_to_ebitda = float(row.get("enterpriseToEbitda")) if row.get("enterpriseToEbitda") is not None else float("nan")
+            profit_margins = float(row.get("profitMargins")) if row.get("profitMargins") is not None else float("nan")
+            operating_margins = float(row.get("operatingMargins")) if row.get("operatingMargins") is not None else float("nan")
+            return_on_equity = float(row.get("returnOnEquity")) if row.get("returnOnEquity") is not None else float("nan")
+            return_on_assets = float(row.get("returnOnAssets")) if row.get("returnOnAssets") is not None else float("nan")
+            revenue_growth = float(row.get("revenueGrowth")) if row.get("revenueGrowth") is not None else float("nan")
+            earnings_growth = float(row.get("earningsGrowth")) if row.get("earningsGrowth") is not None else float("nan")
+            earnings_quarterly_growth = float(row.get("earningsQuarterlyGrowth")) if row.get("earningsQuarterlyGrowth") is not None else float("nan")
+            debt_to_equity = float(row.get("debtToEquity")) if row.get("debtToEquity") is not None else float("nan")
+            current_ratio = float(row.get("currentRatio")) if row.get("currentRatio") is not None else float("nan")
+            quick_ratio = float(row.get("quickRatio")) if row.get("quickRatio") is not None else float("nan")
+            dividend_yield = float(row.get("dividendYield")) if row.get("dividendYield") is not None else float("nan")
+            payout_ratio = float(row.get("payoutRatio")) if row.get("payoutRatio") is not None else float("nan")
+            target_mean_price = float(row.get("targetMeanPrice")) if row.get("targetMeanPrice") is not None else float("nan")
+            recommendation_mean = float(row.get("recommendationMean")) if row.get("recommendationMean") is not None else float("nan")
+            num_analyst_opinions = float(row.get("numberOfAnalystOpinions")) if row.get("numberOfAnalystOpinions") is not None else float("nan")
 
         rows.append(
             {
@@ -206,6 +250,28 @@ def compute_features(
                 "industry_hash": _hash_to_float(str(industry)) if industry else float("nan"),
                 "fx_ret_5d": fx_ret_5d,
                 "fx_ret_20d": fx_ret_20d,
+                # Raw fundamental fields
+                "trailing_pe": trailing_pe,
+                "forward_pe": forward_pe,
+                "price_to_book": price_to_book,
+                "price_to_sales": price_to_sales,
+                "enterprise_to_revenue": enterprise_to_revenue,
+                "enterprise_to_ebitda": enterprise_to_ebitda,
+                "profit_margins": profit_margins,
+                "operating_margins": operating_margins,
+                "return_on_equity": return_on_equity,
+                "return_on_assets": return_on_assets,
+                "revenue_growth": revenue_growth,
+                "earnings_growth": earnings_growth,
+                "earnings_quarterly_growth": earnings_quarterly_growth,
+                "debt_to_equity": debt_to_equity,
+                "current_ratio": current_ratio,
+                "quick_ratio": quick_ratio,
+                "dividend_yield": dividend_yield,
+                "payout_ratio": payout_ratio,
+                "target_mean_price": target_mean_price,
+                "recommendation_mean": recommendation_mean,
+                "num_analyst_opinions": num_analyst_opinions,
                 "n_days": int(len(close)),
             }
         )
@@ -223,6 +289,90 @@ def compute_features(
     for col, out_col in rank_map.items():
         if col in df.columns:
             df[out_col] = df[col].rank(pct=True)
+
+    # Composite fundamental features
+    def _safe_zscore(series: pd.Series) -> pd.Series:
+        """Z-score with NaN handling."""
+        mu = series.mean()
+        sd = series.std()
+        if sd == 0 or pd.isna(sd):
+            return pd.Series(0.0, index=series.index)
+        return (series - mu) / sd
+
+    # Value score: inverse of valuation ratios (lower is better)
+    value_components = []
+    if "trailing_pe" in df.columns:
+        inv_pe = 1.0 / df["trailing_pe"].replace([0, np.inf, -np.inf], np.nan)
+        if inv_pe.notna().sum() > 0:
+            value_components.append(_safe_zscore(inv_pe))
+    if "price_to_book" in df.columns:
+        inv_pb = 1.0 / df["price_to_book"].replace([0, np.inf, -np.inf], np.nan)
+        if inv_pb.notna().sum() > 0:
+            value_components.append(_safe_zscore(inv_pb))
+    if "price_to_sales" in df.columns:
+        inv_ps = 1.0 / df["price_to_sales"].replace([0, np.inf, -np.inf], np.nan)
+        if inv_ps.notna().sum() > 0:
+            value_components.append(_safe_zscore(inv_ps))
+    
+    if value_components:
+        df["value_score"] = pd.concat(value_components, axis=1).mean(axis=1)
+    else:
+        df["value_score"] = 0.0
+
+    # Quality score: profitability and efficiency
+    quality_components = []
+    if "return_on_equity" in df.columns:
+        quality_components.append(_safe_zscore(df["return_on_equity"]))
+    if "operating_margins" in df.columns:
+        quality_components.append(_safe_zscore(df["operating_margins"]))
+    if "profit_margins" in df.columns:
+        quality_components.append(_safe_zscore(df["profit_margins"]))
+    
+    if quality_components:
+        df["quality_score"] = pd.concat(quality_components, axis=1).mean(axis=1)
+    else:
+        df["quality_score"] = 0.0
+
+    # Growth score: revenue and earnings growth
+    growth_components = []
+    if "revenue_growth" in df.columns:
+        growth_components.append(_safe_zscore(df["revenue_growth"]))
+    if "earnings_growth" in df.columns:
+        growth_components.append(_safe_zscore(df["earnings_growth"]))
+    
+    if growth_components:
+        df["growth_score"] = pd.concat(growth_components, axis=1).mean(axis=1)
+    else:
+        df["growth_score"] = 0.0
+
+    # Surprise factors: analyst expectations vs current price
+    if "target_mean_price" in df.columns and "last_close_cad" in df.columns:
+        df["pe_discount"] = (df["target_mean_price"] - df["last_close_cad"]) / df["last_close_cad"].replace(0, np.nan)
+        df["pe_discount"] = df["pe_discount"].replace([np.inf, -np.inf], np.nan)
+    else:
+        df["pe_discount"] = 0.0
+
+    # Fundamental momentum: quarterly earnings growth change
+    if "earnings_quarterly_growth" in df.columns:
+        df["roc_growth"] = df["earnings_quarterly_growth"]  # Simplified - would need historical data for true ROC
+    else:
+        df["roc_growth"] = 0.0
+
+    # Interaction features
+    if "value_score" in df.columns and "ret_120d" in df.columns:
+        df["value_momentum"] = df["value_score"] * df["ret_120d"]
+    else:
+        df["value_momentum"] = 0.0
+
+    if "vol_60d_ann" in df.columns and "log_market_cap" in df.columns:
+        df["vol_size"] = df["vol_60d_ann"] * df["log_market_cap"]
+    else:
+        df["vol_size"] = 0.0
+
+    if "quality_score" in df.columns and "growth_score" in df.columns:
+        df["quality_growth"] = df["quality_score"] * df["growth_score"]
+    else:
+        df["quality_growth"] = 0.0
 
     # Keep the most recent observations per ticker (should already be unique).
     df = df.drop_duplicates(subset=["ticker"]).set_index("ticker").sort_index()

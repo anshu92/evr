@@ -12,7 +12,15 @@ from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
 from stock_screener.modeling.eval import build_time_splits, evaluate_predictions
-from stock_screener.modeling.model import FEATURE_COLUMNS, build_model, save_ensemble, save_model
+from stock_screener.modeling.model import (
+    FEATURE_COLUMNS,
+    build_model,
+    load_bundle,
+    predict_ensemble,
+    predict_score,
+    save_ensemble,
+    save_model,
+)
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json
@@ -198,13 +206,17 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
     # CRITICAL: Cross-sectional winsorization and normalization
     # Financial returns are relative games - normalize within each date
-    logger.info("Applying cross-sectional winsorization and normalization...")
+    logger.info("Applying cross-sectional winsorization (MAD-based) and normalization...")
     
-    def _winsorize(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
-        """Clip extreme values to percentiles."""
-        q_lower = series.quantile(lower)
-        q_upper = series.quantile(upper)
-        return series.clip(lower=q_lower, upper=q_upper)
+    def _winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:
+        """Clip extreme values using MAD (Median Absolute Deviation)."""
+        median = series.median()
+        mad = (series - median).abs().median()
+        if mad == 0 or pd.isna(mad):
+            return series
+        lower = median - n_mad * mad
+        upper = median + n_mad * mad
+        return series.clip(lower=lower, upper=upper)
     
     def _zscore(series: pd.Series) -> pd.Series:
         """Z-score normalize within group."""
@@ -222,11 +234,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     
     for col in feature_cols_to_norm:
         if panel[col].notna().sum() > 0:
-            panel[col] = panel.groupby("date")[col].transform(_winsorize)
+            panel[col] = panel.groupby("date")[col].transform(_winsorize_mad)
             panel[col] = panel.groupby("date")[col].transform(_zscore)
     
-    # Also winsorize labels to remove extreme outliers
-    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize)
+    # Also winsorize labels to remove extreme outliers (MAD-based)
+    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize_mad)
 
 
     dates = pd.to_datetime(panel["date"]).dt.normalize().unique().tolist()
@@ -349,6 +361,45 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         top_features = sorted(feature_ic.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
         logger.info("Top 10 features by |IC|: %s", [(k, f"{v:.3f}") for k, v in top_features])
 
+    # Enhanced validation metrics: by sector and market cap
+    validation_metrics = {}
+    if not holdout_df.empty and len(reg_holdout_preds) > 0:
+        holdout_with_preds = holdout_df.copy()
+        holdout_with_preds["pred_return"] = reg_holdout_preds
+        
+        # IC by sector (if sector data available)
+        if "sector_hash" in holdout_with_preds.columns:
+            sector_ics = {}
+            for sector in holdout_with_preds["sector_hash"].dropna().unique():
+                sector_df = holdout_with_preds[holdout_with_preds["sector_hash"] == sector]
+                if len(sector_df) > 20:
+                    sector_metrics = evaluate_predictions(
+                        sector_df, date_col="date", label_col="future_ret", 
+                        pred_col="pred_return", group_col=None
+                    )
+                    sector_ics[f"sector_{sector:.3f}"] = sector_metrics.get("summary", {})
+            if sector_ics:
+                validation_metrics["by_sector"] = sector_ics
+                logger.info("IC by sector: %d sectors evaluated", len(sector_ics))
+        
+        # IC by market cap quintile
+        if "log_market_cap" in holdout_with_preds.columns:
+            mcap_ics = {}
+            holdout_with_preds["mcap_quintile"] = pd.qcut(
+                holdout_with_preds["log_market_cap"], q=5, labels=False, duplicates="drop"
+            )
+            for q in range(5):
+                q_df = holdout_with_preds[holdout_with_preds["mcap_quintile"] == q]
+                if len(q_df) > 20:
+                    q_metrics = evaluate_predictions(
+                        q_df, date_col="date", label_col="future_ret",
+                        pred_col="pred_return", group_col=None
+                    )
+                    mcap_ics[f"quintile_{q+1}"] = q_metrics.get("summary", {})
+            if mcap_ics:
+                validation_metrics["by_market_cap_quintile"] = mcap_ics
+                logger.info("IC by market cap quintile: %d quintiles evaluated", len(mcap_ics))
+
     metadata = {
         "horizon_days": horizon,
         "feature_columns": FEATURE_COLUMNS,
@@ -368,6 +419,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         },
         "n_samples": int(len(panel)),
         "n_tickers": int(panel["ticker"].nunique()),
+        "validation_metrics": validation_metrics,
     }
     metadata_rel = "metrics.json"
     write_json(model_dir / metadata_rel, metadata)
@@ -417,13 +469,17 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
 
     # CRITICAL: Cross-sectional winsorization and normalization
     # Financial returns are relative games - normalize within each date
-    logger.info("Applying cross-sectional winsorization and normalization...")
+    logger.info("Applying cross-sectional winsorization (MAD-based) and normalization...")
     
-    def _winsorize(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
-        """Clip extreme values to percentiles."""
-        q_lower = series.quantile(lower)
-        q_upper = series.quantile(upper)
-        return series.clip(lower=q_lower, upper=q_upper)
+    def _winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:
+        """Clip extreme values using MAD (Median Absolute Deviation)."""
+        median = series.median()
+        mad = (series - median).abs().median()
+        if mad == 0 or pd.isna(mad):
+            return series
+        lower = median - n_mad * mad
+        upper = median + n_mad * mad
+        return series.clip(lower=lower, upper=upper)
     
     def _zscore(series: pd.Series) -> pd.Series:
         """Z-score normalize within group."""
@@ -441,11 +497,11 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
     
     for col in feature_cols_to_norm:
         if panel[col].notna().sum() > 0:
-            panel[col] = panel.groupby("date")[col].transform(_winsorize)
+            panel[col] = panel.groupby("date")[col].transform(_winsorize_mad)
             panel[col] = panel.groupby("date")[col].transform(_zscore)
     
-    # Also winsorize labels to remove extreme outliers
-    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize)
+    # Also winsorize labels to remove extreme outliers (MAD-based)
+    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize_mad)
 
 
     bundle = load_bundle(Path(cfg.model_path))

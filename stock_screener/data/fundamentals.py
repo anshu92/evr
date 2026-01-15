@@ -57,6 +57,33 @@ def fetch_fundamentals(tickers: list[str], *, cache_dir: Path, logger) -> pd.Dat
                     "industry": _safe_info_value(info, "industry"),
                     "marketCap": _safe_info_value(info, "marketCap"),
                     "beta": _safe_info_value(info, "beta"),
+                    # Valuation ratios
+                    "trailingPE": _safe_info_value(info, "trailingPE"),
+                    "forwardPE": _safe_info_value(info, "forwardPE"),
+                    "priceToBook": _safe_info_value(info, "priceToBook"),
+                    "priceToSalesTrailing12Months": _safe_info_value(info, "priceToSalesTrailing12Months"),
+                    "enterpriseToRevenue": _safe_info_value(info, "enterpriseToRevenue"),
+                    "enterpriseToEbitda": _safe_info_value(info, "enterpriseToEbitda"),
+                    # Profitability
+                    "profitMargins": _safe_info_value(info, "profitMargins"),
+                    "operatingMargins": _safe_info_value(info, "operatingMargins"),
+                    "returnOnEquity": _safe_info_value(info, "returnOnEquity"),
+                    "returnOnAssets": _safe_info_value(info, "returnOnAssets"),
+                    # Growth
+                    "revenueGrowth": _safe_info_value(info, "revenueGrowth"),
+                    "earningsGrowth": _safe_info_value(info, "earningsGrowth"),
+                    "earningsQuarterlyGrowth": _safe_info_value(info, "earningsQuarterlyGrowth"),
+                    # Financial health
+                    "debtToEquity": _safe_info_value(info, "debtToEquity"),
+                    "currentRatio": _safe_info_value(info, "currentRatio"),
+                    "quickRatio": _safe_info_value(info, "quickRatio"),
+                    # Dividend & payout
+                    "dividendYield": _safe_info_value(info, "dividendYield"),
+                    "payoutRatio": _safe_info_value(info, "payoutRatio"),
+                    # Analyst expectations
+                    "targetMeanPrice": _safe_info_value(info, "targetMeanPrice"),
+                    "recommendationMean": _safe_info_value(info, "recommendationMean"),
+                    "numberOfAnalystOpinions": _safe_info_value(info, "numberOfAnalystOpinions"),
                 }
                 path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
             except Exception as exc:

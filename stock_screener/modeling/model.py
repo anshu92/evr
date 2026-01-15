@@ -16,16 +16,66 @@ except Exception as _xgb_err:  # pragma: no cover
 FEATURE_COLUMNS = [
     "last_close_cad",
     "avg_dollar_volume_cad",
+    "ret_5d",
+    "ret_10d",
     "ret_20d",
     "ret_60d",
     "ret_120d",
+    "ret_accel_20_120",
     "vol_20d_ann",
     "vol_60d_ann",
+    "vol_ratio_20_60",
     "rsi_14",
     "ma20_ratio",
     "ma50_ratio",
     "ma200_ratio",
+    "drawdown_60d",
+    "dist_52w_high",
+    "dist_52w_low",
+    "vol_anom_30d",
+    "rank_ret_20d",
+    "rank_ret_60d",
+    "rank_vol_60d",
+    "rank_avg_dollar_volume",
+    "log_market_cap",
+    "beta",
+    "sector_hash",
+    "industry_hash",
+    "fx_ret_5d",
+    "fx_ret_20d",
     "is_tsx",
+    # Raw fundamental features
+    "trailing_pe",
+    "forward_pe",
+    "price_to_book",
+    "price_to_sales",
+    "enterprise_to_revenue",
+    "enterprise_to_ebitda",
+    "profit_margins",
+    "operating_margins",
+    "return_on_equity",
+    "return_on_assets",
+    "revenue_growth",
+    "earnings_growth",
+    "earnings_quarterly_growth",
+    "debt_to_equity",
+    "current_ratio",
+    "quick_ratio",
+    "dividend_yield",
+    "payout_ratio",
+    "target_mean_price",
+    "recommendation_mean",
+    "num_analyst_opinions",
+    # Composite fundamental features
+    "value_score",
+    "quality_score",
+    "growth_score",
+    "pe_discount",
+    "roc_growth",
+    # Interaction features
+    "value_momentum",
+    "vol_size",
+    "quality_growth",
 ]
 
 
@@ -44,16 +94,16 @@ def build_model(random_state: int = 42):
 
     _require_xgb()
     return xgb.XGBRegressor(
-        n_estimators=300,  # Reduced from 800, rely on early stopping
-        learning_rate=0.05,  # Slightly higher learning rate
-        max_depth=4,  # Shallower trees to reduce overfitting
-        subsample=0.7,  # More aggressive subsampling
+        n_estimators=300,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.7,
         colsample_bytree=0.7,
-        reg_lambda=2.0,  # Stronger L2 regularization
-        reg_alpha=0.5,  # Add L1 regularization
-        min_child_weight=10,  # Require more samples per leaf
-        gamma=0.1,  # Minimum loss reduction for split
-        objective="reg:squaredlogerror",  # Better for returns (handles asymmetry)
+        reg_lambda=2.0,
+        reg_alpha=0.5,
+        min_child_weight=10,
+        gamma=0.1,
+        objective="reg:squaredlogerror",
         n_jobs=0,
         random_state=random_state,
     )
@@ -64,15 +114,16 @@ def build_ranker(random_state: int = 42):
 
     _require_xgb()
     return xgb.XGBRanker(
-        n_estimators=600,
+        n_estimators=200,
         learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        min_child_weight=5,
+        max_depth=4,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_lambda=2.0,
+        reg_alpha=0.5,
+        min_child_weight=10,
+        gamma=0.1,
         objective="rank:ndcg",
-        eval_metric="ndcg",
         n_jobs=0,
         random_state=random_state,
     )
@@ -187,8 +238,6 @@ def load_ensemble(manifest_path: str | Path) -> tuple[list, list[float] | None]:
     base = mp.parent
     models = [load_model(base / rel) for rel in model_rel]
     return models, weights
-
-
 
 
 def load_bundle(manifest_path: str | Path) -> dict[str, object]:
