@@ -44,14 +44,16 @@ def build_model(random_state: int = 42):
 
     _require_xgb()
     return xgb.XGBRegressor(
-        n_estimators=800,
-        learning_rate=0.03,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        min_child_weight=5,
-        objective="reg:squarederror",
+        n_estimators=300,  # Reduced from 800, rely on early stopping
+        learning_rate=0.05,  # Slightly higher learning rate
+        max_depth=4,  # Shallower trees to reduce overfitting
+        subsample=0.7,  # More aggressive subsampling
+        colsample_bytree=0.7,
+        reg_lambda=2.0,  # Stronger L2 regularization
+        reg_alpha=0.5,  # Add L1 regularization
+        min_child_weight=10,  # Require more samples per leaf
+        gamma=0.1,  # Minimum loss reduction for split
+        objective="reg:squaredlogerror",  # Better for returns (handles asymmetry)
         n_jobs=0,
         random_state=random_state,
     )

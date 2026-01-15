@@ -196,6 +196,39 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     panel = panel[panel["last_close_cad"] >= float(cfg.min_price_cad)]
     panel = panel[panel["avg_dollar_volume_cad"] >= float(cfg.min_avg_dollar_volume_cad)]
 
+    # CRITICAL: Cross-sectional winsorization and normalization
+    # Financial returns are relative games - normalize within each date
+    logger.info("Applying cross-sectional winsorization and normalization...")
+    
+    def _winsorize(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
+        """Clip extreme values to percentiles."""
+        q_lower = series.quantile(lower)
+        q_upper = series.quantile(upper)
+        return series.clip(lower=q_lower, upper=q_upper)
+    
+    def _zscore(series: pd.Series) -> pd.Series:
+        """Z-score normalize within group."""
+        mu = series.mean()
+        sd = series.std()
+        if sd == 0 or pd.isna(sd):
+            return series * 0.0
+        return (series - mu) / sd
+    
+    # Winsorize and normalize features within each date (cross-sectional)
+    feature_cols_to_norm = [
+        col for col in FEATURE_COLUMNS 
+        if col in panel.columns and col not in ["sector_hash", "industry_hash", "is_tsx"]
+    ]
+    
+    for col in feature_cols_to_norm:
+        if panel[col].notna().sum() > 0:
+            panel[col] = panel.groupby("date")[col].transform(_winsorize)
+            panel[col] = panel.groupby("date")[col].transform(_zscore)
+    
+    # Also winsorize labels to remove extreme outliers
+    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize)
+
+
     dates = pd.to_datetime(panel["date"]).dt.normalize().unique().tolist()
     splits, holdout = build_time_splits(dates, embargo_days=horizon)
     val_dates = splits[-1].val_dates if splits else []
@@ -377,6 +410,39 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
     panel = panel[panel["n_days"] >= 90]
     panel = panel[panel["last_close_cad"] >= float(cfg.min_price_cad)]
     panel = panel[panel["avg_dollar_volume_cad"] >= float(cfg.min_avg_dollar_volume_cad)]
+
+    # CRITICAL: Cross-sectional winsorization and normalization
+    # Financial returns are relative games - normalize within each date
+    logger.info("Applying cross-sectional winsorization and normalization...")
+    
+    def _winsorize(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
+        """Clip extreme values to percentiles."""
+        q_lower = series.quantile(lower)
+        q_upper = series.quantile(upper)
+        return series.clip(lower=q_lower, upper=q_upper)
+    
+    def _zscore(series: pd.Series) -> pd.Series:
+        """Z-score normalize within group."""
+        mu = series.mean()
+        sd = series.std()
+        if sd == 0 or pd.isna(sd):
+            return series * 0.0
+        return (series - mu) / sd
+    
+    # Winsorize and normalize features within each date (cross-sectional)
+    feature_cols_to_norm = [
+        col for col in FEATURE_COLUMNS 
+        if col in panel.columns and col not in ["sector_hash", "industry_hash", "is_tsx"]
+    ]
+    
+    for col in feature_cols_to_norm:
+        if panel[col].notna().sum() > 0:
+            panel[col] = panel.groupby("date")[col].transform(_winsorize)
+            panel[col] = panel.groupby("date")[col].transform(_zscore)
+    
+    # Also winsorize labels to remove extreme outliers
+    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize)
+
 
     bundle = load_bundle(Path(cfg.model_path))
     metrics: dict[str, object] = {"ranker": None, "regressor": None}
