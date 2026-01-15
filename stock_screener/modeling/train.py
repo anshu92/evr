@@ -12,7 +12,7 @@ from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
 from stock_screener.modeling.eval import build_time_splits, evaluate_predictions
-from stock_screener.modeling.model import FEATURE_COLUMNS, build_model, build_ranker, save_bundle, save_model
+from stock_screener.modeling.model import FEATURE_COLUMNS, build_model, save_ensemble, save_model
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json
@@ -36,23 +36,6 @@ def _hash_to_float(val: str | None) -> float:
     h = hashlib.sha256(val.encode("utf-8")).hexdigest()
     return float(int(h[:10], 16) % 1_000_000) / 1_000_000.0
 
-
-
-def _make_ranker_labels(df: pd.DataFrame, *, bins: int = 5) -> pd.Series:
-    """Convert continuous returns into integer relevance labels per date."""
-
-    if df.empty:
-        return pd.Series(dtype=int)
-
-    def _bin_group(group: pd.DataFrame) -> pd.Series:
-        if len(group) <= 1:
-            return pd.Series([0] * len(group), index=group.index, dtype=int)
-        ranks = group["future_ret"].rank(pct=True, method="average")
-        labels = (ranks * bins).fillna(0).astype(float)
-        labels = labels.clip(lower=0, upper=bins - 1).astype(int)
-        return pd.Series(labels, index=group.index, dtype=int)
-
-    return df.groupby("date", group_keys=False).apply(_bin_group)
 
 
 def _build_panel_features(
@@ -230,40 +213,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         temp["pred"] = pred
         return evaluate_predictions(temp, date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx")
 
-    ranker_candidates = [
-        {"max_depth": 6, "learning_rate": 0.05, "min_child_weight": 5},
-        {"max_depth": 5, "learning_rate": 0.07, "min_child_weight": 8},
-    ]
+
     regressor_candidates = [
         {"max_depth": 6, "learning_rate": 0.03, "min_child_weight": 5},
         {"max_depth": 5, "learning_rate": 0.05, "min_child_weight": 8},
     ]
-
-    def _eval_ranker_params(params: dict[str, float]) -> float:
-        scores: list[float] = []
-        for split in splits:
-            train_df = _subset_by_dates(split.train_dates)
-            val_df = _subset_by_dates(split.val_dates)
-            if train_df.empty or val_df.empty:
-                continue
-            model = build_ranker(random_state=42)
-            model.set_params(**params, early_stopping_rounds=50)
-            train_groups = train_df.groupby("date").size().to_numpy()
-            val_groups = val_df.groupby("date").size().to_numpy()
-            train_labels = _make_ranker_labels(train_df)
-            val_labels = _make_ranker_labels(val_df)
-            model.fit(
-                train_df[FEATURE_COLUMNS],
-                train_labels,
-                group=train_groups,
-                eval_set=[(val_df[FEATURE_COLUMNS], val_labels)],
-                eval_group=[val_groups],
-                verbose=False,
-            )
-            preds = model.predict(val_df[FEATURE_COLUMNS])
-            metrics = _rank_ic_for_preds(val_df, pd.Series(preds, index=val_df.index))
-            scores.append(float(metrics["summary"]["mean_ic"]))
-        return float(np.nanmean(scores)) if scores else float("nan")
 
     def _eval_regressor_params(params: dict[str, float]) -> float:
         scores: list[float] = []
@@ -285,36 +239,14 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             scores.append(float(metrics["summary"]["mean_ic"]))
         return float(np.nanmean(scores)) if scores else float("nan")
 
-    ranker_scores = {str(p): _eval_ranker_params(p) for p in ranker_candidates}
     regressor_scores = {str(p): _eval_regressor_params(p) for p in regressor_candidates}
-    best_ranker_params = max(ranker_candidates, key=lambda p: ranker_scores.get(str(p), float("-inf")))
     best_regressor_params = max(regressor_candidates, key=lambda p: regressor_scores.get(str(p), float("-inf")))
 
     train_df = _subset_by_dates(holdout.train_dates)
     val_df = _subset_by_dates(val_dates)
     holdout_df = _subset_by_dates(holdout.holdout_dates)
 
-    ranker = build_ranker(random_state=42)
-    ranker.set_params(**best_ranker_params, early_stopping_rounds=50)
-    ranker_groups = train_df.groupby("date").size().to_numpy()
-    if not val_df.empty:
-        val_groups = val_df.groupby("date").size().to_numpy()
-        train_labels = _make_ranker_labels(train_df)
-        val_labels = _make_ranker_labels(val_df)
-        ranker.fit(
-            train_df[FEATURE_COLUMNS],
-            train_labels,
-            group=ranker_groups,
-            eval_set=[(val_df[FEATURE_COLUMNS], val_labels)],
-            eval_group=[val_groups],
-            verbose=False,
-        )
-    else:
-        train_labels = _make_ranker_labels(train_df)
-        ranker.fit(train_df[FEATURE_COLUMNS], train_labels, group=ranker_groups)
 
-    ranker_holdout_preds = ranker.predict(holdout_df[FEATURE_COLUMNS]) if not holdout_df.empty else []
-    ranker_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(ranker_holdout_preds, index=holdout_df.index))
 
     seeds = [7, 13, 21, 42, 73, 99, 123]
     model_dir = Path(cfg.model_path).parent
@@ -355,8 +287,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
 
-    ranker_rel = "ranker.json"
-    save_model(ranker, model_dir / ranker_rel)
 
     metadata = {
         "horizon_days": horizon,
@@ -366,7 +296,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "min_avg_dollar_volume_cad": float(cfg.min_avg_dollar_volume_cad),
             "min_history_days": 90,
         },
-        "ranker": {"params": best_ranker_params, "cv_scores": ranker_scores, "holdout": ranker_holdout_metrics["summary"]},
         "regressor": {
             "params": best_regressor_params,
             "cv_scores": regressor_scores,
@@ -382,13 +311,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     metadata_rel = "metrics.json"
     write_json(model_dir / metadata_rel, metadata)
 
-    save_bundle(
-        cfg.model_path,
-        ranker_rel_path=ranker_rel,
-        regressor_rel_paths=reg_rel_paths,
-        regressor_weights=None,
-        metadata_rel_path=metadata_rel,
-    )
+    save_ensemble(cfg.model_path, model_rel_paths=reg_rel_paths, weights=None)
     logger.info("Saved model bundle manifest to %s", cfg.model_path)
     return TrainResult(n_samples=int(len(panel)), n_tickers=int(panel["ticker"].nunique()), horizon_days=horizon)
 

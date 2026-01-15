@@ -64,10 +64,10 @@ jobs:
         env:
           MODEL_PATH: "models/ensemble/manifest.json"
           LABEL_HORIZON_DAYS: "5"
-          # Keep limits reasonable for GitHub Actions; increase if needed.
-          MAX_TICKERS: "2500"
-          FEATURE_LOOKBACK_DAYS: "365"
-          BATCH_SIZE: "200"
+          # Increase training data for better signal
+          MAX_TICKERS: "4000"
+          FEATURE_LOOKBACK_DAYS: "730"
+          BATCH_SIZE: "250"
         run: |
           python -m stock_screener.cli train-model --log-level INFO
 

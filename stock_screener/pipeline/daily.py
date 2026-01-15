@@ -18,7 +18,7 @@ from stock_screener.screening.screener import screen_universe
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, read_json, write_json
-from stock_screener.modeling.model import load_bundle, load_model, predict, predict_ensemble, predict_score
+from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
 
@@ -81,26 +81,19 @@ def run_daily(cfg: Config, logger) -> None:
         try:
             mp = Path(cfg.model_path)
             if mp.name.lower() == "manifest.json":
-                bundle = load_bundle(mp)
-                if bundle.get("ranker") is not None:
-                    features["pred_score"] = predict_score(bundle["ranker"], features)
-                    logger.info("Loaded ML ranker from %s", cfg.model_path)
-                reg_models = bundle.get("regressor_models") or []
-                reg_weights = bundle.get("regressor_weights")
-                if reg_models:
-                    features["pred_return"] = predict_ensemble(reg_models, reg_weights, features)
-                    logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(reg_models))
-                metadata_rel = bundle.get("metadata")
-                if metadata_rel:
-                    metadata_path = mp.parent / str(metadata_rel)
-                    if metadata_path.is_file():
-                        run_meta["model"] = {
-                            "manifest_path": str(mp),
-                            "metadata_path": str(metadata_path),
-                            "metadata": read_json(metadata_path),
-                        }
-                    else:
-                        run_meta["model"] = {"manifest_path": str(mp), "metadata_path": str(metadata_path)}
+                ensemble = load_ensemble(mp)
+                models, weights = ensemble
+                if models:
+                    features["pred_return"] = predict_ensemble(models, weights, features)
+                    logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(models))
+                # Try to load metadata from manifest parent
+                metadata_path = mp.parent / "metrics.json"
+                if metadata_path.is_file():
+                    run_meta["model"] = {
+                        "manifest_path": str(mp),
+                        "metadata_path": str(metadata_path),
+                        "metadata": read_json(metadata_path),
+                    }
             else:
                 model = load_model(cfg.model_path)
                 logger.info("Loaded ML model from %s", cfg.model_path)

@@ -101,9 +101,7 @@ def render_reports(
     if model_metrics:
         lines.append("MODEL VALIDATION (Holdout IC)")
         lines.append("-" * 78)
-        ranker_summary = model_metrics.get("ranker", {}).get("holdout")
         reg_summary = model_metrics.get("regressor", {}).get("holdout")
-        lines.append(f"Ranker:    {_fmt_ic_summary(ranker_summary)}")
         lines.append(f"Regressor: {_fmt_ic_summary(reg_summary)}")
         lines.append("")
 
@@ -247,7 +245,6 @@ def render_reports(
 
     model_block = ""
     if model_metrics:
-        ranker_summary = model_metrics.get("ranker", {}).get("holdout") or {}
         reg_summary = model_metrics.get("regressor", {}).get("holdout") or {}
         model_block = f"""
   <div style="background:#ecfeff;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
@@ -263,13 +260,6 @@ def render_reports(
         </tr>
       </thead>
       <tbody>
-        <tr>
-          <td style="padding:4px 6px;">Ranker</td>
-          <td style="padding:4px 6px;">{_fmt_num(ranker_summary.get("mean_ic"))}</td>
-          <td style="padding:4px 6px;">{_fmt_num(ranker_summary.get("std_ic"))}</td>
-          <td style="padding:4px 6px;">{_fmt_num(ranker_summary.get("ic_ir"))}</td>
-          <td style="padding:4px 6px;">{ranker_summary.get("n_days", "N/A")}</td>
-        </tr>
         <tr>
           <td style="padding:4px 6px;">Regressor</td>
           <td style="padding:4px 6px;">{_fmt_num(reg_summary.get("mean_ic"))}</td>
