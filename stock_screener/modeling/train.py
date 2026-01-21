@@ -355,7 +355,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         raise RuntimeError("No training panel built")
 
     horizon = int(cfg.label_horizon_days)
-    panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-horizon) / panel["last_close_cad"] - 1.0
+    # Shift by (horizon + 1) so predictions made with today's features predict tomorrow onward
+    # This ensures we can act on predictions before market open
+    panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
 
     # Drop rows without labels/features
     panel = panel.dropna(subset=["future_ret"])
@@ -563,6 +565,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
     metadata = {
         "horizon_days": horizon,
+        "prediction_offset": 1,
+        "note": "Model predicts (horizon+1) days forward to enable same-day actionability",
         "feature_columns": FEATURE_COLUMNS,
         "filters": {
             "min_price_cad": float(cfg.min_price_cad),
@@ -620,7 +624,9 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
         raise RuntimeError("No evaluation panel built")
 
     horizon = int(cfg.label_horizon_days)
-    panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-horizon) / panel["last_close_cad"] - 1.0
+    # Shift by (horizon + 1) so predictions made with today's features predict tomorrow onward
+    # This ensures we can act on predictions before market open
+    panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
     panel = panel.dropna(subset=["future_ret"])
     panel = panel.replace([np.inf, -np.inf], np.nan)
     panel = panel.dropna(subset=["last_close_cad", "avg_dollar_volume_cad"])

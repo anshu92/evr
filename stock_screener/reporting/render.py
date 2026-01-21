@@ -190,57 +190,32 @@ def render_reports(
 
     # Portfolio P&L history (stateful; computed from portfolio state positions)
     if portfolio_pnl_history:
-        lines.append("PORTFOLIO NET P/L (CAD; based on `shares` in portfolio state)")
+        lines.append("PORTFOLIO RETURNS")
         lines.append("-" * 78)
         latest = portfolio_pnl_history[-1]
         prev = portfolio_pnl_history[-2] if len(portfolio_pnl_history) >= 2 else None
-        net = _to_float(latest.get("net_pl_cad"))
-        realized = _to_float(latest.get("realized_pl_cad"))
-        unrealized = _to_float(latest.get("unrealized_pl_cad"))
-        mv = _to_float(latest.get("open_market_value_cad"))
-        cash = _to_float(latest.get("cash_cad"))
+        first = portfolio_pnl_history[0]
+        
         equity = _to_float(latest.get("equity_cad"))
-
-        delta_1d = None
-        if prev is not None:
-            prev_net = _to_float(prev.get("net_pl_cad"))
-            if prev_net is not None and net is not None:
-                delta_1d = net - prev_net
-
-        parts: list[str] = []
-        if equity is not None:
-            parts.append(f"Equity: {_fmt_money(equity)}")
-            if fx_rate is not None and fx_rate > 0:
-                parts.append(f"Equity USD: {_fmt_money(equity / fx_rate)}")
-        if cash is not None:
-            parts.append(f"Cash: {_fmt_money(cash)}")
-        if net is not None:
-            parts.append(f"Net: {_fmt_money(net)}")
-        if delta_1d is not None:
-            parts.append(f"Δ1D: {_fmt_money(delta_1d)}")
-        if realized is not None:
-            parts.append(f"Realized: {_fmt_money(realized)}")
-        if unrealized is not None:
-            parts.append(f"Unrealized: {_fmt_money(unrealized)}")
-        if mv is not None:
-            parts.append(f"Open MV: {_fmt_money(mv)}")
-        if parts:
-            lines.append(" | ".join(parts))
-            lines.append("")
-
-        # Show last 10 points (most recent last)
-        tail = portfolio_pnl_history[-10:]
-        for item in tail:
-            asof = str(item.get("asof_utc", "")).strip()
-            day = asof[:10] if len(asof) >= 10 else asof
-            item_net = _to_float(item.get("net_pl_cad"))
-            item_real = _to_float(item.get("realized_pl_cad"))
-            item_unreal = _to_float(item.get("unrealized_pl_cad"))
-            lines.append(
-                f"{day:<12} net={_fmt_money(item_net) if item_net is not None else 'N/A'} "
-                f"realized={_fmt_money(item_real) if item_real is not None else 'N/A'} "
-                f"unrealized={_fmt_money(item_unreal) if item_unreal is not None else 'N/A'}"
-            )
+        prev_equity = _to_float(prev.get("equity_cad")) if prev else None
+        first_equity = _to_float(first.get("equity_cad"))
+        
+        # Calculate returns
+        all_time_return = None
+        day_to_day_return = None
+        
+        if equity is not None and first_equity is not None and first_equity > 0:
+            all_time_return = (equity - first_equity) / first_equity
+        
+        if equity is not None and prev_equity is not None and prev_equity > 0:
+            day_to_day_return = (equity - prev_equity) / prev_equity
+        
+        lines.append(f"Current Equity: {_fmt_money(equity) if equity is not None else 'N/A'}")
+        if fx_rate is not None and fx_rate > 0 and equity is not None:
+            lines.append(f"Current Equity USD: {_fmt_money(equity / fx_rate)}")
+        lines.append("")
+        lines.append(f"All-Time Return: {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
+        lines.append(f"Day-to-Day Return: {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
         lines.append("")
 
     model_block = ""
@@ -358,70 +333,38 @@ def render_reports(
     if portfolio_pnl_history:
         latest = portfolio_pnl_history[-1]
         prev = portfolio_pnl_history[-2] if len(portfolio_pnl_history) >= 2 else None
-        net = _to_float(latest.get("net_pl_cad"))
-        realized = _to_float(latest.get("realized_pl_cad"))
-        unrealized = _to_float(latest.get("unrealized_pl_cad"))
-        mv = _to_float(latest.get("open_market_value_cad"))
-        cash = _to_float(latest.get("cash_cad"))
+        first = portfolio_pnl_history[0]
+        
         equity = _to_float(latest.get("equity_cad"))
-        delta_1d = None
-        if prev is not None:
-            prev_net = _to_float(prev.get("net_pl_cad"))
-            if prev_net is not None and net is not None:
-                delta_1d = net - prev_net
-
-        summary_parts: list[str] = []
-        if equity is not None:
-            summary_parts.append(f"Equity: {_fmt_money(equity)}")
-            fx_rate = _to_float(fx_usdcad_rate)
-            if fx_rate is not None and fx_rate > 0:
-                summary_parts.append(f"Equity USD: {_fmt_money(equity / fx_rate)}")
-        if cash is not None:
-            summary_parts.append(f"Cash: {_fmt_money(cash)}")
-        if net is not None:
-            summary_parts.append(f"Net: {_fmt_money(net)}")
-        if delta_1d is not None:
-            summary_parts.append(f"Δ1D: {_fmt_money(delta_1d)}")
-        if realized is not None:
-            summary_parts.append(f"Realized: {_fmt_money(realized)}")
-        if unrealized is not None:
-            summary_parts.append(f"Unrealized: {_fmt_money(unrealized)}")
-        if mv is not None:
-            summary_parts.append(f"Open MV: {_fmt_money(mv)}")
-        summary = " | ".join(summary_parts) if summary_parts else "N/A"
-
-        tail = portfolio_pnl_history[-10:]
-        pnl_rows = "\n".join(
-            "<tr>"
-            + f"<td style='padding:6px 8px;border-bottom:1px solid #e5e7eb;'>{_html_escape(str(item.get('asof_utc',''))[:10])}</td>"
-            + f"<td style='padding:6px 8px;border-bottom:1px solid #e5e7eb;'>{_html_escape(_fmt_money(item.get('net_pl_cad')))}</td>"
-            + f"<td style='padding:6px 8px;border-bottom:1px solid #e5e7eb;'>{_html_escape(_fmt_money(item.get('realized_pl_cad')))}</td>"
-            + f"<td style='padding:6px 8px;border-bottom:1px solid #e5e7eb;'>{_html_escape(_fmt_money(item.get('unrealized_pl_cad')))}</td>"
-            + "</tr>"
-            for item in tail
-        )
+        prev_equity = _to_float(prev.get("equity_cad")) if prev else None
+        first_equity = _to_float(first.get("equity_cad"))
+        
+        # Calculate returns
+        all_time_return = None
+        day_to_day_return = None
+        
+        if equity is not None and first_equity is not None and first_equity > 0:
+            all_time_return = (equity - first_equity) / first_equity
+        
+        if equity is not None and prev_equity is not None and prev_equity > 0:
+            day_to_day_return = (equity - prev_equity) / prev_equity
+        
+        fx_rate = _to_float(fx_usdcad_rate)
+        equity_parts: list[str] = []
+        equity_parts.append(f"<strong>Current Equity:</strong> {_fmt_money(equity) if equity is not None else 'N/A'}")
+        if fx_rate is not None and fx_rate > 0 and equity is not None:
+            equity_parts.append(f"<strong>Current Equity USD:</strong> {_fmt_money(equity / fx_rate)}")
+        
+        return_parts: list[str] = []
+        return_parts.append(f"<strong>All-Time Return:</strong> {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
+        return_parts.append(f"<strong>Day-to-Day Return:</strong> {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
+        
+        summary = "<br/>".join(equity_parts + return_parts)
 
         pnl_block = f"""
-  <h3 style="margin: 0 0 10px 0;">Portfolio Net P&amp;L (CAD)</h3>
+  <h3 style="margin: 0 0 10px 0;">Portfolio Returns</h3>
   <div style="background:#ecfeff;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
-    <div><strong>{_html_escape(summary)}</strong></div>
-    <div style="margin-top:10px; font-size: 12px; color:#374151;">Last {len(tail)} points (UTC date)</div>
-    <table style="border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px;">
-      <thead>
-        <tr>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">As of</th>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Net</th>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Realized</th>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Unrealized</th>
-        </tr>
-      </thead>
-      <tbody>
-        {pnl_rows}
-      </tbody>
-    </table>
-    <div style="margin-top:10px; font-size: 12px; color:#374151;">
-      Note: computed from entry/exit prices in the persisted portfolio state (uses each position's <code>shares</code>).
-    </div>
+    <div>{summary}</div>
   </div>
 """
 

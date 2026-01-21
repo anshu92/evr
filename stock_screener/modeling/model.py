@@ -44,38 +44,6 @@ FEATURE_COLUMNS = [
     "fx_ret_5d",
     "fx_ret_20d",
     "is_tsx",
-    # Raw fundamental features
-    "trailing_pe",
-    "forward_pe",
-    "price_to_book",
-    "price_to_sales",
-    "enterprise_to_revenue",
-    "enterprise_to_ebitda",
-    "profit_margins",
-    "operating_margins",
-    "return_on_equity",
-    "return_on_assets",
-    "revenue_growth",
-    "earnings_growth",
-    "earnings_quarterly_growth",
-    "debt_to_equity",
-    "current_ratio",
-    "quick_ratio",
-    "dividend_yield",
-    "payout_ratio",
-    "target_mean_price",
-    "recommendation_mean",
-    "num_analyst_opinions",
-    # Composite fundamental features
-    "value_score",
-    "quality_score",
-    "growth_score",
-    "pe_discount",
-    "roc_growth",
-    # Interaction features
-    "value_momentum",
-    "vol_size",
-    "quality_growth",
 ]
 
 
@@ -94,16 +62,14 @@ def build_model(random_state: int = 42):
 
     _require_xgb()
     return xgb.XGBRegressor(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=4,
-        subsample=0.7,
-        colsample_bytree=0.7,
-        reg_lambda=2.0,
-        reg_alpha=0.5,
-        min_child_weight=10,
-        gamma=0.1,
-        objective="reg:squaredlogerror",
+        n_estimators=800,
+        learning_rate=0.03,
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        min_child_weight=5,
+        objective="reg:squarederror",
         n_jobs=0,
         random_state=random_state,
     )
@@ -114,16 +80,15 @@ def build_ranker(random_state: int = 42):
 
     _require_xgb()
     return xgb.XGBRanker(
-        n_estimators=200,
+        n_estimators=600,
         learning_rate=0.05,
-        max_depth=4,
-        subsample=0.7,
-        colsample_bytree=0.7,
-        reg_lambda=2.0,
-        reg_alpha=0.5,
-        min_child_weight=10,
-        gamma=0.1,
-        objective="rank:ndcg",
+        max_depth=6,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        min_child_weight=5,
+        objective="rank:pairwise",
+        eval_metric="ndcg",
         n_jobs=0,
         random_state=random_state,
     )
