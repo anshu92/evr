@@ -191,6 +191,7 @@ def run_daily(cfg: Config, logger) -> None:
         logger=logger,
         portfolio_pnl_history=state.pnl_history,
         fx_usdcad_rate=float(fx.dropna().iloc[-1]) if fx is not None and not fx.dropna().empty else None,
+        total_processed=len(features),
     )
 
     # Persist metadata for debugging/auditing

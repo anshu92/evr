@@ -39,6 +39,7 @@ def render_reports(
     *,
     portfolio_pnl_history: list[dict[str, Any]] | None = None,
     fx_usdcad_rate: float | None = None,
+    total_processed: int | None = None,
 ) -> None:
     """Write daily email HTML + text report + weights CSV to reports_dir."""
 
@@ -77,6 +78,9 @@ def render_reports(
     lines.append(f"US meta:  {universe_meta.get('us', {})}")
     lines.append(f"TSX meta: {universe_meta.get('tsx', {})}")
     lines.append(f"Total requested: {universe_meta.get('total_requested')}")
+    if total_processed is not None:
+        lines.append(f"Number of tickers scanned: {total_processed:,}")
+    lines.append(f"Top screened: {len(screened):,} tickers")
     lines.append("")
 
     def _to_float(x: Any) -> float | None:
@@ -368,6 +372,7 @@ def render_reports(
   </div>
 """
 
+    total_scanned = total_processed if total_processed is not None else len(screened)
     html = f"""<html>
 <body style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827; max-width: 900px; margin: 0 auto; padding: 20px;">
   <h2 style="margin: 0 0 10px 0;">Daily Screener + Risk Parity Portfolio (CAD)</h2>
@@ -382,7 +387,8 @@ def render_reports(
 
   <div style="background:#f3f4f6;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
     <div><strong>Universe:</strong> US + TSX</div>
-    <div><strong>Screened:</strong> {len(screened):,} tickers</div>
+    <div><strong>Number of tickers scanned:</strong> {total_scanned:,}</div>
+    <div><strong>Top screened:</strong> {len(screened):,} tickers</div>
     <div><strong>Portfolio:</strong> {len(weights):,} tickers (inverse-vol weights)</div>
   </div>
 
