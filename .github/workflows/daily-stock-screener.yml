@@ -2,7 +2,9 @@ name: Daily Stock Screener (CAD) + Email
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5' # Weekdays 10:00 UTC ~= 6:00 AM EDT / 5:00 AM EST
+    # Run twice daily at 10 AM and 2 PM Eastern
+    - cron: '0 14 * * *' # 14:00 UTC = 10:00 AM EDT / 9:00 AM EST
+    - cron: '0 18 * * *' # 18:00 UTC = 2:00 PM EDT / 1:00 PM EST
   workflow_dispatch:
 
 permissions:

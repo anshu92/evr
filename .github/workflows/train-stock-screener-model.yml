@@ -2,7 +2,7 @@ name: Train Stock Screener Model (XGBoost)
 
 on:
   schedule:
-    # Run daily at 02:00 UTC, but gate to every 3rd day (see step "Gate (every 3 days)").
+    # Run daily at 02:00 UTC
     - cron: '0 2 * * *'
   workflow_dispatch:
 
@@ -42,25 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Gate (every 3 days)
-        id: gate
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run=1" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Gate: run only on every 3rd UTC day since epoch.
-          day=$(( $(date -u +%s) / 86400 ))
-          if [ $(( day % 3 )) -eq 0 ]; then
-            echo "run=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=0" >> "$GITHUB_OUTPUT"
-            echo "Skipping training today (not a 3-day boundary)."
-          fi
-
       - name: Train model
-        if: steps.gate.outputs.run == '1'
         env:
           MODEL_PATH: "models/ensemble/manifest.json"
           LABEL_HORIZON_DAYS: "5"
