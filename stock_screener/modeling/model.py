@@ -217,7 +217,8 @@ def load_bundle(manifest_path: str | Path) -> dict[str, object]:
         return {"type": mtype, "ranker": None, "regressor_models": models, "regressor_weights": weights, "metadata": None}
 
     if mtype != "xgboost_dual_v1":
-        raise ValueError("Unsupported ensemble manifest type")    ranker_rel = manifest.get("ranker")
+        raise ValueError("Unsupported ensemble manifest type")
+    ranker_rel = manifest.get("ranker")
     reg_payload = manifest.get("regressor") or {}
     reg_models = reg_payload.get("models") or []
     reg_weights = reg_payload.get("weights")
