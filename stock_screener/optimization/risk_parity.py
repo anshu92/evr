@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 
-def _cap_weights(w: pd.Series, cap: float) -> pd.Series:
+def _cap_weights(w: pd.Series, cap: float, *, allow_cash: bool) -> pd.Series:
     cap = float(cap)
     if cap <= 0 or cap >= 1:
         return w / w.sum()
@@ -19,7 +19,10 @@ def _cap_weights(w: pd.Series, cap: float) -> pd.Series:
         if not under.any():
             break
         w.loc[under] = w.loc[under] + (w.loc[under] / float(w.loc[under].sum())) * excess
-    return w / float(w.sum())
+    if allow_cash:
+        return w
+    total = float(w.sum())
+    return w / total if total > 0 else w
 
 
 def compute_inverse_vol_weights(
@@ -46,12 +49,21 @@ def compute_inverse_vol_weights(
 
     inv = 1.0 / vol
     w = inv / float(inv.sum())
-    w = _cap_weights(w, float(weight_cap))
+    cap = float(weight_cap)
+    allow_cash = False
+    if 0 < cap < 1 and cap * len(w) < 1:
+        allow_cash = True
+        logger.warning(
+            "Weight cap %.3f with %s names implies max invested %.1f%%; leaving cash unallocated.",
+            cap,
+            len(w),
+            cap * len(w) * 100.0,
+        )
+    w = _cap_weights(w, cap, allow_cash=allow_cash)
 
     out = df.copy()
     out["weight"] = w
     out = out.sort_values("weight", ascending=False)
     logger.info("Computed weights: %s tickers (cap=%s)", len(out), weight_cap)
     return out
-
 

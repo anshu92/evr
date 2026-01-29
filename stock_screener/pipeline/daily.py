@@ -181,12 +181,18 @@ def run_daily(cfg: Config, logger) -> None:
     open_tickers = [p.ticker for p in state.positions if p.status == "OPEN"]
     holdings_features = screened.loc[screened.index.intersection(open_tickers)].copy()
     holdings_features = holdings_features.sort_values("score", ascending=False)
-    holdings_weights = compute_inverse_vol_weights(
-        features=holdings_features,
-        portfolio_size=len(holdings_features),
-        weight_cap=cfg.weight_cap,
-        logger=logger,
-    )
+    if holdings_features.empty:
+        holdings_weights = holdings_features.copy()
+        for col in ["weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]:
+            if col not in holdings_weights.columns:
+                holdings_weights[col] = pd.NA
+    else:
+        holdings_weights = compute_inverse_vol_weights(
+            features=holdings_features,
+            portfolio_size=len(holdings_features),
+            weight_cap=cfg.weight_cap,
+            logger=logger,
+        )
     # Attach current holdings sizing for reporting (shares + position value).
     shares_by_ticker = {p.ticker: int(p.shares) for p in state.positions if p.status == "OPEN"}
     holdings_weights = holdings_weights.copy()
@@ -208,4 +214,3 @@ def run_daily(cfg: Config, logger) -> None:
     # Persist metadata for debugging/auditing
     write_json(cache_dir / "last_run_meta.json", run_meta)
     logger.info("Wrote reports to %s", reports_dir.resolve())
-
