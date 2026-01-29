@@ -45,7 +45,7 @@ def compute_inverse_vol_weights(
     df = df.head(n).copy()
 
     vol = pd.to_numeric(df["vol_60d_ann"], errors="coerce")
-    vol = vol.replace(0.0, np.nan).dropna()
+    vol = vol.replace([0.0, np.inf, -np.inf], np.nan).dropna()
     df = df.loc[vol.index].copy()
     if df.empty:
         raise RuntimeError("No tickers with valid volatility for weighting")
@@ -59,7 +59,12 @@ def compute_inverse_vol_weights(
             logger.info("Applied alpha weighting using %s (floor=%s).", alpha_col, alpha_floor)
         else:
             logger.warning("Alpha column %s has no positive values; falling back to pure inverse-vol.", alpha_col)
-    w = inv / float(inv.sum())
+    inv_sum = float(inv.sum())
+    if not np.isfinite(inv_sum) or inv_sum <= 0:
+        logger.warning("Inverse-vol sum invalid (sum=%s); falling back to equal weights.", inv_sum)
+        inv = pd.Series(1.0, index=inv.index)
+        inv_sum = float(inv.sum())
+    w = inv / inv_sum
     cap = float(weight_cap)
     allow_cash = False
     if 0 < cap < 1 and cap * len(w) < 1:
