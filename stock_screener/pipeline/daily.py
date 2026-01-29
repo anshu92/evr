@@ -19,6 +19,7 @@ from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, read_json, write_json
 from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble
+from stock_screener.modeling.transform import normalize_features_cross_section
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
 
@@ -78,13 +79,14 @@ def run_daily(cfg: Config, logger) -> None:
     )
 
     if cfg.use_ml:
+        features_ml = normalize_features_cross_section(features, date_col=None)
         try:
             mp = Path(cfg.model_path)
             if mp.name.lower() == "manifest.json":
                 ensemble = load_ensemble(mp)
                 models, weights = ensemble
                 if models:
-                    features["pred_return"] = predict_ensemble(models, weights, features)
+                    features["pred_return"] = predict_ensemble(models, weights, features_ml)
                     logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(models))
                 # Try to load metadata from manifest parent
                 metadata_path = mp.parent / "metrics.json"
@@ -97,7 +99,7 @@ def run_daily(cfg: Config, logger) -> None:
             else:
                 model = load_model(cfg.model_path)
                 logger.info("Loaded ML model from %s", cfg.model_path)
-                features["pred_return"] = predict(model, features)
+                features["pred_return"] = predict(model, features_ml)
         except Exception as e:
             logger.warning("ML enabled but model could not be loaded/used: %s", e)
 
@@ -206,5 +208,4 @@ def run_daily(cfg: Config, logger) -> None:
     # Persist metadata for debugging/auditing
     write_json(cache_dir / "last_run_meta.json", run_meta)
     logger.info("Wrote reports to %s", reports_dir.resolve())
-
 

@@ -21,6 +21,7 @@ from stock_screener.modeling.model import (
     save_ensemble,
     save_model,
 )
+from stock_screener.modeling.transform import normalize_features_cross_section, winsorize_mad
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json
@@ -370,38 +371,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # CRITICAL: Cross-sectional winsorization and normalization
     # Financial returns are relative games - normalize within each date
     logger.info("Applying cross-sectional winsorization (MAD-based) and normalization...")
-    
-    def _winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:
-        """Clip extreme values using MAD (Median Absolute Deviation)."""
-        median = series.median()
-        mad = (series - median).abs().median()
-        if mad == 0 or pd.isna(mad):
-            return series
-        lower = median - n_mad * mad
-        upper = median + n_mad * mad
-        return series.clip(lower=lower, upper=upper)
-    
-    def _zscore(series: pd.Series) -> pd.Series:
-        """Z-score normalize within group."""
-        mu = series.mean()
-        sd = series.std()
-        if sd == 0 or pd.isna(sd):
-            return series * 0.0
-        return (series - mu) / sd
-    
-    # Winsorize and normalize features within each date (cross-sectional)
-    feature_cols_to_norm = [
-        col for col in FEATURE_COLUMNS 
-        if col in panel.columns and col not in ["sector_hash", "industry_hash", "is_tsx"]
-    ]
-    
-    for col in feature_cols_to_norm:
-        if panel[col].notna().sum() > 0:
-            panel[col] = panel.groupby("date")[col].transform(_winsorize_mad)
-            panel[col] = panel.groupby("date")[col].transform(_zscore)
-    
+    panel = normalize_features_cross_section(panel, date_col="date")
+
     # Also winsorize labels to remove extreme outliers (MAD-based)
-    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize_mad)
+    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(winsorize_mad)
 
 
     dates = pd.to_datetime(panel["date"]).dt.normalize().unique().tolist()
@@ -637,38 +610,10 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
     # CRITICAL: Cross-sectional winsorization and normalization
     # Financial returns are relative games - normalize within each date
     logger.info("Applying cross-sectional winsorization (MAD-based) and normalization...")
-    
-    def _winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:
-        """Clip extreme values using MAD (Median Absolute Deviation)."""
-        median = series.median()
-        mad = (series - median).abs().median()
-        if mad == 0 or pd.isna(mad):
-            return series
-        lower = median - n_mad * mad
-        upper = median + n_mad * mad
-        return series.clip(lower=lower, upper=upper)
-    
-    def _zscore(series: pd.Series) -> pd.Series:
-        """Z-score normalize within group."""
-        mu = series.mean()
-        sd = series.std()
-        if sd == 0 or pd.isna(sd):
-            return series * 0.0
-        return (series - mu) / sd
-    
-    # Winsorize and normalize features within each date (cross-sectional)
-    feature_cols_to_norm = [
-        col for col in FEATURE_COLUMNS 
-        if col in panel.columns and col not in ["sector_hash", "industry_hash", "is_tsx"]
-    ]
-    
-    for col in feature_cols_to_norm:
-        if panel[col].notna().sum() > 0:
-            panel[col] = panel.groupby("date")[col].transform(_winsorize_mad)
-            panel[col] = panel.groupby("date")[col].transform(_zscore)
-    
+    panel = normalize_features_cross_section(panel, date_col="date")
+
     # Also winsorize labels to remove extreme outliers (MAD-based)
-    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(_winsorize_mad)
+    panel["future_ret"] = panel.groupby("date")["future_ret"].transform(winsorize_mad)
 
 
     bundle = load_bundle(Path(cfg.model_path))
