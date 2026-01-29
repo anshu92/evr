@@ -42,7 +42,7 @@ class Config:
     take_profit_pct: float | None = None
 
     # Peak detection and partial exit settings
-    peak_detection_enabled: bool = False
+    peak_detection_enabled: bool = True
     peak_sell_portion_pct: float = 0.50
     peak_min_gain_pct: float | None = 0.10
     peak_min_holding_days: int = 2
@@ -126,7 +126,7 @@ class Config:
             take_profit_pct=(
                 _get_float("TAKE_PROFIT_PCT", 0.0) if os.getenv("TAKE_PROFIT_PCT") not in {None, ""} else None
             ),
-            peak_detection_enabled=os.getenv("PEAK_DETECTION_ENABLED", "0").strip() in {"1", "true", "True"},
+            peak_detection_enabled=os.getenv("PEAK_DETECTION_ENABLED", "1").strip() in {"1", "true", "True"},
             peak_sell_portion_pct=_get_float("PEAK_SELL_PORTION_PCT", 0.50),
             peak_min_gain_pct=(
                 _get_float("PEAK_MIN_GAIN_PCT", 0.0)

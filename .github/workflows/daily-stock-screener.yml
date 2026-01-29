@@ -142,6 +142,15 @@ jobs:
           # If the model is very confident, allow holding beyond 5 days up to the hard cap.
           EXTEND_HOLD_MIN_PRED_RETURN: "0.03"
           PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
+          # Peak detection and partial exit settings
+          PEAK_DETECTION_ENABLED: "1"
+          PEAK_SELL_PORTION_PCT: "0.50"
+          PEAK_MIN_GAIN_PCT: "0.10"
+          PEAK_MIN_HOLDING_DAYS: "2"
+          PEAK_PRED_RETURN_THRESHOLD: "-0.02"
+          PEAK_SCORE_PERCENTILE_DROP: "0.30"
+          PEAK_RSI_OVERBOUGHT: "70.0"
+          PEAK_ABOVE_MA_RATIO: "0.15"
         run: |
           python -m stock_screener.cli daily --log-level INFO
 
