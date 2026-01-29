@@ -11,3 +11,4 @@ optuna>=3.0.0
 rich>=13.0.0
 lxml>=4.9.0
 html5lib>=1.1
+pytest>=7.0.0

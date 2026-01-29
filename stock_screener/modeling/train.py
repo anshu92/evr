@@ -12,7 +12,7 @@ from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.fundamental_scores import add_fundamental_composites
-from stock_screener.modeling.eval import build_time_splits, evaluate_predictions
+from stock_screener.modeling.eval import build_time_splits, evaluate_predictions, evaluate_topn_returns
 from stock_screener.modeling.model import (
     FEATURE_COLUMNS,
     build_model,
@@ -272,6 +272,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         raise RuntimeError("No training panel built")
 
     horizon = int(cfg.label_horizon_days)
+    top_n = max(1, int(cfg.portfolio_size))
+    cost_bps = float(getattr(cfg, "trade_cost_bps", 0.0))
     # Shift by (horizon + 1) so predictions made with today's features predict tomorrow onward
     # This ensures we can act on predictions before market open
     panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
@@ -310,6 +312,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         temp["pred"] = pred
         return evaluate_predictions(temp, date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx")
 
+    def _topn_for_preds(df: pd.DataFrame, pred: pd.Series) -> dict[str, object]:
+        if df.empty:
+            return {
+                "summary": {
+                    "mean_ret": float("nan"),
+                    "std_ret": float("nan"),
+                    "ret_ir": float("nan"),
+                    "mean_net_ret": float("nan"),
+                    "std_net_ret": float("nan"),
+                    "net_ret_ir": float("nan"),
+                    "n_days": 0,
+                }
+            }
+        temp = df.copy()
+        temp["pred"] = pred
+        return evaluate_topn_returns(
+            temp, date_col="date", label_col="future_ret", pred_col="pred", top_n=top_n, cost_bps=cost_bps
+        )
+
 
     regressor_candidates = [
         {"max_depth": 6, "learning_rate": 0.03, "min_child_weight": 5},
@@ -332,8 +353,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 verbose=False,
             )
             preds = model.predict(val_df[FEATURE_COLUMNS])
-            metrics = _rank_ic_for_preds(val_df, pd.Series(preds, index=val_df.index))
-            scores.append(float(metrics["summary"]["mean_ic"]))
+            metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
+            scores.append(float(metrics["summary"]["mean_net_ret"]))
         return float(np.nanmean(scores)) if scores else float("nan")
 
     regressor_scores = {str(p): _eval_regressor_params(p) for p in regressor_candidates}
@@ -383,6 +404,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         reg_holdout_preds = preds.tolist()
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
+    reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
 
 
 
@@ -464,8 +486,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         },
         "regressor": {
             "params": best_regressor_params,
-            "cv_scores": regressor_scores,
+            "cv_metric": "mean_net_ret_topn",
+            "cv_scores_topn": regressor_scores,
+            "topn": {"top_n": int(top_n), "cost_bps": float(cost_bps)},
             "holdout": reg_holdout_metrics["summary"],
+            "holdout_topn": reg_holdout_topn["summary"],
         },
         "date_range": {
             "start": str(pd.to_datetime(panel["date"]).min().date()),
@@ -532,16 +557,43 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
     panel["future_ret"] = panel.groupby("date")["future_ret"].transform(winsorize_mad)
 
 
+    top_n = max(1, int(cfg.portfolio_size))
+    cost_bps = float(getattr(cfg, "trade_cost_bps", 0.0))
+
     bundle = load_bundle(Path(cfg.model_path))
     metrics: dict[str, object] = {"ranker": None, "regressor": None}
 
     if bundle.get("ranker") is not None:
         preds = predict_score(bundle["ranker"], panel)
-        metrics["ranker"] = evaluate_predictions(panel.assign(pred=preds), date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx")
+        rank_payload = evaluate_predictions(
+            panel.assign(pred=preds), date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx"
+        )
+        topn_payload = evaluate_topn_returns(
+            panel.assign(pred=preds),
+            date_col="date",
+            label_col="future_ret",
+            pred_col="pred",
+            top_n=top_n,
+            cost_bps=cost_bps,
+        )
+        rank_payload["topn"] = topn_payload
+        metrics["ranker"] = rank_payload
 
     reg_models = bundle.get("regressor_models") or []
     if reg_models:
         preds = predict_ensemble(reg_models, bundle.get("regressor_weights"), panel)
-        metrics["regressor"] = evaluate_predictions(panel.assign(pred=preds), date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx")
+        reg_payload = evaluate_predictions(
+            panel.assign(pred=preds), date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx"
+        )
+        topn_payload = evaluate_topn_returns(
+            panel.assign(pred=preds),
+            date_col="date",
+            label_col="future_ret",
+            pred_col="pred",
+            top_n=top_n,
+            cost_bps=cost_bps,
+        )
+        reg_payload["topn"] = topn_payload
+        metrics["regressor"] = reg_payload
 
     return metrics

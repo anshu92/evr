@@ -115,11 +115,13 @@ def run_daily(cfg: Config, logger) -> None:
     screened = scored.head(n).copy()
     logger.info("Screened universe: %s tickers (from %s after filters)", len(screened), len(scored))
 
+    alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
     target_weights = compute_inverse_vol_weights(
         features=screened,
         portfolio_size=cfg.portfolio_size,
         weight_cap=cfg.weight_cap,
         logger=logger,
+        alpha_col=alpha_col,
     )
 
     # Portfolio actions (stateful)
@@ -196,6 +198,7 @@ def run_daily(cfg: Config, logger) -> None:
             portfolio_size=len(holdings_features),
             weight_cap=cfg.weight_cap,
             logger=logger,
+            alpha_col=alpha_col,
         )
     # Attach current holdings sizing for reporting (shares + position value).
     shares_by_ticker = {p.ticker: int(p.shares) for p in state.positions if p.status == "OPEN"}

@@ -82,6 +82,39 @@ def compute_daily_rank_ic(
     return pd.DataFrame(rows)
 
 
+def compute_daily_topn_returns(
+    df: pd.DataFrame,
+    *,
+    date_col: str,
+    label_col: str,
+    pred_col: str,
+    top_n: int,
+    cost_bps: float = 0.0,
+) -> pd.DataFrame:
+    """Compute per-date top-N mean returns with optional per-day cost in bps."""
+
+    if df.empty:
+        return pd.DataFrame(columns=["date", "n", "mean_ret", "net_ret"])
+
+    frame = df[[date_col, label_col, pred_col]].copy()
+    frame[date_col] = pd.to_datetime(frame[date_col]).dt.normalize()
+    frame = frame.dropna(subset=[label_col, pred_col])
+
+    n = max(1, int(top_n))
+    cost = float(cost_bps) * 1e-4
+
+    rows: list[dict[str, float]] = []
+    for dt, grp in frame.groupby(date_col):
+        if len(grp) < 1:
+            continue
+        top = grp.sort_values(pred_col, ascending=False).head(n)
+        mean_ret = float(top[label_col].mean())
+        net_ret = float(mean_ret - cost)
+        rows.append({"date": dt, "n": float(len(top)), "mean_ret": mean_ret, "net_ret": net_ret})
+
+    return pd.DataFrame(rows)
+
+
 def summarize_rank_ic(daily_ic: pd.DataFrame) -> dict[str, float]:
     if daily_ic.empty:
         return {"mean_ic": float("nan"), "std_ic": float("nan"), "ic_ir": float("nan"), "n_days": 0}
@@ -89,6 +122,52 @@ def summarize_rank_ic(daily_ic: pd.DataFrame) -> dict[str, float]:
     std_ic = float(daily_ic["rank_ic"].std(ddof=0))
     ic_ir = float(mean_ic / std_ic) if std_ic > 0 else float("nan")
     return {"mean_ic": mean_ic, "std_ic": std_ic, "ic_ir": ic_ir, "n_days": int(len(daily_ic))}
+
+
+def summarize_topn_returns(daily_ret: pd.DataFrame) -> dict[str, float]:
+    if daily_ret.empty:
+        return {
+            "mean_ret": float("nan"),
+            "std_ret": float("nan"),
+            "ret_ir": float("nan"),
+            "mean_net_ret": float("nan"),
+            "std_net_ret": float("nan"),
+            "net_ret_ir": float("nan"),
+            "n_days": 0,
+        }
+    mean_ret = float(daily_ret["mean_ret"].mean())
+    std_ret = float(daily_ret["mean_ret"].std(ddof=0))
+    ret_ir = float(mean_ret / std_ret) if std_ret > 0 else float("nan")
+    mean_net = float(daily_ret["net_ret"].mean())
+    std_net = float(daily_ret["net_ret"].std(ddof=0))
+    net_ir = float(mean_net / std_net) if std_net > 0 else float("nan")
+    return {
+        "mean_ret": mean_ret,
+        "std_ret": std_ret,
+        "ret_ir": ret_ir,
+        "mean_net_ret": mean_net,
+        "std_net_ret": std_net,
+        "net_ret_ir": net_ir,
+        "n_days": int(len(daily_ret)),
+    }
+
+
+def evaluate_topn_returns(
+    df: pd.DataFrame,
+    *,
+    date_col: str,
+    label_col: str,
+    pred_col: str,
+    top_n: int,
+    cost_bps: float = 0.0,
+) -> dict[str, object]:
+    """Evaluate top-N realized returns across dates."""
+
+    daily = compute_daily_topn_returns(
+        df, date_col=date_col, label_col=label_col, pred_col=pred_col, top_n=top_n, cost_bps=cost_bps
+    )
+    summary = summarize_topn_returns(daily)
+    return {"summary": summary, "daily": daily}
 
 
 def evaluate_predictions(

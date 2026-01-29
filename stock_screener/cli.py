@@ -57,8 +57,14 @@ def main() -> int:
         regressor = metrics.get("regressor")
         if ranker:
             logger.info("Ranker IC summary: %s", ranker.get("summary"))
+            topn = ranker.get("topn", {}).get("summary") if isinstance(ranker, dict) else None
+            if topn:
+                logger.info("Ranker Top-N returns: %s", topn)
         if regressor:
             logger.info("Regressor IC summary: %s", regressor.get("summary"))
+            topn = regressor.get("topn", {}).get("summary") if isinstance(regressor, dict) else None
+            if topn:
+                logger.info("Regressor Top-N returns: %s", topn)
         return 0
 
     raise RuntimeError(f"Unknown cmd: {args.cmd}")
@@ -66,5 +72,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

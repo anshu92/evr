@@ -30,6 +30,7 @@ class Config:
     use_ml: bool = False
     model_path: str = "models/ensemble/manifest.json"
     label_horizon_days: int = 5
+    trade_cost_bps: float = 0.0
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
@@ -108,6 +109,7 @@ class Config:
             use_ml=os.getenv("USE_ML", "0").strip() in {"1", "true", "True"},
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
             label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 5) or 5,
+            trade_cost_bps=_get_float("TRADE_COST_BPS", 0.0),
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
             max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,
@@ -165,5 +167,4 @@ class Config:
             batch_size=_get_int("BATCH_SIZE", 200) or 200,
             yfinance_threads=os.getenv("YFINANCE_THREADS", "1").strip() not in {"0", "false", "False"},
         )
-
 

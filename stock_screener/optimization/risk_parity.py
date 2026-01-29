@@ -30,6 +30,9 @@ def compute_inverse_vol_weights(
     portfolio_size: int,
     weight_cap: float,
     logger,
+    *,
+    alpha_col: str | None = None,
+    alpha_floor: float = 0.0,
 ) -> pd.DataFrame:
     """Compute inverse-vol (risk parity style) weights from screened features."""
 
@@ -48,6 +51,14 @@ def compute_inverse_vol_weights(
         raise RuntimeError("No tickers with valid volatility for weighting")
 
     inv = 1.0 / vol
+    if alpha_col and alpha_col in df.columns:
+        alpha = pd.to_numeric(df[alpha_col], errors="coerce").reindex(vol.index)
+        alpha = alpha.clip(lower=float(alpha_floor)).fillna(0.0)
+        if float(alpha.sum()) > 0:
+            inv = inv * alpha
+            logger.info("Applied alpha weighting using %s (floor=%s).", alpha_col, alpha_floor)
+        else:
+            logger.warning("Alpha column %s has no positive values; falling back to pure inverse-vol.", alpha_col)
     w = inv / float(inv.sum())
     cap = float(weight_cap)
     allow_cash = False
@@ -66,4 +77,3 @@ def compute_inverse_vol_weights(
     out = out.sort_values("weight", ascending=False)
     logger.info("Computed weights: %s tickers (cap=%s)", len(out), weight_cap)
     return out
-
