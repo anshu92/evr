@@ -11,6 +11,7 @@ from stock_screener.config import Config
 from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
+from stock_screener.features.fundamental_scores import add_fundamental_composites
 from stock_screener.modeling.eval import build_time_splits, evaluate_predictions
 from stock_screener.modeling.model import (
     FEATURE_COLUMNS,
@@ -69,6 +70,7 @@ def _build_panel_features(
         vol = prices[(t, "Volume")].astype(float) if (t, "Volume") in prices.columns else pd.Series(index=idx, dtype=float)
         is_tsx = _is_tsx_ticker(t)
         fx_series = 1.0 if is_tsx else fx
+        fx_factor = float(fx_series.iloc[-1]) if not is_tsx and hasattr(fx_series, "iloc") and len(fx_series) else 1.0
         close_cad = close * fx_series
 
         rets = close_cad.pct_change(fill_method=None)
@@ -132,7 +134,12 @@ def _build_panel_features(
             sector_hash = _hash_to_float(str(row.get("sector"))) if row.get("sector") else np.nan
             industry_hash = _hash_to_float(str(row.get("industry"))) if row.get("industry") else np.nan
             market_cap = row.get("marketCap")
-            log_market_cap = float(np.log10(market_cap)) if market_cap and float(market_cap) > 0 else np.nan
+            market_cap_cad = None
+            if market_cap is not None:
+                market_cap_cad = float(market_cap)
+                if not is_tsx and fx_factor and not pd.isna(fx_factor):
+                    market_cap_cad = market_cap_cad * float(fx_factor)
+            log_market_cap = float(np.log10(market_cap_cad)) if market_cap_cad and float(market_cap_cad) > 0 else np.nan
             beta = float(row.get("beta")) if row.get("beta") is not None else np.nan
             # Extract new fundamental data
             trailing_pe = float(row.get("trailingPE")) if row.get("trailingPE") is not None else np.nan
@@ -229,98 +236,7 @@ def _build_panel_features(
             if col in panel.columns:
                 panel[out_col] = panel.groupby("date")[col].rank(pct=True)
         
-        # Compute composite fundamental features
-        def _safe_zscore_panel(series: pd.Series) -> pd.Series:
-            """Z-score with NaN handling for panel data."""
-            clean = series.dropna()
-            if len(clean) == 0:
-                return pd.Series(0.0, index=series.index)
-            mu = clean.mean()
-            sd = clean.std()
-            if sd == 0 or pd.isna(sd):
-                return pd.Series(0.0, index=series.index)
-            return (series - mu) / sd
-        
-        # Value score: inverse of valuation ratios (per date)
-        def _compute_value_score(group):
-            value_components = []
-            if "trailing_pe" in group.columns:
-                inv_pe = 1.0 / group["trailing_pe"].replace([0, np.inf, -np.inf], np.nan)
-                if inv_pe.notna().sum() > 1:  # Need at least 2 values
-                    value_components.append(_safe_zscore_panel(inv_pe))
-            if "price_to_book" in group.columns:
-                inv_pb = 1.0 / group["price_to_book"].replace([0, np.inf, -np.inf], np.nan)
-                if inv_pb.notna().sum() > 1:
-                    value_components.append(_safe_zscore_panel(inv_pb))
-            if "price_to_sales" in group.columns:
-                inv_ps = 1.0 / group["price_to_sales"].replace([0, np.inf, -np.inf], np.nan)
-                if inv_ps.notna().sum() > 1:
-                    value_components.append(_safe_zscore_panel(inv_ps))
-            if value_components:
-                result = pd.concat(value_components, axis=1).mean(axis=1, skipna=True)
-                return result.fillna(0.0)
-            return pd.Series(0.0, index=group.index)
-        
-        panel["value_score"] = panel.groupby("date", group_keys=False).apply(_compute_value_score)
-        
-        # Quality score: profitability and efficiency (per date)
-        def _compute_quality_score(group):
-            quality_components = []
-            if "return_on_equity" in group.columns and group["return_on_equity"].notna().sum() > 1:
-                quality_components.append(_safe_zscore_panel(group["return_on_equity"]))
-            if "operating_margins" in group.columns and group["operating_margins"].notna().sum() > 1:
-                quality_components.append(_safe_zscore_panel(group["operating_margins"]))
-            if "profit_margins" in group.columns and group["profit_margins"].notna().sum() > 1:
-                quality_components.append(_safe_zscore_panel(group["profit_margins"]))
-            if quality_components:
-                result = pd.concat(quality_components, axis=1).mean(axis=1, skipna=True)
-                return result.fillna(0.0)
-            return pd.Series(0.0, index=group.index)
-        
-        panel["quality_score"] = panel.groupby("date", group_keys=False).apply(_compute_quality_score)
-        
-        # Growth score: revenue and earnings growth (per date)
-        def _compute_growth_score(group):
-            growth_components = []
-            if "revenue_growth" in group.columns and group["revenue_growth"].notna().sum() > 1:
-                growth_components.append(_safe_zscore_panel(group["revenue_growth"]))
-            if "earnings_growth" in group.columns and group["earnings_growth"].notna().sum() > 1:
-                growth_components.append(_safe_zscore_panel(group["earnings_growth"]))
-            if growth_components:
-                result = pd.concat(growth_components, axis=1).mean(axis=1, skipna=True)
-                return result.fillna(0.0)
-            return pd.Series(0.0, index=group.index)
-        
-        panel["growth_score"] = panel.groupby("date", group_keys=False).apply(_compute_growth_score)
-        
-        # Surprise factors: analyst expectations vs current price
-        if "target_mean_price" in panel.columns and "last_close_cad" in panel.columns:
-            panel["pe_discount"] = (panel["target_mean_price"] - panel["last_close_cad"]) / panel["last_close_cad"].replace(0, np.nan)
-            panel["pe_discount"] = panel["pe_discount"].replace([np.inf, -np.inf], np.nan)
-        else:
-            panel["pe_discount"] = 0.0
-        
-        # Fundamental momentum (simplified)
-        if "earnings_quarterly_growth" in panel.columns:
-            panel["roc_growth"] = panel["earnings_quarterly_growth"]
-        else:
-            panel["roc_growth"] = 0.0
-        
-        # Interaction features
-        if "value_score" in panel.columns and "ret_120d" in panel.columns:
-            panel["value_momentum"] = panel["value_score"] * panel["ret_120d"]
-        else:
-            panel["value_momentum"] = 0.0
-        
-        if "vol_60d_ann" in panel.columns and "log_market_cap" in panel.columns:
-            panel["vol_size"] = panel["vol_60d_ann"] * panel["log_market_cap"]
-        else:
-            panel["vol_size"] = 0.0
-        
-        if "quality_score" in panel.columns and "growth_score" in panel.columns:
-            panel["quality_growth"] = panel["quality_score"] * panel["growth_score"]
-        else:
-            panel["quality_growth"] = 0.0
+        panel = add_fundamental_composites(panel, date_col="date")
     
     return panel
 

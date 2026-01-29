@@ -14,7 +14,7 @@ from stock_screener.data.prices import download_price_history
 from stock_screener.features.technical import compute_features
 from stock_screener.optimization.risk_parity import compute_inverse_vol_weights
 from stock_screener.reporting.render import render_reports
-from stock_screener.screening.screener import screen_universe
+from stock_screener.screening.screener import score_universe
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, read_json, write_json
@@ -103,13 +103,17 @@ def run_daily(cfg: Config, logger) -> None:
         except Exception as e:
             logger.warning("ML enabled but model could not be loaded/used: %s", e)
 
-    screened = screen_universe(
+    scored = score_universe(
         features=features,
         min_price_cad=cfg.min_price_cad,
         min_avg_dollar_volume_cad=cfg.min_avg_dollar_volume_cad,
-        top_n=cfg.top_n,
         logger=logger,
     )
+    n = int(cfg.top_n)
+    if n <= 0:
+        n = 50
+    screened = scored.head(n).copy()
+    logger.info("Screened universe: %s tickers (from %s after filters)", len(screened), len(scored))
 
     target_weights = compute_inverse_vol_weights(
         features=screened,
@@ -122,7 +126,7 @@ def run_daily(cfg: Config, logger) -> None:
     # Use full `features` for exits so we can manage holdings even if they are not in today's top-N.
     prices_cad = features["last_close_cad"].astype(float)
     pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
-    score = screened["score"].astype(float) if "score" in screened.columns else None
+    score = scored["score"].astype(float) if "score" in scored.columns else None
     state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
     # Migration safeguard:
     # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,

@@ -13,14 +13,13 @@ def _zscore(s: pd.Series) -> pd.Series:
     return (s - mu) / sd
 
 
-def screen_universe(
+def score_universe(
     features: pd.DataFrame,
     min_price_cad: float,
     min_avg_dollar_volume_cad: float,
-    top_n: int,
     logger,
 ) -> pd.DataFrame:
-    """Filter and rank tickers by a robust multi-factor score."""
+    """Compute scores for all eligible tickers (no top-N truncation)."""
 
     df = features.copy()
 
@@ -61,12 +60,29 @@ def screen_universe(
 
     df["score"] = score
     df = df.sort_values("score", ascending=False)
+    return df
+
+
+def screen_universe(
+    features: pd.DataFrame,
+    min_price_cad: float,
+    min_avg_dollar_volume_cad: float,
+    top_n: int,
+    logger,
+) -> pd.DataFrame:
+    """Filter and rank tickers by a robust multi-factor score."""
+
+    scored = score_universe(
+        features=features,
+        min_price_cad=min_price_cad,
+        min_avg_dollar_volume_cad=min_avg_dollar_volume_cad,
+        logger=logger,
+    )
 
     n = int(top_n)
     if n <= 0:
         n = 50
-    out = df.head(n).copy()
-    logger.info("Screened universe: %s tickers (from %s after filters)", len(out), len(df))
+    out = scored.head(n).copy()
+    logger.info("Screened universe: %s tickers (from %s after filters)", len(out), len(scored))
     return out
-
 

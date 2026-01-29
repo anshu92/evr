@@ -7,6 +7,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from stock_screener.features.fundamental_scores import add_fundamental_composites
 
 def _is_tsx_ticker(ticker: str) -> bool:
     t = ticker.upper()
@@ -120,6 +121,12 @@ def compute_features(
         except Exception:
             vol = pd.Series(dtype=float)
 
+        # Enforce feature lookback window.
+        if feature_lookback_days and int(feature_lookback_days) > 0 and len(close) > int(feature_lookback_days):
+            close = close.iloc[-int(feature_lookback_days) :]
+            if vol is not None:
+                vol = vol.reindex(close.index)
+
         is_tsx = _is_tsx_ticker(t)
         fx_series = 1.0 if is_tsx else fx.reindex(close.index).ffill()
         fx_factor = float(fx_series.iloc[-1]) if not is_tsx and not fx_series.empty else 1.0
@@ -219,6 +226,12 @@ def compute_features(
             recommendation_mean = float(row.get("recommendationMean")) if row.get("recommendationMean") is not None else float("nan")
             num_analyst_opinions = float(row.get("numberOfAnalystOpinions")) if row.get("numberOfAnalystOpinions") is not None else float("nan")
 
+        # Normalize market cap to CAD for cross-market comparability.
+        market_cap_cad = market_cap
+        if not is_tsx and market_cap and not pd.isna(market_cap):
+            if fx_factor and not pd.isna(fx_factor):
+                market_cap_cad = market_cap * float(fx_factor)
+
         rows.append(
             {
                 "ticker": t,
@@ -244,7 +257,7 @@ def compute_features(
                 "dist_52w_high": dist_52w_high,
                 "dist_52w_low": dist_52w_low,
                 "vol_anom_30d": vol_anom_30d,
-                "log_market_cap": float(np.log10(market_cap)) if market_cap and market_cap > 0 else float("nan"),
+                "log_market_cap": float(np.log10(market_cap_cad)) if market_cap_cad and market_cap_cad > 0 else float("nan"),
                 "beta": beta,
                 "sector_hash": _hash_to_float(str(sector)) if sector else float("nan"),
                 "industry_hash": _hash_to_float(str(industry)) if industry else float("nan"),
@@ -290,93 +303,9 @@ def compute_features(
         if col in df.columns:
             df[out_col] = df[col].rank(pct=True)
 
-    # Composite fundamental features
-    def _safe_zscore(series: pd.Series) -> pd.Series:
-        """Z-score with NaN handling."""
-        mu = series.mean()
-        sd = series.std()
-        if sd == 0 or pd.isna(sd):
-            return pd.Series(0.0, index=series.index)
-        return (series - mu) / sd
-
-    # Value score: inverse of valuation ratios (lower is better)
-    value_components = []
-    if "trailing_pe" in df.columns:
-        inv_pe = 1.0 / df["trailing_pe"].replace([0, np.inf, -np.inf], np.nan)
-        if inv_pe.notna().sum() > 0:
-            value_components.append(_safe_zscore(inv_pe))
-    if "price_to_book" in df.columns:
-        inv_pb = 1.0 / df["price_to_book"].replace([0, np.inf, -np.inf], np.nan)
-        if inv_pb.notna().sum() > 0:
-            value_components.append(_safe_zscore(inv_pb))
-    if "price_to_sales" in df.columns:
-        inv_ps = 1.0 / df["price_to_sales"].replace([0, np.inf, -np.inf], np.nan)
-        if inv_ps.notna().sum() > 0:
-            value_components.append(_safe_zscore(inv_ps))
-    
-    if value_components:
-        df["value_score"] = pd.concat(value_components, axis=1).mean(axis=1)
-    else:
-        df["value_score"] = 0.0
-
-    # Quality score: profitability and efficiency
-    quality_components = []
-    if "return_on_equity" in df.columns:
-        quality_components.append(_safe_zscore(df["return_on_equity"]))
-    if "operating_margins" in df.columns:
-        quality_components.append(_safe_zscore(df["operating_margins"]))
-    if "profit_margins" in df.columns:
-        quality_components.append(_safe_zscore(df["profit_margins"]))
-    
-    if quality_components:
-        df["quality_score"] = pd.concat(quality_components, axis=1).mean(axis=1)
-    else:
-        df["quality_score"] = 0.0
-
-    # Growth score: revenue and earnings growth
-    growth_components = []
-    if "revenue_growth" in df.columns:
-        growth_components.append(_safe_zscore(df["revenue_growth"]))
-    if "earnings_growth" in df.columns:
-        growth_components.append(_safe_zscore(df["earnings_growth"]))
-    
-    if growth_components:
-        df["growth_score"] = pd.concat(growth_components, axis=1).mean(axis=1)
-    else:
-        df["growth_score"] = 0.0
-
-    # Surprise factors: analyst expectations vs current price
-    if "target_mean_price" in df.columns and "last_close_cad" in df.columns:
-        df["pe_discount"] = (df["target_mean_price"] - df["last_close_cad"]) / df["last_close_cad"].replace(0, np.nan)
-        df["pe_discount"] = df["pe_discount"].replace([np.inf, -np.inf], np.nan)
-    else:
-        df["pe_discount"] = 0.0
-
-    # Fundamental momentum: quarterly earnings growth change
-    if "earnings_quarterly_growth" in df.columns:
-        df["roc_growth"] = df["earnings_quarterly_growth"]  # Simplified - would need historical data for true ROC
-    else:
-        df["roc_growth"] = 0.0
-
-    # Interaction features
-    if "value_score" in df.columns and "ret_120d" in df.columns:
-        df["value_momentum"] = df["value_score"] * df["ret_120d"]
-    else:
-        df["value_momentum"] = 0.0
-
-    if "vol_60d_ann" in df.columns and "log_market_cap" in df.columns:
-        df["vol_size"] = df["vol_60d_ann"] * df["log_market_cap"]
-    else:
-        df["vol_size"] = 0.0
-
-    if "quality_score" in df.columns and "growth_score" in df.columns:
-        df["quality_growth"] = df["quality_score"] * df["growth_score"]
-    else:
-        df["quality_growth"] = 0.0
+    df = add_fundamental_composites(df, date_col=None)
 
     # Keep the most recent observations per ticker (should already be unique).
     df = df.drop_duplicates(subset=["ticker"]).set_index("ticker").sort_index()
     logger.info("Computed features: %s tickers", len(df))
     return df
-
-
