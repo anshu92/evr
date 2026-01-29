@@ -154,11 +154,20 @@ def run_daily(cfg: Config, logger) -> None:
         max_positions=cfg.portfolio_size,
         stop_loss_pct=cfg.stop_loss_pct,
         take_profit_pct=cfg.take_profit_pct,
+        peak_detection_enabled=cfg.peak_detection_enabled,
+        peak_sell_portion_pct=cfg.peak_sell_portion_pct,
+        peak_min_gain_pct=cfg.peak_min_gain_pct,
+        peak_min_holding_days=cfg.peak_min_holding_days,
+        peak_pred_return_threshold=cfg.peak_pred_return_threshold,
+        peak_score_percentile_drop=cfg.peak_score_percentile_drop,
+        peak_rsi_overbought=cfg.peak_rsi_overbought,
+        peak_above_ma_ratio=cfg.peak_above_ma_ratio,
         logger=logger,
     )
-    exit_actions = pm.apply_exits(state, prices_cad=prices_cad, pred_return=pred_return, score=score)
+    exit_actions = pm.apply_exits(state, prices_cad=prices_cad, pred_return=pred_return, score=score, features=features)
     if exit_actions:
-        logger.info("Exited %s position(s) (time/stop/target).", len([a for a in exit_actions if a.action == "SELL"]))
+        sells = len([a for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")])
+        logger.info("Exited %s position(s) (time/stop/target/peak).", sells)
 
     trade_plan = pm.build_trade_plan(
         state=state,

@@ -41,6 +41,14 @@ class PortfolioManager:
         max_positions: int,
         stop_loss_pct: float | None,
         take_profit_pct: float | None,
+        peak_detection_enabled: bool,
+        peak_sell_portion_pct: float,
+        peak_min_gain_pct: float | None,
+        peak_min_holding_days: int,
+        peak_pred_return_threshold: float | None,
+        peak_score_percentile_drop: float | None,
+        peak_rsi_overbought: float | None,
+        peak_above_ma_ratio: float | None,
         logger,
     ) -> None:
         self.state_path = state_path
@@ -51,6 +59,14 @@ class PortfolioManager:
         self.max_positions = max(1, int(max_positions))
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.peak_detection_enabled = peak_detection_enabled
+        self.peak_sell_portion_pct = peak_sell_portion_pct
+        self.peak_min_gain_pct = peak_min_gain_pct
+        self.peak_min_holding_days = max(0, int(peak_min_holding_days))
+        self.peak_pred_return_threshold = peak_pred_return_threshold
+        self.peak_score_percentile_drop = peak_score_percentile_drop
+        self.peak_rsi_overbought = peak_rsi_overbought
+        self.peak_above_ma_ratio = peak_above_ma_ratio
         self.logger = logger
 
     def _positions_by_ticker(self, state: PortfolioState) -> dict[str, Position]:
@@ -79,6 +95,105 @@ class PortfolioManager:
             price_cad=float(price_cad),
             days_held=days_held,
         )
+
+    def _detect_peak(
+        self,
+        p: Position,
+        *,
+        current_price: float,
+        pred_return: float | None,
+        score: float | None,
+        score_percentile: float | None,
+        rsi_14: float | None,
+        ma20_ratio: float | None,
+        days_held: int,
+    ) -> tuple[bool, str]:
+        """Detect if position has peaked using combination of signals."""
+        if not self.peak_detection_enabled:
+            return False, ""
+        
+        # Must meet minimum requirements
+        if days_held < self.peak_min_holding_days:
+            return False, ""
+        
+        if self.peak_min_gain_pct is not None and p.entry_price > 0:
+            gain = (current_price - p.entry_price) / p.entry_price
+            if gain < self.peak_min_gain_pct:
+                return False, ""
+        
+        # Check multiple peak signals (combination approach)
+        signals = []
+        
+        # Signal 1: Negative ML prediction (reversal expected)
+        if (pred_return is not None and 
+            self.peak_pred_return_threshold is not None and
+            not pd.isna(pred_return) and
+            pred_return < self.peak_pred_return_threshold):
+            signals.append("NEG_PRED")
+        
+        # Signal 2: Score dropped significantly vs universe
+        if (score_percentile is not None and 
+            self.peak_score_percentile_drop is not None and
+            not pd.isna(score_percentile) and
+            score_percentile < self.peak_score_percentile_drop):
+            signals.append("SCORE_DROP")
+        
+        # Signal 3: Technical overbought (RSI)
+        if (rsi_14 is not None and 
+            self.peak_rsi_overbought is not None and
+            not pd.isna(rsi_14) and
+            rsi_14 > self.peak_rsi_overbought):
+            signals.append("RSI_OB")
+        
+        # Signal 4: Price extended above moving average
+        if (ma20_ratio is not None and 
+            self.peak_above_ma_ratio is not None and
+            not pd.isna(ma20_ratio) and
+            ma20_ratio > self.peak_above_ma_ratio):
+            signals.append("MA_EXT")
+        
+        # Require at least 2 signals for peak confirmation
+        if len(signals) >= 2:
+            return True, "+".join(signals)
+        
+        return False, ""
+
+    def _sell_partial_position(
+        self,
+        state: PortfolioState,
+        p: Position,
+        *,
+        price_cad: float,
+        reason: str,
+        days_held: int,
+        sell_portion: float,
+    ) -> tuple[TradeAction, Position]:
+        """Sell a portion of position, keeping the rest open."""
+        shares_to_sell = max(1, int(p.shares * sell_portion))
+        shares_remaining = p.shares - shares_to_sell
+        
+        # Don't do partial sell if it would leave us with 0 shares
+        if shares_remaining <= 0:
+            shares_to_sell = p.shares
+            shares_remaining = 0
+        
+        # Execute partial sell
+        proceeds = float(price_cad) * float(shares_to_sell)
+        state.cash_cad = float(state.cash_cad) + float(proceeds)
+        
+        # Update position to reduced shares
+        p.shares = shares_remaining
+        
+        action = TradeAction(
+            ticker=p.ticker,
+            action="SELL_PARTIAL",
+            reason=f"PEAK_{reason}",
+            shares=shares_to_sell,
+            price_cad=float(price_cad),
+            days_held=days_held,
+        )
+        
+        return action, p
 
     def _compute_pnl_snapshot(self, state: PortfolioState, *, prices_cad: pd.Series) -> dict[str, Any]:
         realized = 0.0
@@ -147,6 +262,7 @@ class PortfolioManager:
         *,
         pred_return: pd.Series | None = None,
         score: pd.Series | None = None,
+        features: pd.DataFrame | None = None,
     ) -> list[TradeAction]:
         actions: list[TradeAction] = []
         now = _utcnow()
@@ -211,6 +327,63 @@ class PortfolioManager:
             if self.take_profit_pct is not None and ret >= abs(float(self.take_profit_pct)):
                 actions.append(self._sell_position(state, p, price_cad=px, reason="TAKE_PROFIT", days_held=days))
                 continue
+
+            # Peak detection with partial exit (only for winning positions)
+            if self.peak_detection_enabled and p.entry_price > 0:
+                gain = px / float(p.entry_price) - 1.0
+                if gain > 0:  # Only check peaks for winning positions
+                    # Get prediction for this ticker
+                    pr = None
+                    if pred_return is not None:
+                        pr_val = float(pred_return.get(p.ticker, float("nan")))
+                        if not pd.isna(pr_val):
+                            pr = pr_val
+                    
+                    # Get score and compute percentile
+                    sc = None
+                    sc_pct = None
+                    if score is not None:
+                        sc_val = float(score.get(p.ticker, float("nan")))
+                        if not pd.isna(sc_val):
+                            sc = sc_val
+                            # Compute percentile: rank score against all available scores
+                            all_scores = score.dropna()
+                            if len(all_scores) > 0:
+                                sc_pct = (all_scores < sc_val).sum() / len(all_scores)
+                    
+                    # Get technical indicators from features
+                    rsi = None
+                    ma20_r = None
+                    if features is not None and p.ticker in features.index:
+                        if "rsi_14" in features.columns:
+                            rsi_val = float(features.loc[p.ticker, "rsi_14"])
+                            if not pd.isna(rsi_val):
+                                rsi = rsi_val
+                        if "ma20_ratio" in features.columns:
+                            ma_val = float(features.loc[p.ticker, "ma20_ratio"])
+                            if not pd.isna(ma_val):
+                                ma20_r = ma_val
+                    
+                    is_peak, peak_reason = self._detect_peak(
+                        p,
+                        current_price=px,
+                        pred_return=pr,
+                        score=sc,
+                        score_percentile=sc_pct,
+                        rsi_14=rsi,
+                        ma20_ratio=ma20_r,
+                        days_held=days,
+                    )
+                    
+                    if is_peak and p.shares >= 2:  # Only do partial sell if we have at least 2 shares
+                        action, remaining_pos = self._sell_partial_position(
+                            state, p, price_cad=px, reason=peak_reason,
+                            days_held=days, sell_portion=self.peak_sell_portion_pct
+                        )
+                        actions.append(action)
+                        if remaining_pos.shares > 0:
+                            keep.append(remaining_pos)
+                        continue
 
             keep.append(p)
 

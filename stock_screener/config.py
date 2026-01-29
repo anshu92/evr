@@ -41,6 +41,16 @@ class Config:
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
 
+    # Peak detection and partial exit settings
+    peak_detection_enabled: bool = False
+    peak_sell_portion_pct: float = 0.50
+    peak_min_gain_pct: float | None = 0.10
+    peak_min_holding_days: int = 2
+    peak_pred_return_threshold: float | None = -0.02
+    peak_score_percentile_drop: float | None = 0.30
+    peak_rsi_overbought: float | None = 70.0
+    peak_above_ma_ratio: float | None = 0.15
+
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
     base_currency: str = "CAD"
@@ -115,6 +125,34 @@ class Config:
             ),
             take_profit_pct=(
                 _get_float("TAKE_PROFIT_PCT", 0.0) if os.getenv("TAKE_PROFIT_PCT") not in {None, ""} else None
+            ),
+            peak_detection_enabled=os.getenv("PEAK_DETECTION_ENABLED", "0").strip() in {"1", "true", "True"},
+            peak_sell_portion_pct=_get_float("PEAK_SELL_PORTION_PCT", 0.50),
+            peak_min_gain_pct=(
+                _get_float("PEAK_MIN_GAIN_PCT", 0.0)
+                if os.getenv("PEAK_MIN_GAIN_PCT") not in {None, ""}
+                else None
+            ),
+            peak_min_holding_days=_get_int("PEAK_MIN_HOLDING_DAYS", 2) or 2,
+            peak_pred_return_threshold=(
+                _get_float("PEAK_PRED_RETURN_THRESHOLD", 0.0)
+                if os.getenv("PEAK_PRED_RETURN_THRESHOLD") not in {None, ""}
+                else None
+            ),
+            peak_score_percentile_drop=(
+                _get_float("PEAK_SCORE_PERCENTILE_DROP", 0.0)
+                if os.getenv("PEAK_SCORE_PERCENTILE_DROP") not in {None, ""}
+                else None
+            ),
+            peak_rsi_overbought=(
+                _get_float("PEAK_RSI_OVERBOUGHT", 0.0)
+                if os.getenv("PEAK_RSI_OVERBOUGHT") not in {None, ""}
+                else None
+            ),
+            peak_above_ma_ratio=(
+                _get_float("PEAK_ABOVE_MA_RATIO", 0.0)
+                if os.getenv("PEAK_ABOVE_MA_RATIO") not in {None, ""}
+                else None
             ),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
