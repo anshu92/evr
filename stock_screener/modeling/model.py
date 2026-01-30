@@ -40,6 +40,18 @@ FEATURE_COLUMNS = [
     "fx_ret_5d",
     "fx_ret_20d",
     "is_tsx",
+    # Fundamental features
+    "log_market_cap",
+    "beta",
+    # Fundamental composite scores
+    "value_score",
+    "quality_score",
+    "growth_score",
+    "pe_discount",
+    "roc_growth",
+    "value_momentum",
+    "vol_size",
+    "quality_growth",
 ]
 
 
