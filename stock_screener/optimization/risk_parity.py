@@ -76,6 +76,9 @@ def compute_inverse_vol_weights(
             cap * len(w) * 100.0,
         )
     w = _cap_weights(w, cap, allow_cash=allow_cash)
+    w = w.fillna(0.0)
+    if w.sum() > 0:
+        w = w / w.sum()
 
     out = df.copy()
     out["weight"] = w

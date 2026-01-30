@@ -9,21 +9,30 @@ import pandas as pd
 
 def _fmt_money(x: float) -> str:
     try:
-        return f"{float(x):,.2f}"
+        v = float(x)
+        if v != v:
+            return "N/A"
+        return f"{v:,.2f}"
     except Exception:
         return "N/A"
 
 
 def _fmt_pct(x: float) -> str:
     try:
-        return f"{float(x) * 100.0:+.2f}%"
+        v = float(x)
+        if v != v:  # NaN
+            return "N/A"
+        return f"{v * 100.0:+.2f}%"
     except Exception:
         return "N/A"
 
 
 def _fmt_num(x: float) -> str:
     try:
-        return f"{float(x):,.3f}"
+        v = float(x)
+        if v != v:
+            return "N/A"
+        return f"{v:,.3f}"
     except Exception:
         return "N/A"
 
