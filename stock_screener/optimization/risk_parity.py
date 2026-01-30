@@ -18,7 +18,14 @@ def _cap_weights(w: pd.Series, cap: float, *, allow_cash: bool) -> pd.Series:
         under = ~over
         if not under.any():
             break
-        w.loc[under] = w.loc[under] + (w.loc[under] / float(w.loc[under].sum())) * excess
+        under_sum = float(w.loc[under].sum())
+        if under_sum > 0:
+            w.loc[under] = w.loc[under] + (w.loc[under] / under_sum) * excess
+        else:
+            # Under-cap names all had weight 0 (alpha col zero/NaN). Distribute excess equally to avoid 0/0 → NaN.
+            n_under = int(under.sum())
+            if n_under > 0:
+                w.loc[under] = excess / n_under
     if allow_cash:
         return w
     total = float(w.sum())
