@@ -690,6 +690,18 @@ class PortfolioManager:
                 shares = min(affordable_shares, max(1, target_shares))
                 if shares <= 0:
                     continue
+                
+                # Get pred_return and pred_peak_days from weights BEFORE creating position
+                pred_ret = None
+                pred_peak_days = None
+                try:
+                    if "pred_return" in weights.columns:
+                        pred_ret = float(weights.loc[t, "pred_return"])
+                    if "pred_peak_days" in weights.columns:
+                        pred_peak_days = float(weights.loc[t, "pred_peak_days"])
+                except Exception:
+                    pass
+                
                 cost = float(px) * float(shares)
                 state.cash_cad = float(state.cash_cad) - float(cost)
                 pos = Position(
@@ -699,24 +711,20 @@ class PortfolioManager:
                     shares=int(shares),
                     stop_loss_pct=self.stop_loss_pct,
                     take_profit_pct=self.take_profit_pct,
+                    entry_pred_peak_days=pred_peak_days,  # Store prediction at entry
                 )
                 state.positions.append(pos)
-                # Get pred_return from weights if available
-                pred_ret = None
-                try:
-                    if "pred_return" in weights.columns:
-                        pred_ret = float(weights.loc[t, "pred_return"])
-                except Exception:
-                    pass
-                # Compute expected sell date/strategy
-                expected_sell = None
-                if self.twr_optimization:
-                    expected_sell = "TWR Optimized"
-                elif self.peak_based_exit:
-                    expected_sell = "Peak Detection"
-                elif self.max_holding_days:
-                    sell_dt = now + timedelta(days=self.max_holding_days)
+                
+                # Compute expected sell date based on predicted peak
+                if pred_peak_days is not None and pred_peak_days > 0:
+                    # Use ML-predicted peak day
+                    sell_dt = now + timedelta(days=int(pred_peak_days))
                     expected_sell = sell_dt.strftime("%Y-%m-%d")
+                else:
+                    # Fallback to max holding days
+                    sell_dt = now + timedelta(days=self.max_holding_days or 5)
+                    expected_sell = sell_dt.strftime("%Y-%m-%d") + " (max)"
+                
                 actions.append(
                     TradeAction(
                         ticker=t, action="BUY", reason="TOP_RANKED", shares=int(shares), 
@@ -738,22 +746,31 @@ class PortfolioManager:
             p = open_by_ticker.get(t)
             px = float(prices_cad.get(t, float("nan")))
             days = p.days_held(now) if p else None
-            # Get pred_return from weights if available
+            # Get pred_return and pred_peak_days from weights if available
             pred_ret = None
+            pred_peak_days = None
             try:
                 if "pred_return" in weights.columns:
                     pred_ret = float(weights.loc[t, "pred_return"])
+                if "pred_peak_days" in weights.columns:
+                    pred_peak_days = float(weights.loc[t, "pred_peak_days"])
             except Exception:
                 pass
-            # Compute expected sell date/strategy from entry
-            expected_sell = None
-            if self.twr_optimization:
-                expected_sell = "TWR Optimized"
-            elif self.peak_based_exit:
-                expected_sell = "Peak Detection"
-            elif p and self.max_holding_days:
-                sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
+            
+            # Compute expected sell date based on predicted peak
+            # Note: pred_peak_days is today's prediction, so sell = now + pred_peak_days
+            if pred_peak_days is not None and pred_peak_days > 0:
+                # Use ML-predicted peak day (from today, since that's when prediction was made)
+                sell_dt = now + timedelta(days=int(pred_peak_days))
                 expected_sell = sell_dt.strftime("%Y-%m-%d")
+            elif p and self.max_holding_days:
+                # Fallback to max holding days from entry
+                sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
+                expected_sell = sell_dt.strftime("%Y-%m-%d") + " (max)"
+            else:
+                sell_dt = now + timedelta(days=self.max_holding_days or 5)
+                expected_sell = sell_dt.strftime("%Y-%m-%d") + " (max)"
+            
             actions.append(
                 TradeAction(
                     ticker=t, action="HOLD", reason="IN_TARGET", shares=p.shares if p else 0, 

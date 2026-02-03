@@ -9,6 +9,11 @@ import pandas as pd
 import xgboost as xgb
 
 try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
+
+try:
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)  # Reduce noise
 except ImportError:
@@ -392,11 +397,52 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         raise RuntimeError("No training panel built")
 
     horizon = int(cfg.label_horizon_days)
+    max_horizon = int(getattr(cfg, "max_holding_days_hard", 10))  # Extended horizon for peak detection
     top_n = max(1, int(cfg.portfolio_size))
     cost_bps = float(getattr(cfg, "trade_cost_bps", 0.0))
     # Shift by (horizon + 1) so predictions made with today's features predict tomorrow onward
     # This ensures we can act on predictions before market open
     panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
+    
+    # PEAK DETECTION: Find the day of maximum price within the extended horizon
+    # This allows the model to predict optimal sell timing
+    def _compute_peak_day(group):
+        """For each row, find the day (1 to max_horizon) when max price occurs."""
+        prices = group["last_close_cad"].values
+        n = len(prices)
+        peak_days = np.full(n, np.nan)
+        
+        for i in range(n - max_horizon):
+            # Look at prices from day i+1 to i+max_horizon
+            future_prices = prices[i+1:i+1+max_horizon]
+            if len(future_prices) > 0 and not np.all(np.isnan(future_prices)):
+                # Find day of max (1-indexed: day 1 = tomorrow)
+                peak_idx = np.nanargmax(future_prices)
+                peak_days[i] = peak_idx + 1  # 1 = tomorrow, 2 = day after, etc.
+        
+        return pd.Series(peak_days, index=group.index)
+    
+    panel["days_to_peak"] = panel.groupby("ticker", group_keys=False).apply(_compute_peak_day)
+    
+    # Also compute the return at peak for evaluation
+    def _compute_peak_return(group):
+        """For each row, compute the return at the peak day."""
+        prices = group["last_close_cad"].values
+        n = len(prices)
+        peak_returns = np.full(n, np.nan)
+        
+        for i in range(n - max_horizon):
+            future_prices = prices[i+1:i+1+max_horizon]
+            if len(future_prices) > 0 and not np.all(np.isnan(future_prices)):
+                peak_price = np.nanmax(future_prices)
+                current_price = prices[i]
+                if current_price > 0:
+                    peak_returns[i] = peak_price / current_price - 1.0
+        
+        return pd.Series(peak_returns, index=group.index)
+    
+    panel["peak_return"] = panel.groupby("ticker", group_keys=False).apply(_compute_peak_return)
+    logger.info("Computed peak detection targets: days_to_peak (1-%d), peak_return", max_horizon)
     
     # Compute market benchmark return for each date using MARKET-CAP WEIGHTING
     # This is more realistic than equal-weighted (approximates SPY/TSX benchmark)
@@ -901,6 +947,74 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     for rel, mtype in zip(reg_rel_paths, model_types):
         reg_models.append(load_model(model_dir / rel, mtype))
 
+    # =========================================================================
+    # PEAK TIMING MODEL: Predict days_to_peak (1 to max_horizon)
+    # =========================================================================
+    peak_model_path = None
+    peak_metrics = {}
+    
+    # Filter rows with valid days_to_peak
+    peak_train = train_df[train_df["days_to_peak"].notna()].copy()
+    peak_holdout = holdout_df[holdout_df["days_to_peak"].notna()].copy() if not holdout_df.empty else pd.DataFrame()
+    
+    if len(peak_train) > 1000 and lgb is not None:
+        logger.info("Training peak timing model on %d samples...", len(peak_train))
+        
+        # Use LightGBM for peak prediction (regression on days 1-10)
+        peak_model = lgb.LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.03,
+            max_depth=4,
+            num_leaves=15,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_lambda=3.0,
+            min_child_samples=50,
+            random_state=42,
+            verbose=-1,
+        )
+        
+        peak_model.fit(
+            peak_train[selected_features], 
+            peak_train["days_to_peak"].astype(float)
+        )
+        
+        # Save peak model
+        peak_rel = "peak_model.txt"
+        save_model(peak_model, model_dir / peak_rel)
+        peak_model_path = peak_rel
+        logger.info("Trained peak timing model")
+        
+        # Evaluate on holdout
+        if len(peak_holdout) > 100:
+            peak_preds = peak_model.predict(peak_holdout[selected_features])
+            actual_days = peak_holdout["days_to_peak"].values
+            
+            # Compute MAE (mean absolute error in days)
+            mae = np.mean(np.abs(peak_preds - actual_days))
+            
+            # Compute correlation (do predictions correlate with actual peak days?)
+            from scipy.stats import spearmanr
+            corr, _ = spearmanr(peak_preds, actual_days)
+            
+            # Compute accuracy within N days
+            within_1_day = np.mean(np.abs(peak_preds - actual_days) <= 1)
+            within_2_days = np.mean(np.abs(peak_preds - actual_days) <= 2)
+            
+            peak_metrics = {
+                "mae_days": float(mae),
+                "correlation": float(corr) if not np.isnan(corr) else 0.0,
+                "within_1_day": float(within_1_day),
+                "within_2_days": float(within_2_days),
+                "n_samples": len(peak_holdout),
+            }
+            logger.info(
+                "Peak timing holdout: MAE=%.2f days, corr=%.3f, within_1d=%.1f%%, within_2d=%.1f%%",
+                mae, corr if not np.isnan(corr) else 0, within_1_day * 100, within_2_days * 100
+            )
+    else:
+        logger.info("Insufficient samples for peak timing model (%d < 1000)", len(peak_train))
+
 
 
     # Compute feature importance from first XGBoost model
@@ -1218,19 +1332,30 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "walk_forward_validation": walk_forward_results,  # Multi-period robustness
         "feature_importance": feature_importance,
         # Calibration map for realistic prediction magnitudes
-        "prediction_calibration": build_calibration_map(panel["future_ret"].dropna(), n_quantiles=20),
+        # Use label_col (future_alpha or future_ret) for calibration to match training target
+        "prediction_calibration": build_calibration_map(panel[label_col].dropna(), n_quantiles=20),
         # Target encodings for inference
         "target_encodings": {
             "sector": sector_encodings,
             "industry": industry_encodings,
             "global_mean": global_mean,
         },
+        # Peak timing model info
+        "peak_model": peak_model_path,
+        "peak_metrics": peak_metrics,
+        "max_horizon_days": max_horizon,
     }
     metadata_rel = "metrics.json"
     write_json(model_dir / metadata_rel, metadata)
 
-    # Save the ensemble manifest with model types
-    save_ensemble(cfg.model_path, model_rel_paths=reg_rel_paths, model_types=model_types, weights=None)
+    # Save the ensemble manifest with model types and peak model
+    save_ensemble(
+        cfg.model_path, 
+        model_rel_paths=reg_rel_paths, 
+        model_types=model_types, 
+        weights=None,
+        peak_model_path=peak_model_path,
+    )
     logger.info("Saved model bundle manifest to %s", cfg.model_path)
     return TrainResult(n_samples=int(len(panel)), n_tickers=int(panel["ticker"].nunique()), horizon_days=horizon)
 

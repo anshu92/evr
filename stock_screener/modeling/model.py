@@ -337,6 +337,29 @@ def predict_ensemble_with_uncertainty(
     }, index=features.index)
 
 
+def predict_peak_days(
+    peak_model, 
+    features: pd.DataFrame,
+    feature_cols: list[str] | None = None,
+    min_days: int = 1,
+    max_days: int = 10,
+) -> pd.Series:
+    """Predict optimal sell day (days from now until expected peak).
+    
+    Returns predicted days to peak, clipped to valid range.
+    """
+    if peak_model is None:
+        # Default to mid-horizon if no model
+        return pd.Series(5.0, index=features.index, name="pred_peak_days")
+    
+    preds = predict(peak_model, features, feature_cols).values.astype(float)
+    
+    # Clip to valid range and round to nearest day
+    preds = np.clip(np.round(preds), min_days, max_days)
+    
+    return pd.Series(preds, index=features.index, name="pred_peak_days")
+
+
 def save_model(model, path: str | Path) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -358,8 +381,14 @@ def save_model(model, path: str | Path) -> None:
         booster.save_model(str(p))
 
 
-def save_ensemble(manifest_path: str | Path, model_rel_paths: list[str], model_types: list[str] | None = None, weights: list[float] | None = None) -> None:
-    """Save ensemble manifest with model paths and types."""
+def save_ensemble(
+    manifest_path: str | Path, 
+    model_rel_paths: list[str], 
+    model_types: list[str] | None = None, 
+    weights: list[float] | None = None,
+    peak_model_path: str | None = None,
+) -> None:
+    """Save ensemble manifest with model paths, types, and peak model."""
     p = Path(manifest_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -367,6 +396,7 @@ def save_ensemble(manifest_path: str | Path, model_rel_paths: list[str], model_t
         "models": model_rel_paths,
         "model_types": model_types or ["xgboost"] * len(model_rel_paths),
         "weights": weights,
+        "peak_model": peak_model_path,  # Optional peak timing model
     }
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -405,26 +435,38 @@ def load_model(path: str | Path, model_type: str = "xgboost"):
         return booster
 
 
-def load_ensemble(manifest_path: str | Path) -> tuple[list, list[float] | None]:
+def load_ensemble(manifest_path: str | Path) -> tuple[list, list[float] | None, object | None]:
+    """Load ensemble models and optional peak model.
+    
+    Returns (models, weights, peak_model) tuple.
+    """
     mp = Path(manifest_path)
     manifest = json.loads(mp.read_text(encoding="utf-8"))
     manifest_type = manifest.get("type")
+    base = mp.parent
+    
+    # Load peak model if present
+    peak_model = None
+    peak_rel = manifest.get("peak_model")
+    if peak_rel:
+        try:
+            peak_model = load_model(base / peak_rel, "lightgbm")
+        except Exception:
+            pass  # Peak model is optional
     
     # Support both old and new formats
     if manifest_type == "xgboost_ensemble_v1":
         _require_xgb()
         model_rel = manifest.get("models") or []
         weights = manifest.get("weights")
-        base = mp.parent
         models = [load_model(base / rel, "xgboost") for rel in model_rel]
-        return models, weights
+        return models, weights, peak_model
     elif manifest_type == "mixed_ensemble_v1":
         model_rel = manifest.get("models") or []
         model_types = manifest.get("model_types") or ["xgboost"] * len(model_rel)
         weights = manifest.get("weights")
-        base = mp.parent
         models = [load_model(base / rel, mtype) for rel, mtype in zip(model_rel, model_types)]
-        return models, weights
+        return models, weights, peak_model
     else:
         raise ValueError(f"Unsupported ensemble manifest type: {manifest_type}")
 

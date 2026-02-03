@@ -21,7 +21,7 @@ from stock_screener.utils import Universe, ensure_dir, read_json, write_json, su
 
 # Suppress known external library warnings
 suppress_external_warnings()
-from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty
+from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty, predict_peak_days
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
@@ -125,8 +125,7 @@ def run_daily(cfg: Config, logger) -> None:
             features_ml = normalize_features_cross_section(features, date_col=None)
             
             if mp.name.lower() == "manifest.json":
-                ensemble = load_ensemble(mp)
-                models, weights = ensemble
+                models, weights, peak_model = load_ensemble(mp)
                 if models:
                     # Use uncertainty-aware predictions with selected features
                     pred_df = predict_ensemble_with_uncertainty(
@@ -149,6 +148,21 @@ def run_daily(cfg: Config, logger) -> None:
                     
                     features["pred_uncertainty"] = pred_df["pred_uncertainty"]
                     features["pred_confidence"] = pred_df["pred_confidence"]
+                    
+                    # Predict peak timing (days until optimal sell)
+                    max_horizon = model_metadata.get("max_horizon_days", 10) if model_metadata else 10
+                    features["pred_peak_days"] = predict_peak_days(
+                        peak_model, features_ml, feature_cols=selected_features,
+                        min_days=1, max_days=max_horizon
+                    )
+                    if peak_model:
+                        logger.info(
+                            "Peak timing predictions: mean=%.1f days, range=[%.0f, %.0f]",
+                            features["pred_peak_days"].mean(),
+                            features["pred_peak_days"].min(),
+                            features["pred_peak_days"].max(),
+                        )
+                    
                     logger.info(
                         "ML predictions: mean=%.4f, confidence range=[%.3f, %.3f]",
                         features["pred_return"].mean(),
@@ -465,11 +479,15 @@ def run_daily(cfg: Config, logger) -> None:
         sells = len([a for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")])
         logger.info("Exited %s position(s) (time/stop/target/peak).", sells)
 
-    # Add pred_return to target_weights so it can be shown in email
+    # Add pred_return and pred_peak_days to target_weights for email reporting
     if "pred_return" in screened.columns:
         for t in target_weights.index:
             if t in screened.index:
                 target_weights.loc[t, "pred_return"] = screened.loc[t, "pred_return"]
+    if "pred_peak_days" in screened.columns:
+        for t in target_weights.index:
+            if t in screened.index:
+                target_weights.loc[t, "pred_peak_days"] = screened.loc[t, "pred_peak_days"]
     
     trade_plan = pm.build_trade_plan(
         state=state,
