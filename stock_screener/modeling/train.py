@@ -687,13 +687,33 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # XGBRanker needs group sizes (number of samples per query/date)
     train_groups = None
     val_groups = None
+    train_rank_labels = None
+    val_rank_labels = None
     if use_ranking:
         train_df = train_df.sort_values("date")  # Sort by date for grouping
         train_groups = train_df.groupby("date").size().values
+        
+        # Convert continuous returns to integer relevance grades (0-4)
+        # XGBRanker requires non-negative integer labels
+        def returns_to_grades(returns: pd.Series, n_grades: int = 5) -> pd.Series:
+            """Convert returns to integer relevance grades per cross-section."""
+            # Use quantiles to assign grades 0-4 (0=worst, 4=best)
+            grades = pd.qcut(returns.rank(method="first"), q=n_grades, labels=False, duplicates="drop")
+            return grades.fillna(0).astype(int)
+        
+        # Apply per-date to maintain cross-sectional ranking
+        train_rank_labels = train_df.groupby("date")[label_col].transform(
+            lambda x: returns_to_grades(x, n_grades=5)
+        ).astype(int)
+        
         if not val_df.empty:
             val_df = val_df.sort_values("date")
             val_groups = val_df.groupby("date").size().values
-        logger.info("Using LTR objective with %d training groups (dates)", len(train_groups))
+            val_rank_labels = val_df.groupby("date")[label_col].transform(
+                lambda x: returns_to_grades(x, n_grades=5)
+            ).astype(int)
+        
+        logger.info("Using LTR objective with %d training groups (dates), labels as grades 0-4", len(train_groups))
     
     objective_type = "LTR (rank)" if use_ranking else "regression"
     logger.info(
@@ -731,18 +751,18 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 n_jobs=0,
                 random_state=seed,
             )
-            # Recompute groups if features changed (same data, just fewer columns)
-            if not val_df.empty and val_groups is not None:
+            # Use integer rank labels for XGBRanker
+            if not val_df.empty and val_groups is not None and val_rank_labels is not None:
                 m.fit(
                     train_df[current_features],
-                    train_df[label_col].astype(float),
+                    train_rank_labels,
                     group=train_groups,
-                    eval_set=[(val_df[current_features], val_df[label_col].astype(float))],
+                    eval_set=[(val_df[current_features], val_rank_labels)],
                     eval_group=[val_groups],
                     verbose=False,
                 )
             else:
-                m.fit(train_df[current_features], train_df[label_col].astype(float), group=train_groups)
+                m.fit(train_df[current_features], train_rank_labels, group=train_groups)
         else:
             # Use XGBRegressor for regression
             m = build_model(random_state=seed)
