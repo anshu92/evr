@@ -185,6 +185,12 @@ class Config:
                 return default
             return float(raw)
 
+        def _get_bool(name: str, default: bool) -> bool:
+            raw = os.getenv(name)
+            if raw is None or raw.strip() == "":
+                return default
+            return raw.lower() in ("true", "1", "yes", "on")
+
         def _get_str(name: str, default: str) -> str:
             raw = os.getenv(name)
             if raw is None or raw.strip() == "":

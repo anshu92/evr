@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 
@@ -16,7 +16,7 @@ def _utcnow() -> datetime:
 @dataclass(frozen=True)
 class TradeAction:
     ticker: str
-    action: str  # BUY | SELL | HOLD
+    action: str  # BUY | SELL | SELL_PARTIAL | HOLD
     reason: str
     shares: int
     price_cad: float
