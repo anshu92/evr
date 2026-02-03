@@ -54,6 +54,36 @@ FEATURE_COLUMNS = [
     "quality_growth",
 ]
 
+# Technical features only (no fundamentals) - use for training to avoid lookahead bias
+TECHNICAL_FEATURES_ONLY = [
+    "last_close_cad",
+    "avg_dollar_volume_cad",
+    "ret_5d",
+    "ret_10d",
+    "ret_20d",
+    "ret_60d",
+    "ret_120d",
+    "ret_accel_20_120",
+    "vol_20d_ann",
+    "vol_60d_ann",
+    "vol_ratio_20_60",
+    "rsi_14",
+    "ma20_ratio",
+    "ma50_ratio",
+    "ma200_ratio",
+    "drawdown_60d",
+    "dist_52w_high",
+    "dist_52w_low",
+    "vol_anom_30d",
+    "rank_ret_20d",
+    "rank_ret_60d",
+    "rank_vol_60d",
+    "rank_avg_dollar_volume",
+    "fx_ret_5d",
+    "fx_ret_20d",
+    "is_tsx",
+]
+
 
 def _require_xgb() -> None:
     if xgb is None:  # pragma: no cover
@@ -104,9 +134,18 @@ def build_ranker(random_state: int = 42):
 
 def _coerce_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
+    missing = []
     for c in FEATURE_COLUMNS:
         if c not in x.columns:
             x[c] = np.nan
+            missing.append(c)
+    
+    # Log warning if features are missing
+    if missing:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning("Missing %d feature columns (filled with NaN): %s", len(missing), missing[:10])
+    
     # Convert bool to int for sklearn
     if "is_tsx" in x.columns:
         x["is_tsx"] = x["is_tsx"].astype(int, errors="ignore")

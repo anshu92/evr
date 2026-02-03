@@ -16,11 +16,11 @@ _CACHE_TTL_DAYS = 7
 _MAX_WORKERS = 4
 
 
-def _is_fresh(path: Path) -> bool:
+def _is_fresh(path: Path, ttl_days: int = 7) -> bool:
     if not path.exists():
         return False
     age = datetime.now(tz=timezone.utc) - datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    return age <= timedelta(days=_CACHE_TTL_DAYS)
+    return age <= timedelta(days=ttl_days)
 
 
 def _safe_info_value(info: dict[str, Any], key: str) -> Any:
@@ -66,12 +66,28 @@ def _build_payload(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fetch_payload(ticker: str) -> dict[str, Any]:
-    info = yf.Ticker(ticker).info
-    return _build_payload(info)
+def _fetch_payload(ticker: str, max_retries: int = 2) -> dict[str, Any]:
+    """Fetch fundamental data for a ticker with retry logic."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            info = yf.Ticker(ticker).info
+            return _build_payload(info)
+        except ConnectionError as e:
+            if attempt < max_retries:
+                from time import sleep
+                sleep(1.0 * attempt)  # 1s, 2s
+            else:
+                raise ConnectionError(f"Failed to fetch fundamentals for {ticker} after {max_retries} attempts") from e
+        except KeyError as e:
+            # KeyError usually means invalid ticker or API change
+            raise KeyError(f"Invalid ticker or missing data for {ticker}") from e
+        except Exception as e:
+            # Other exceptions - don't retry
+            raise RuntimeError(f"Failed to fetch fundamentals for {ticker}: {str(e)}") from e
+    return {}  # Should never reach here
 
 
-def fetch_fundamentals(tickers: list[str], *, cache_dir: Path, logger) -> pd.DataFrame:
+def fetch_fundamentals(tickers: list[str], *, cache_dir: Path, cache_ttl_days: int = 7, logger) -> pd.DataFrame:
     """Fetch minimal fundamentals with caching."""
 
     out_rows: list[dict[str, Any]] = []
@@ -88,10 +104,14 @@ def fetch_fundamentals(tickers: list[str], *, cache_dir: Path, logger) -> pd.Dat
         path = base / f"{t}.json"
         payload: dict[str, Any] | None = None
 
-        if _is_fresh(path):
+        if _is_fresh(path, ttl_days=cache_ttl_days):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except json.JSONDecodeError as e:
+                logger.warning("Invalid JSON in cache for %s: %s", t, str(e))
+                payload = None
+            except OSError as e:
+                logger.warning("Failed to read cache for %s: %s", t, str(e))
                 payload = None
 
         if payload is not None:
@@ -108,6 +128,12 @@ def fetch_fundamentals(tickers: list[str], *, cache_dir: Path, logger) -> pd.Dat
                 payload: dict[str, Any] = {}
                 try:
                     payload = future.result()
+                except ConnectionError as exc:
+                    logger.error("Connection error fetching fundamentals for %s: %s", t, exc)
+                    payload = {}
+                except KeyError as exc:
+                    logger.warning("Invalid ticker or missing data for %s: %s", t, exc)
+                    payload = {}
                 except Exception as exc:
                     logger.warning("Could not fetch fundamentals for %s: %s", t, exc)
                     payload = {}

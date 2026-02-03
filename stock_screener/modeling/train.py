@@ -6,6 +6,7 @@ import hashlib
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 
 from stock_screener.config import Config
 from stock_screener.data.fx import fetch_usdcad
@@ -15,8 +16,10 @@ from stock_screener.features.fundamental_scores import add_fundamental_composite
 from stock_screener.modeling.eval import build_time_splits, evaluate_predictions, evaluate_topn_returns
 from stock_screener.modeling.model import (
     FEATURE_COLUMNS,
+    TECHNICAL_FEATURES_ONLY,
     build_model,
     load_bundle,
+    load_model,
     predict_ensemble,
     predict_score,
     save_ensemble,
@@ -243,6 +246,15 @@ def _build_panel_features(
 
 def train_and_save(cfg: Config, logger) -> TrainResult:
     """Train an ensemble of ML models and write manifest to cfg.model_path."""
+    
+    # Choose feature set based on config
+    # Use technical features only to avoid fundamental data lookahead bias
+    feature_cols = TECHNICAL_FEATURES_ONLY if not cfg.use_fundamentals_in_training else FEATURE_COLUMNS
+    logger.info(
+        "Using %s features for training (fundamentals=%s)",
+        len(feature_cols),
+        cfg.use_fundamentals_in_training,
+    )
 
     data_cache_dir = ensure_dir(cfg.data_cache_dir)
 
@@ -266,7 +278,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         logger=logger,
     )
 
-    fundamentals = fetch_fundamentals(tickers=tickers, cache_dir=data_cache_dir, logger=logger)
+    fundamentals = fetch_fundamentals(
+        tickers=tickers,
+        cache_dir=data_cache_dir,
+        cache_ttl_days=cfg.fundamentals_cache_ttl_days,
+        logger=logger,
+    )
     panel = _build_panel_features(prices=prices, fx_usdcad=fx, fundamentals=fundamentals)
     if panel.empty:
         raise RuntimeError("No training panel built")
@@ -293,10 +310,26 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
     # Also winsorize labels to remove extreme outliers (MAD-based)
     panel["future_ret"] = panel.groupby("date")["future_ret"].transform(winsorize_mad)
+    
+    # Validate that required features exist
+    missing_features = [c for c in feature_cols if c not in panel.columns]
+    if missing_features:
+        logger.error("Missing %d required features: %s", len(missing_features), missing_features[:20])
+        raise ValueError(f"Missing required features in training data: {missing_features[:10]}")
+    
+    # Check for features with all NaN values
+    nan_features = [c for c in feature_cols if panel[c].isna().all()]
+    if nan_features:
+        logger.warning("Features with all NaN values: %s", nan_features)
 
 
     dates = pd.to_datetime(panel["date"]).dt.normalize().unique().tolist()
-    splits, holdout = build_time_splits(dates, embargo_days=horizon)
+    splits, holdout = build_time_splits(
+        dates, 
+        n_splits=cfg.train_cv_splits,
+        val_window=cfg.train_val_window_days,
+        embargo_days=cfg.train_embargo_days,
+    )
     val_dates = splits[-1].val_dates if splits else []
 
     def _subset_by_dates(dates_list: list[pd.Timestamp]) -> pd.DataFrame:
@@ -347,12 +380,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             model = build_model(random_state=42)
             model.set_params(**params, early_stopping_rounds=50)
             model.fit(
-                train_df[FEATURE_COLUMNS],
+                train_df[feature_cols],
                 train_df["future_ret"].astype(float),
-                eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
+                eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
                 verbose=False,
             )
-            preds = model.predict(val_df[FEATURE_COLUMNS])
+            preds = model.predict(val_df[feature_cols])
             metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
             scores.append(float(metrics["summary"]["mean_net_ret"]))
         return float(np.nanmean(scores)) if scores else float("nan")
@@ -366,7 +399,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
 
 
-    seeds = [7, 13, 21, 42, 73, 99, 123]
+    # Use configured ensemble seeds or default
+    seeds = cfg.train_ensemble_seeds if cfg.train_ensemble_seeds else [7, 13, 21, 42, 73, 99, 123]
     model_dir = Path(cfg.model_path).parent
     model_dir.mkdir(parents=True, exist_ok=True)
     reg_rel_paths: list[str] = []
@@ -382,13 +416,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         m.set_params(**best_regressor_params, early_stopping_rounds=50)
         if not val_df.empty:
             m.fit(
-                train_df[FEATURE_COLUMNS],
+                train_df[feature_cols],
                 train_df["future_ret"].astype(float),
-                eval_set=[(val_df[FEATURE_COLUMNS], val_df["future_ret"].astype(float))],
+                eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
                 verbose=False,
             )
         else:
-            m.fit(train_df[FEATURE_COLUMNS], train_df["future_ret"].astype(float))
+            m.fit(train_df[feature_cols], train_df["future_ret"].astype(float))
         rel = f"regressor_seed_{s}.json"
         save_model(m, model_dir / rel)
         reg_rel_paths.append(rel)
@@ -397,9 +431,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     if not holdout_df.empty:
         preds = np.zeros(len(holdout_df), dtype=float)
         for rel in reg_rel_paths:
-            model = build_model()
-            model.load_model(str(model_dir / rel))
-            preds += model.predict(holdout_df[FEATURE_COLUMNS]).astype(float)
+            model = load_model(model_dir / rel)
+            preds += model.predict(xgb.DMatrix(holdout_df[feature_cols])).astype(float)
         preds = preds / float(len(reg_rel_paths))
         reg_holdout_preds = preds.tolist()
 
@@ -411,11 +444,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Compute feature importance from first regressor
     feature_importance = {}
     if reg_rel_paths:
-        first_model = build_model()
-        first_model.load_model(str(model_dir / reg_rel_paths[0]))
-        # Use get_booster().get_score() for XGBRegressor
+        first_model = load_model(model_dir / reg_rel_paths[0])
+        # Use get_score() for xgb.Booster
         try:
-            importance = first_model.get_booster().get_score(importance_type="gain")
+            importance = first_model.get_score(importance_type="gain")
             feature_importance = {k: float(v) for k, v in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]}
             logger.info("Top 10 features by gain: %s", list(feature_importance.keys())[:10])
         except Exception as e:
@@ -532,7 +564,12 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
         logger=logger,
     )
 
-    fundamentals = fetch_fundamentals(tickers=tickers, cache_dir=data_cache_dir, logger=logger)
+    fundamentals = fetch_fundamentals(
+        tickers=tickers,
+        cache_dir=data_cache_dir,
+        cache_ttl_days=cfg.fundamentals_cache_ttl_days,
+        logger=logger,
+    )
     panel = _build_panel_features(prices=prices, fx_usdcad=fx, fundamentals=fundamentals)
     if panel.empty:
         raise RuntimeError("No evaluation panel built")

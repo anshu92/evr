@@ -68,7 +68,12 @@ def run_daily(cfg: Config, logger) -> None:
         logger=logger,
     )
 
-    fundamentals = fetch_fundamentals(tickers=universe.tickers, cache_dir=data_cache_dir, logger=logger)
+    fundamentals = fetch_fundamentals(
+        tickers=universe.tickers,
+        cache_dir=data_cache_dir,
+        cache_ttl_days=cfg.fundamentals_cache_ttl_days,
+        logger=logger,
+    )
     features = compute_features(
         prices=prices,
         fx_usdcad=fx,

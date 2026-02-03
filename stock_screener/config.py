@@ -31,6 +31,14 @@ class Config:
     model_path: str = "models/ensemble/manifest.json"
     label_horizon_days: int = 5
     trade_cost_bps: float = 0.0
+    
+    # Training configuration
+    use_fundamentals_in_training: bool = False  # Set to False to avoid lookahead bias
+    train_ensemble_seeds: list[int] | None = None  # Random seeds for ensemble (default: [7, 13, 21, 42, 73, 99, 123])
+    train_cv_splits: int = 3
+    train_val_window_days: int = 60
+    train_embargo_days: int = 5  # Should match label_horizon_days
+    fundamentals_cache_ttl_days: int = 7
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
@@ -110,6 +118,12 @@ class Config:
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
             label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 5) or 5,
             trade_cost_bps=_get_float("TRADE_COST_BPS", 0.0),
+            use_fundamentals_in_training=os.getenv("USE_FUNDAMENTALS_IN_TRAINING", "0").strip() in {"1", "true", "True"},
+            train_ensemble_seeds=None,  # Use default in train.py
+            train_cv_splits=_get_int("TRAIN_CV_SPLITS", 3) or 3,
+            train_val_window_days=_get_int("TRAIN_VAL_WINDOW_DAYS", 60) or 60,
+            train_embargo_days=_get_int("TRAIN_EMBARGO_DAYS", 5) or 5,
+            fundamentals_cache_ttl_days=_get_int("FUNDAMENTALS_CACHE_TTL_DAYS", 7) or 7,
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
             max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,

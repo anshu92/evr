@@ -293,6 +293,7 @@ def compute_features(
     if df.empty:
         raise RuntimeError("No features computed (empty)")
 
+    # Cross-sectional ranking (percentile ranks)
     rank_map = {
         "ret_20d": "rank_ret_20d",
         "ret_60d": "rank_ret_60d",
@@ -303,6 +304,10 @@ def compute_features(
         if col in df.columns:
             df[out_col] = df[col].rank(pct=True)
 
+    # Add fundamental composite scores
+    # Note: date_col=None is correct here since compute_features() produces single-date snapshots.
+    # Z-scoring across all tickers for the current date IS cross-sectional normalization.
+    # This is consistent with training which uses date_col="date" for multi-date panels.
     df = add_fundamental_composites(df, date_col=None)
 
     # Keep the most recent observations per ticker (should already be unique).
