@@ -106,7 +106,8 @@ def run_daily(cfg: Config, logger) -> None:
                         pred_df["pred_confidence"].max(),
                     )
                     logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(models))
-                # Try to load metadata from manifest parent
+                
+                # Try to load metadata from manifest parent (do this regardless of prediction success)
                 metadata_path = mp.parent / "metrics.json"
                 if metadata_path.is_file():
                     run_meta["model"] = {
@@ -114,12 +115,29 @@ def run_daily(cfg: Config, logger) -> None:
                         "metadata_path": str(metadata_path),
                         "metadata": read_json(metadata_path),
                     }
+                    logger.info("Loaded model metadata from %s", metadata_path)
+                else:
+                    logger.warning("Model metadata not found at %s", metadata_path)
             else:
                 model = load_model(cfg.model_path)
                 logger.info("Loaded ML model from %s", cfg.model_path)
                 features["pred_return"] = predict(model, features_ml)
         except Exception as e:
             logger.warning("ML enabled but model could not be loaded/used: %s", e)
+            # Still try to load metadata even if prediction fails
+            try:
+                mp = Path(cfg.model_path)
+                if mp.exists() and mp.name.lower() == "manifest.json":
+                    metadata_path = mp.parent / "metrics.json"
+                    if metadata_path.is_file():
+                        run_meta["model"] = {
+                            "manifest_path": str(mp),
+                            "metadata_path": str(metadata_path),
+                            "metadata": read_json(metadata_path),
+                        }
+                        logger.info("Loaded model metadata despite prediction failure")
+            except Exception as meta_e:
+                logger.warning("Could not load model metadata: %s", meta_e)
 
     scored = score_universe(
         features=features,
