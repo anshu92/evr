@@ -405,43 +405,56 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
     
     # PEAK DETECTION: Find the day of maximum price within the extended horizon
-    # This allows the model to predict optimal sell timing
-    def _compute_peak_day(group):
-        """For each row, find the day (1 to max_horizon) when max price occurs."""
+    # Uses vectorized rolling operations for speed (no Python loops)
+    def _compute_peak_targets_vectorized(group):
+        """Vectorized peak detection - find day and return of max price in next N days."""
         prices = group["last_close_cad"].values
         n = len(prices)
+        
+        # Pre-allocate output arrays
         peak_days = np.full(n, np.nan)
-        
-        for i in range(n - max_horizon):
-            # Look at prices from day i+1 to i+max_horizon
-            future_prices = prices[i+1:i+1+max_horizon]
-            if len(future_prices) > 0 and not np.all(np.isnan(future_prices)):
-                # Find day of max (1-indexed: day 1 = tomorrow)
-                peak_idx = np.nanargmax(future_prices)
-                peak_days[i] = peak_idx + 1  # 1 = tomorrow, 2 = day after, etc.
-        
-        return pd.Series(peak_days, index=group.index)
-    
-    panel["days_to_peak"] = panel.groupby("ticker", group_keys=False).apply(_compute_peak_day)
-    
-    # Also compute the return at peak for evaluation
-    def _compute_peak_return(group):
-        """For each row, compute the return at the peak day."""
-        prices = group["last_close_cad"].values
-        n = len(prices)
         peak_returns = np.full(n, np.nan)
         
-        for i in range(n - max_horizon):
-            future_prices = prices[i+1:i+1+max_horizon]
-            if len(future_prices) > 0 and not np.all(np.isnan(future_prices)):
-                peak_price = np.nanmax(future_prices)
-                current_price = prices[i]
-                if current_price > 0:
-                    peak_returns[i] = peak_price / current_price - 1.0
+        # Build matrix of future prices: each row i contains prices[i+1:i+1+max_horizon]
+        # Use stride tricks for efficiency
+        if n <= max_horizon:
+            return pd.DataFrame({"days_to_peak": peak_days, "peak_return": peak_returns}, index=group.index)
         
-        return pd.Series(peak_returns, index=group.index)
+        # Create shifted views for each day in horizon
+        # shifted[d] = prices shifted by -(d+1), i.e., future price on day d+1
+        future_matrix = np.full((n, max_horizon), np.nan)
+        for d in range(max_horizon):
+            shift = d + 1
+            if shift < n:
+                future_matrix[:-shift, d] = prices[shift:]
+        
+        # Mark rows with all-NaN future FIRST
+        all_nan_mask = np.all(np.isnan(future_matrix), axis=1)
+        
+        # For rows with all NaN, temporarily fill with 0 to avoid nanargmax error
+        temp_matrix = future_matrix.copy()
+        temp_matrix[all_nan_mask, 0] = 0.0
+        
+        # Find argmax and max across the horizon dimension
+        peak_idx = np.nanargmax(temp_matrix, axis=1)
+        with np.errstate(all='ignore'):  # Suppress "All-NaN slice" warning
+            peak_price = np.nanmax(future_matrix, axis=1)
+        
+        # Convert to 1-indexed days (1 = tomorrow)
+        peak_days = (peak_idx + 1).astype(float)
+        peak_days[all_nan_mask] = np.nan
+        
+        # Compute peak returns
+        valid_price_mask = prices > 0
+        peak_returns = np.where(valid_price_mask, peak_price / prices - 1.0, np.nan)
+        peak_returns[all_nan_mask] = np.nan
+        
+        return pd.DataFrame({"days_to_peak": peak_days, "peak_return": peak_returns}, index=group.index)
     
-    panel["peak_return"] = panel.groupby("ticker", group_keys=False).apply(_compute_peak_return)
+    # Apply vectorized function to each ticker group
+    peak_df = panel.groupby("ticker", group_keys=False).apply(_compute_peak_targets_vectorized)
+    panel["days_to_peak"] = peak_df["days_to_peak"]
+    panel["peak_return"] = peak_df["peak_return"]
     logger.info("Computed peak detection targets: days_to_peak (1-%d), peak_return", max_horizon)
     
     # Compute market benchmark return for each date using MARKET-CAP WEIGHTING
