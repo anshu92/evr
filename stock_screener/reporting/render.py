@@ -201,7 +201,9 @@ def render_reports(
             pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
             sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
             pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
-            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px} days_held={days} pred_ret={pred_ret_str} sell_date={sell_date or 'N/A'} reason={reason}")
+            px_cad_str = _fmt_money(px) if px else "N/A"
+            px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
+            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px_cad_str} price_usd={px_usd_str} days_held={days} pred_ret={pred_ret_str} sell_date={sell_date or 'N/A'} reason={reason}")
         lines.append("")
 
     # Portfolio P&L history (stateful; computed from portfolio state positions)
@@ -334,6 +336,7 @@ def render_reports(
     )
 
     # Build actions block outside the f-string to avoid complex nested expressions.
+    fx_rate = _to_float(fx_usdcad_rate)
     if trade_actions:
         # Build actions as a table for better readability
         action_rows: list[str] = []
@@ -346,12 +349,14 @@ def render_reports(
             pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
             sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
             pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
-            px_str = _fmt_money(px) if px else "N/A"
+            px_cad_str = _fmt_money(px) if px else "N/A"
+            px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
             action_rows.append(
                 f"<tr><td style='padding:4px 8px;'>{_html_escape(action)}</td>"
                 f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
                 f"<td style='padding:4px 8px;'>{shares}</td>"
-                f"<td style='padding:4px 8px;'>{px_str}</td>"
+                f"<td style='padding:4px 8px;'>{px_cad_str}</td>"
+                f"<td style='padding:4px 8px;'>{px_usd_str}</td>"
                 f"<td style='padding:4px 8px;'>{pred_ret_str}</td>"
                 f"<td style='padding:4px 8px;'>{sell_date or 'N/A'}</td>"
                 f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
@@ -362,7 +367,8 @@ def render_reports(
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Action</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Ticker</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Shares</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price (CAD)</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price (USD)</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Pred Ret</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Sell Date</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Reason</th>
