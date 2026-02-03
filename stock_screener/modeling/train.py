@@ -376,6 +376,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
 
     # Hyperparameter tuning with Optuna (if available) or fallback to manual search
+    regressor_scores = {}  # Initialize to avoid UnboundLocalError
+    
     if optuna and getattr(cfg, 'use_optuna', False):
         logger.info("Using Optuna for hyperparameter optimization...")
         n_trials = getattr(cfg, 'optuna_n_trials', 12)
@@ -412,7 +414,17 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         study = optuna.create_study(direction="maximize")
         study.optimize(_optuna_objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
         best_regressor_params = study.best_params
+        
+        # Store all trial results in consistent format with manual search
+        # Format: {str(params): score} for consistency
+        regressor_scores = {}
+        for trial in study.trials:
+            if trial.state == optuna.trial.TrialState.COMPLETE:
+                params_str = str(trial.params)
+                regressor_scores[params_str] = trial.value
+        
         logger.info("Optuna best params: %s (score=%.6f)", best_regressor_params, study.best_value)
+        logger.info("Optuna completed %d trials", len(study.trials))
     else:
         # Fallback to manual hyperparameter search
         logger.info("Using manual hyperparameter search...")
