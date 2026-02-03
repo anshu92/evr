@@ -304,9 +304,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Shift by (horizon + 1) so predictions made with today's features predict tomorrow onward
     # This ensures we can act on predictions before market open
     panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
+    
+    # Compute market benchmark return for each date (equal-weighted average)
+    market_returns = panel.groupby("date")["future_ret"].mean()
+    panel["market_ret"] = panel["date"].map(market_returns)
+    
+    # Compute market-relative returns (alpha = stock return - market return)
+    panel["future_alpha"] = panel["future_ret"] - panel["market_ret"]
+    
+    # Configure which target to use for training
+    use_market_relative = getattr(cfg, 'use_market_relative_returns', True)
+    if use_market_relative:
+        target_col = "future_alpha"
+        logger.info("Training on market-relative returns (alpha). Market avg will be subtracted.")
+    else:
+        target_col = "future_ret"
+        logger.info("Training on absolute returns.")
 
     # Drop rows without labels/features
-    panel = panel.dropna(subset=["future_ret"])
+    panel = panel.dropna(subset=[target_col])
     panel = panel.replace([np.inf, -np.inf], np.nan)
     panel = panel.dropna(subset=["last_close_cad", "avg_dollar_volume_cad"])
     panel = panel[panel["n_days"] >= 90]
@@ -348,12 +364,15 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         mask = panel["date"].isin(dates_list)
         return panel.loc[mask]
 
+    # Use configured target column for all training and evaluation
+    label_col = target_col
+
     def _rank_ic_for_preds(df: pd.DataFrame, pred: pd.Series) -> dict[str, object]:
         if df.empty:
             return {"summary": {"mean_ic": float("nan"), "std_ic": float("nan"), "ic_ir": float("nan"), "n_days": 0}}
         temp = df.copy()
         temp["pred"] = pred
-        return evaluate_predictions(temp, date_col="date", label_col="future_ret", pred_col="pred", group_col="is_tsx")
+        return evaluate_predictions(temp, date_col="date", label_col=label_col, pred_col="pred", group_col="is_tsx")
 
     def _topn_for_preds(df: pd.DataFrame, pred: pd.Series) -> dict[str, object]:
         if df.empty:
@@ -371,7 +390,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         temp = df.copy()
         temp["pred"] = pred
         return evaluate_topn_returns(
-            temp, date_col="date", label_col="future_ret", pred_col="pred", top_n=top_n, cost_bps=cost_bps
+            temp, date_col="date", label_col=label_col, pred_col="pred", top_n=top_n, cost_bps=cost_bps
         )
 
 
@@ -402,8 +421,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 model.set_params(**params, early_stopping_rounds=50)
                 model.fit(
                     train_df[feature_cols],
-                    train_df["future_ret"].astype(float),
-                    eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                    train_df[label_col].astype(float),
+                    eval_set=[(val_df[feature_cols], val_df[label_col].astype(float))],
                     verbose=False,
                 )
                 preds = model.predict(val_df[feature_cols])
@@ -444,8 +463,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 model.set_params(**params, early_stopping_rounds=50)
                 model.fit(
                     train_df[feature_cols],
-                    train_df["future_ret"].astype(float),
-                    eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                    train_df[label_col].astype(float),
+                    eval_set=[(val_df[feature_cols], val_df[label_col].astype(float))],
                     verbose=False,
                 )
                 preds = model.predict(val_df[feature_cols])
@@ -492,12 +511,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         if not val_df.empty:
             m.fit(
                 train_df[feature_cols],
-                train_df["future_ret"].astype(float),
-                eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                train_df[label_col].astype(float),
+                eval_set=[(val_df[feature_cols], val_df[label_col].astype(float))],
                 verbose=False,
             )
         else:
-            m.fit(train_df[feature_cols], train_df["future_ret"].astype(float))
+            m.fit(train_df[feature_cols], train_df[label_col].astype(float))
         rel = f"xgb_model_{i}.json"
         save_model(m, model_dir / rel)
         reg_rel_paths.append(rel)
@@ -522,12 +541,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if not val_df.empty:
                 m.fit(
                     train_df[feature_cols],
-                    train_df["future_ret"].astype(float),
-                    eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                    train_df[label_col].astype(float),
+                    eval_set=[(val_df[feature_cols], val_df[label_col].astype(float))],
                     callbacks=[],  # Disable callbacks to reduce verbosity
                 )
             else:
-                m.fit(train_df[feature_cols], train_df["future_ret"].astype(float))
+                m.fit(train_df[feature_cols], train_df[label_col].astype(float))
             rel = f"lgbm_model_{i}.txt"
             save_model(m, model_dir / rel)
             reg_rel_paths.append(rel)
@@ -560,7 +579,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         try:
             importance = first_model.get_score(importance_type="gain")
             feature_importance = {k: float(v) for k, v in sorted(importance.items(), key=lambda x: x[1], reverse=True)[:20]}
-            logger.info("Top 10 features by gain: %s", list(feature_importance.keys())[:10])
+            
+            # Map feature codes (f0, f1) to actual names for better logging
+            feature_name_map = {f"f{i}": name for i, name in enumerate(feature_cols)}
+            top_features_named = [f"{k} ({feature_name_map.get(k, k)})" for k in list(feature_importance.keys())[:10]]
+            logger.info("Top 10 features by gain: %s", top_features_named)
         except Exception as e:
             logger.warning("Could not extract feature importance: %s", e)
 
@@ -571,7 +594,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if col in holdout_df.columns and holdout_df[col].notna().sum() > 10:
                 try:
                     from scipy.stats import spearmanr
-                    ic, _ = spearmanr(holdout_df[col].fillna(0), holdout_df["future_ret"].fillna(0), nan_policy="omit")
+                    ic, _ = spearmanr(holdout_df[col].fillna(0), holdout_df[label_col].fillna(0), nan_policy="omit")
                     feature_ic[col] = float(ic)
                 except Exception:
                     pass
@@ -591,7 +614,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 sector_df = holdout_with_preds[holdout_with_preds["sector_hash"] == sector]
                 if len(sector_df) > 20:
                     sector_metrics = evaluate_predictions(
-                        sector_df, date_col="date", label_col="future_ret", 
+                        sector_df, date_col="date", label_col=label_col, 
                         pred_col="pred_return", group_col=None
                     )
                     sector_ics[f"sector_{sector:.3f}"] = sector_metrics.get("summary", {})
@@ -609,7 +632,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 q_df = holdout_with_preds[holdout_with_preds["mcap_quintile"] == q]
                 if len(q_df) > 20:
                     q_metrics = evaluate_predictions(
-                        q_df, date_col="date", label_col="future_ret",
+                        q_df, date_col="date", label_col=label_col,
                         pred_col="pred_return", group_col=None
                     )
                     mcap_ics[f"quintile_{q+1}"] = q_metrics.get("summary", {})
@@ -625,7 +648,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         # Compute calibration
         calibration_result = compute_calibration(
             pd.Series(reg_holdout_preds, index=holdout_df.index),
-            holdout_df["future_ret"],
+            holdout_df[label_col],
             n_bins=10
         )
         calibration_metrics = {

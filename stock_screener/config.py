@@ -51,6 +51,9 @@ class Config:
     # Portfolio optimization
     use_correlation_weights: bool = False  # Requires scipy; set True to enable
     confidence_weight_floor: float = 0.3
+    
+    # Training target
+    use_market_relative_returns: bool = True  # Train on alpha (stock return - market return) instead of absolute returns
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
@@ -144,6 +147,7 @@ class Config:
             ensemble_lgbm_count=_get_int("ENSEMBLE_LGBM_COUNT", 3) or 3,
             use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
+            use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
             max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,
