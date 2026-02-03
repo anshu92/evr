@@ -106,6 +106,14 @@ class Config:
     portfolio_budget_cad: float = 500.0
     max_holding_days: int = 5
     max_holding_days_hard: int = 10
+    peak_based_exit: bool = True  # Exit at peak (trailing stop) instead of fixed days
+    
+    # Time-weighted return optimization
+    twr_optimization: bool = True  # Optimize for time-weighted returns
+    quick_profit_pct: float = 0.05  # Take profit if hit 5% gain quickly
+    quick_profit_days: int = 3  # "Quickly" means within 3 days
+    min_daily_return: float = 0.005  # Exit if daily return drops below 0.5%/day
+    momentum_decay_exit: bool = True  # Exit when return momentum decelerates
     extend_hold_min_pred_return: float | None = 0.03
     extend_hold_min_score: float | None = None
     portfolio_state_path: str = "screener_portfolio_state.json"
@@ -264,6 +272,12 @@ class Config:
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
             max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,
+            peak_based_exit=_get_bool("PEAK_BASED_EXIT", True),
+            twr_optimization=_get_bool("TWR_OPTIMIZATION", True),
+            quick_profit_pct=_get_float("QUICK_PROFIT_PCT", 0.05),
+            quick_profit_days=_get_int("QUICK_PROFIT_DAYS", 3) or 3,
+            min_daily_return=_get_float("MIN_DAILY_RETURN", 0.005),
+            momentum_decay_exit=_get_bool("MOMENTUM_DECAY_EXIT", True),
             extend_hold_min_pred_return=(
                 _get_float("EXTEND_HOLD_MIN_PRED_RETURN", 0.0)
                 if os.getenv("EXTEND_HOLD_MIN_PRED_RETURN") not in {None, ""}

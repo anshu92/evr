@@ -46,6 +46,12 @@ class PortfolioManager:
         trailing_stop_enabled: bool = True,
         trailing_stop_activation_pct: float = 0.05,
         trailing_stop_distance_pct: float = 0.08,
+        peak_based_exit: bool = True,
+        twr_optimization: bool = True,
+        quick_profit_pct: float = 0.05,
+        quick_profit_days: int = 3,
+        min_daily_return: float = 0.005,
+        momentum_decay_exit: bool = True,
         signal_decay_exit_enabled: bool = True,
         signal_decay_threshold: float = -0.02,
         dynamic_holding_enabled: bool = True,
@@ -78,6 +84,12 @@ class PortfolioManager:
         self.trailing_stop_enabled = trailing_stop_enabled
         self.trailing_stop_activation_pct = trailing_stop_activation_pct
         self.trailing_stop_distance_pct = trailing_stop_distance_pct
+        self.peak_based_exit = peak_based_exit
+        self.twr_optimization = twr_optimization
+        self.quick_profit_pct = quick_profit_pct
+        self.quick_profit_days = max(1, int(quick_profit_days))
+        self.min_daily_return = min_daily_return
+        self.momentum_decay_exit = momentum_decay_exit
         self.signal_decay_exit_enabled = signal_decay_exit_enabled
         self.signal_decay_threshold = signal_decay_threshold
         self.dynamic_holding_enabled = dynamic_holding_enabled
@@ -393,10 +405,11 @@ class PortfolioManager:
                 continue
 
             days = p.days_held(now)
-            # Time exits:
+            # Time exits (skipped if peak_based_exit is enabled):
             # - Default behavior: exit at max_holding_days (dynamic if enabled).
             # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
-            if days >= max_hold:
+            # When peak_based_exit is True, we rely on trailing stops instead of fixed time.
+            if not self.peak_based_exit and days >= max_hold:
                 if days >= max_hold_hard:
                     actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT_HARD", days_held=days))
                     continue
@@ -469,6 +482,45 @@ class PortfolioManager:
                     )
                     actions.append(self._sell_position(state, p, price_cad=px, reason="AGE_URGENCY", days_held=days))
                     continue
+
+            # Time-weighted return optimization: exit to maximize capital efficiency
+            if self.twr_optimization and p.entry_price > 0:
+                gain = px / float(p.entry_price) - 1.0
+                
+                # Quick profit exit: take gains if we hit target quickly
+                if days <= self.quick_profit_days and gain >= self.quick_profit_pct:
+                    annualized = ((1 + gain) ** (252 / max(1, days))) - 1
+                    self.logger.info(
+                        "%s quick profit: %.1f%% gain in %d days (annualized: %.0f%%)",
+                        p.ticker, gain * 100, days, annualized * 100
+                    )
+                    actions.append(self._sell_position(state, p, price_cad=px, reason="QUICK_PROFIT", days_held=days))
+                    continue
+                
+                # Daily return check: exit if return per day is too low
+                if days >= 2 and gain > 0:
+                    daily_return = gain / days
+                    if daily_return < self.min_daily_return:
+                        self.logger.info(
+                            "%s low daily return: %.2f%% total / %d days = %.2f%%/day (min: %.2f%%)",
+                            p.ticker, gain * 100, days, daily_return * 100, self.min_daily_return * 100
+                        )
+                        actions.append(self._sell_position(state, p, price_cad=px, reason="LOW_DAILY_RETURN", days_held=days))
+                        continue
+                
+                # Momentum decay: exit if we're past peak and velocity is slowing
+                if self.momentum_decay_exit and p.highest_price and p.highest_price > p.entry_price:
+                    current_gain = gain
+                    peak_gain = (p.highest_price / float(p.entry_price)) - 1.0
+                    
+                    # If we've given back more than 40% of our peak gain, exit
+                    if peak_gain > 0.02 and current_gain < peak_gain * 0.6:
+                        self.logger.info(
+                            "%s momentum decay: current %.1f%% vs peak %.1f%% (gave back %.0f%%)",
+                            p.ticker, current_gain * 100, peak_gain * 100, (1 - current_gain / peak_gain) * 100
+                        )
+                        actions.append(self._sell_position(state, p, price_cad=px, reason="MOMENTUM_DECAY", days_held=days))
+                        continue
 
             # Trailing stop: update highest price and check trailing stop trigger
             if self.trailing_stop_enabled and p.entry_price > 0:
@@ -656,9 +708,11 @@ class PortfolioManager:
                         pred_ret = float(weights.loc[t, "pred_return"])
                 except Exception:
                     pass
-                # Compute expected sell date
+                # Compute expected sell date/strategy
                 expected_sell = None
-                if self.max_holding_days:
+                if self.peak_based_exit:
+                    expected_sell = "Peak Detection"
+                elif self.max_holding_days:
                     sell_dt = now + timedelta(days=self.max_holding_days)
                     expected_sell = sell_dt.strftime("%Y-%m-%d")
                 actions.append(
@@ -684,9 +738,11 @@ class PortfolioManager:
                     pred_ret = float(weights.loc[t, "pred_return"])
             except Exception:
                 pass
-            # Compute expected sell date from entry
+            # Compute expected sell date/strategy from entry
             expected_sell = None
-            if p and self.max_holding_days:
+            if self.peak_based_exit:
+                expected_sell = "Peak Detection"
+            elif p and self.max_holding_days:
                 sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
                 expected_sell = sell_dt.strftime("%Y-%m-%d")
             actions.append(
