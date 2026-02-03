@@ -37,7 +37,7 @@ class Config:
     train_ensemble_seeds: list[int] | None = None  # Random seeds for ensemble (default: [7, 13, 21, 42, 73, 99, 123])
     train_cv_splits: int = 3
     train_val_window_days: int = 60
-    train_embargo_days: int = 5  # Should match label_horizon_days
+    train_embargo_days: int = 10  # Should be >= 2x label_horizon_days to prevent leakage
     fundamentals_cache_ttl_days: int = 7
     
     # Advanced modeling

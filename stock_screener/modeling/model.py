@@ -139,17 +139,18 @@ def _require_lgb() -> None:
 
 
 def build_model(random_state: int = 42):
-    """Build a strong baseline boosted-tree model for next-horizon returns."""
+    """Build a regularized boosted-tree model for next-horizon returns."""
 
     _require_xgb()
     return xgb.XGBRegressor(
-        n_estimators=800,
-        learning_rate=0.03,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        min_child_weight=5,
+        n_estimators=500,  # Reduced from 800
+        learning_rate=0.02,  # Reduced from 0.03 for better generalization
+        max_depth=4,  # Reduced from 6 to prevent overfitting
+        subsample=0.7,  # Reduced from 0.8
+        colsample_bytree=0.7,  # Reduced from 0.8
+        reg_lambda=5.0,  # Increased from 1.0 for stronger regularization
+        reg_alpha=0.5,  # Added L1 regularization
+        min_child_weight=10,  # Increased from 5
         objective="reg:squarederror",
         n_jobs=0,
         random_state=random_state,
@@ -176,18 +177,19 @@ def build_ranker(random_state: int = 42):
 
 
 def build_lgbm_model(random_state: int = 42):
-    """Build a LightGBM regressor for ensemble diversity."""
+    """Build a regularized LightGBM regressor for ensemble diversity."""
     
     _require_lgb()
     return lgb.LGBMRegressor(
-        n_estimators=500,
-        learning_rate=0.05,
-        max_depth=6,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        min_child_samples=20,
+        n_estimators=400,  # Reduced
+        learning_rate=0.02,  # Reduced for better generalization
+        max_depth=4,  # Reduced to prevent overfitting
+        num_leaves=15,  # Reduced from 31
+        subsample=0.7,  # Reduced
+        colsample_bytree=0.7,  # Reduced
+        reg_lambda=5.0,  # Increased regularization
+        reg_alpha=0.5,  # Added L1 regularization
+        min_child_samples=50,  # Increased from 20
         random_state=random_state,
         verbose=-1,
     )

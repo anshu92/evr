@@ -465,6 +465,12 @@ def run_daily(cfg: Config, logger) -> None:
         sells = len([a for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")])
         logger.info("Exited %s position(s) (time/stop/target/peak).", sells)
 
+    # Add pred_return to target_weights so it can be shown in email
+    if "pred_return" in screened.columns:
+        for t in target_weights.index:
+            if t in screened.index:
+                target_weights.loc[t, "pred_return"] = screened.loc[t, "pred_return"]
+    
     trade_plan = pm.build_trade_plan(
         state=state,
         screened=screened,

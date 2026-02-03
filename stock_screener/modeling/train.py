@@ -79,11 +79,14 @@ def _apply_target_encoding(
     """Apply target encoding with smoothing to prevent overfitting.
     
     Uses expanding window with vectorized merge - fast O(n) implementation.
+    No future data leakage - uses only historical data for each date.
     """
     if cat_col not in panel.columns or panel[cat_col].isna().all():
         return pd.Series(np.nan, index=panel.index)
     
-    global_mean = panel[target_col].mean()
+    # Use expanding mean for global_mean to avoid future leakage
+    # For simplicity, use 0.0 as the initial global mean (neutral)
+    global_mean = 0.0
     
     # Compute per-date aggregates per category
     daily_agg = panel.groupby([date_col, cat_col])[target_col].agg(["sum", "count"]).reset_index()
@@ -872,6 +875,27 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
 
+    # Compute train IC to compare with holdout IC (detect overfitting)
+    train_preds = np.zeros(len(train_df), dtype=float)
+    for rel, mtype in zip(reg_rel_paths, model_types):
+        model = load_model(model_dir / rel, mtype)
+        if mtype == "xgboost":
+            train_preds += model.predict(xgb.DMatrix(train_df[selected_features])).astype(float)
+        else:  # lightgbm
+            train_preds += model.predict(train_df[selected_features]).astype(float)
+    train_preds = train_preds / float(len(reg_rel_paths))
+    train_metrics = _rank_ic_for_preds(train_df, pd.Series(train_preds, index=train_df.index))
+    
+    # Log train vs holdout IC to detect overfitting
+    train_ic = train_metrics.get("summary", {}).get("mean_ic", 0.0)
+    holdout_ic = reg_holdout_metrics.get("summary", {}).get("mean_ic", 0.0)
+    logger.info(
+        "Train IC: %.4f, Holdout IC: %.4f (ratio: %.2f) - %s",
+        train_ic, holdout_ic,
+        holdout_ic / train_ic if train_ic != 0 else 0,
+        "OVERFITTING" if train_ic > 0.1 and holdout_ic < train_ic * 0.5 else "OK"
+    )
+
     # Load all trained models for walk-forward validation
     reg_models = []
     for rel, mtype in zip(reg_rel_paths, model_types):
@@ -903,8 +927,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if col in holdout_df.columns and holdout_df[col].notna().sum() > 10:
                 try:
                     from scipy.stats import spearmanr
-                    ic, _ = spearmanr(holdout_df[col].fillna(0), holdout_df[label_col].fillna(0), nan_policy="omit")
-                    feature_ic[col] = float(ic)
+                    # Use only non-NaN values to avoid bias from filling with 0
+                    mask = holdout_df[col].notna() & holdout_df[label_col].notna()
+                    if mask.sum() > 10:
+                        ic, _ = spearmanr(holdout_df.loc[mask, col], holdout_df.loc[mask, label_col])
+                        feature_ic[col] = float(ic) if not np.isnan(ic) else 0.0
                 except Exception:
                     pass
         top_features = sorted(feature_ic.items(), key=lambda x: abs(x[1]), reverse=True)[:10]

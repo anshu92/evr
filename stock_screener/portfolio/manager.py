@@ -710,7 +710,9 @@ class PortfolioManager:
                     pass
                 # Compute expected sell date/strategy
                 expected_sell = None
-                if self.peak_based_exit:
+                if self.twr_optimization:
+                    expected_sell = "TWR Optimized"
+                elif self.peak_based_exit:
                     expected_sell = "Peak Detection"
                 elif self.max_holding_days:
                     sell_dt = now + timedelta(days=self.max_holding_days)
@@ -724,10 +726,15 @@ class PortfolioManager:
                 open_tickers.add(t)
                 slots -= 1
 
-        # HOLD: open tickers in target.
+        # Track tickers we just bought (so we don't also generate HOLD for them)
+        just_bought = {a.ticker for a in actions if a.action == "BUY"}
+        
+        # HOLD: open tickers in target (but skip just-bought ones).
         for t in sorted(open_tickers):
             if t not in target_set:
                 continue
+            if t in just_bought:
+                continue  # Already have a BUY action for this ticker
             p = open_by_ticker.get(t)
             px = float(prices_cad.get(t, float("nan")))
             days = p.days_held(now) if p else None
@@ -740,7 +747,9 @@ class PortfolioManager:
                 pass
             # Compute expected sell date/strategy from entry
             expected_sell = None
-            if self.peak_based_exit:
+            if self.twr_optimization:
+                expected_sell = "TWR Optimized"
+            elif self.peak_based_exit:
                 expected_sell = "Peak Detection"
             elif p and self.max_holding_days:
                 sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
