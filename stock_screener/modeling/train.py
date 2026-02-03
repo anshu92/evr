@@ -35,7 +35,10 @@ from stock_screener.modeling.model import (
 from stock_screener.modeling.transform import normalize_features_cross_section, winsorize_mad
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
-from stock_screener.utils import Universe, ensure_dir, write_json
+from stock_screener.utils import Universe, ensure_dir, write_json, suppress_external_warnings
+
+# Suppress known external library warnings
+suppress_external_warnings()
 
 
 @dataclass(frozen=True)

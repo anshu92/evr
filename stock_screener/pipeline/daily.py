@@ -17,7 +17,10 @@ from stock_screener.reporting.render import render_reports
 from stock_screener.screening.screener import score_universe
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
-from stock_screener.utils import Universe, ensure_dir, read_json, write_json
+from stock_screener.utils import Universe, ensure_dir, read_json, write_json, suppress_external_warnings
+
+# Suppress known external library warnings
+suppress_external_warnings()
 from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty
 from stock_screener.modeling.transform import normalize_features_cross_section
 from stock_screener.portfolio.manager import PortfolioManager

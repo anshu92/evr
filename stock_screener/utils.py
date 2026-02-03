@@ -7,6 +7,15 @@ import logging
 from pathlib import Path
 import re
 from typing import Any, Iterable
+import warnings
+
+
+def suppress_external_warnings():
+    """Suppress known deprecation warnings from external libraries."""
+    # yfinance uses deprecated pd.Timestamp.utcnow() - ignore until they update
+    warnings.filterwarnings('ignore', category=DeprecationWarning, module='yfinance')
+    # Suppress FutureWarnings from yfinance as well
+    warnings.filterwarnings('ignore', category=FutureWarning, module='yfinance')
 
 
 TICKER_ALLOWED_RE = re.compile(r"^[A-Z0-9.\-^=]{1,20}$")
