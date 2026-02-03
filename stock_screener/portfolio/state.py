@@ -30,10 +30,17 @@ class Position:
     exit_price: float | None = None
     exit_date: datetime | None = None
     exit_reason: str | None = None
+    highest_price: float | None = None  # Peak price for trailing stop
 
     def days_held(self, now: datetime | None = None) -> int:
         n = now or _utcnow()
         return (n - self.entry_date).days
+    
+    def update_highest_price(self, current_price: float) -> None:
+        """Update highest price for trailing stop calculation."""
+        if current_price > 0:
+            if self.highest_price is None or current_price > self.highest_price:
+                self.highest_price = current_price
 
 
 @dataclass
@@ -70,6 +77,7 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
             exit_price=raw.get("exit_price"),
             exit_date=_dt_from_iso(raw.get("exit_date")),
             exit_reason=raw.get("exit_reason"),
+            highest_price=raw.get("highest_price"),
         )
         if pos.ticker and pos.shares > 0:
             positions.append(pos)
@@ -114,5 +122,110 @@ def save_portfolio_state(path: str | Path, state: PortfolioState) -> None:
         raw["exit_date"] = pos.exit_date.isoformat() if pos.exit_date else None
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def compute_portfolio_drawdown(state: PortfolioState) -> dict[str, float]:
+    """Compute current drawdown from portfolio P&L history.
+    
+    Returns:
+        Dict with 'current_drawdown', 'max_equity', 'current_equity', 'drawdown_scalar'
+    """
+    if not state.pnl_history:
+        return {
+            "current_drawdown": 0.0,
+            "max_equity": 0.0,
+            "current_equity": 0.0,
+            "drawdown_scalar": 1.0,
+            "days_in_drawdown": 0,
+        }
+    
+    # Extract equity history
+    equities = []
+    for entry in state.pnl_history:
+        equity = entry.get("equity_cad")
+        if equity is not None and equity > 0:
+            equities.append(float(equity))
+    
+    if not equities:
+        return {
+            "current_drawdown": 0.0,
+            "max_equity": 0.0,
+            "current_equity": 0.0,
+            "drawdown_scalar": 1.0,
+            "days_in_drawdown": 0,
+        }
+    
+    current_equity = equities[-1]
+    max_equity = max(equities)
+    
+    if max_equity <= 0:
+        return {
+            "current_drawdown": 0.0,
+            "max_equity": 0.0,
+            "current_equity": current_equity,
+            "drawdown_scalar": 1.0,
+            "days_in_drawdown": 0,
+        }
+    
+    # Calculate drawdown (negative value)
+    current_drawdown = (current_equity - max_equity) / max_equity
+    
+    # Count days in drawdown
+    days_in_dd = 0
+    for eq in reversed(equities):
+        if eq < max_equity * 0.99:  # 1% tolerance
+            days_in_dd += 1
+        else:
+            break
+    
+    return {
+        "current_drawdown": current_drawdown,
+        "max_equity": max_equity,
+        "current_equity": current_equity,
+        "drawdown_scalar": 1.0,  # Will be computed by caller
+        "days_in_drawdown": days_in_dd,
+    }
+
+
+def compute_drawdown_scalar(
+    state: PortfolioState,
+    max_drawdown_threshold: float = -0.10,
+    min_scalar: float = 0.25,
+    recovery_threshold: float = -0.02,
+) -> tuple[float, dict]:
+    """Compute position sizing scalar based on portfolio drawdown.
+    
+    When in drawdown, reduce position sizes to limit further losses.
+    
+    Args:
+        state: Portfolio state with P&L history
+        max_drawdown_threshold: Drawdown at which to apply minimum scalar (e.g., -0.10 = -10%)
+        min_scalar: Minimum position sizing multiplier (e.g., 0.25 = 25% normal size)
+        recovery_threshold: Drawdown threshold to return to normal sizing (e.g., -0.02 = -2%)
+        
+    Returns:
+        Tuple of (scalar, drawdown_info dict)
+    """
+    dd_info = compute_portfolio_drawdown(state)
+    current_dd = dd_info["current_drawdown"]
+    
+    # No drawdown or recovered
+    if current_dd >= recovery_threshold:
+        dd_info["drawdown_scalar"] = 1.0
+        return 1.0, dd_info
+    
+    # In significant drawdown - scale down linearly
+    # At max_drawdown_threshold, use min_scalar
+    # Between recovery_threshold and max_drawdown_threshold, interpolate
+    if current_dd <= max_drawdown_threshold:
+        scalar = min_scalar
+    else:
+        # Linear interpolation
+        dd_range = recovery_threshold - max_drawdown_threshold
+        dd_position = (current_dd - max_drawdown_threshold) / dd_range
+        scalar = min_scalar + (1.0 - min_scalar) * dd_position
+    
+    dd_info["drawdown_scalar"] = scalar
+    return scalar, dd_info
 
 

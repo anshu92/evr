@@ -19,7 +19,16 @@ from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.fundamental_scores import add_fundamental_composites
-from stock_screener.modeling.eval import build_time_splits, evaluate_predictions, evaluate_topn_returns, compute_calibration, compute_portfolio_metrics
+from stock_screener.modeling.eval import (
+    build_time_splits,
+    build_walk_forward_periods,
+    evaluate_predictions,
+    evaluate_topn_returns,
+    compute_calibration,
+    compute_portfolio_metrics,
+    simulate_realistic_portfolio,
+    aggregate_walk_forward_results,
+)
 from stock_screener.modeling.model import (
     FEATURE_COLUMNS,
     TECHNICAL_FEATURES_ONLY,
@@ -32,7 +41,7 @@ from stock_screener.modeling.model import (
     save_ensemble,
     save_model,
 )
-from stock_screener.modeling.transform import normalize_features_cross_section, winsorize_mad
+from stock_screener.modeling.transform import normalize_features_cross_section, winsorize_mad, build_calibration_map
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json, suppress_external_warnings
@@ -58,6 +67,53 @@ def _hash_to_float(val: str | None) -> float:
         return float("nan")
     h = hashlib.sha256(val.encode("utf-8")).hexdigest()
     return float(int(h[:10], 16) % 1_000_000) / 1_000_000.0
+
+
+def _apply_target_encoding(
+    panel: pd.DataFrame,
+    cat_col: str,
+    target_col: str,
+    date_col: str = "date",
+    smoothing: float = 10.0,
+) -> pd.Series:
+    """Apply target encoding with smoothing to prevent overfitting.
+    
+    Uses leave-one-out encoding within each date to prevent data leakage.
+    Smoothing pulls extreme values toward the global mean.
+    """
+    if cat_col not in panel.columns or panel[cat_col].isna().all():
+        return pd.Series(np.nan, index=panel.index)
+    
+    # Global mean for smoothing
+    global_mean = panel[target_col].mean()
+    
+    # Compute per-category stats using historical data only (no leakage)
+    result = pd.Series(np.nan, index=panel.index)
+    
+    for date in panel[date_col].unique():
+        # Use only data BEFORE this date for encoding
+        historical = panel[panel[date_col] < date]
+        current = panel[panel[date_col] == date]
+        
+        if historical.empty:
+            # No history yet - use global mean
+            result.loc[current.index] = global_mean
+            continue
+        
+        # Calculate category means from historical data
+        cat_stats = historical.groupby(cat_col)[target_col].agg(["mean", "count"])
+        
+        # Apply smoothing: blend category mean with global mean based on sample size
+        # Formula: (n * cat_mean + m * global_mean) / (n + m) where m = smoothing
+        cat_encoded = (
+            cat_stats["count"] * cat_stats["mean"] + smoothing * global_mean
+        ) / (cat_stats["count"] + smoothing)
+        
+        # Map to current date's rows
+        current_cats = current[cat_col]
+        result.loc[current.index] = current_cats.map(cat_encoded).fillna(global_mean)
+    
+    return result
 
 
 
@@ -111,6 +167,19 @@ def _build_panel_features(
         dist_52w_high = close_cad / roll_max_252.replace(0.0, np.nan) - 1.0
         dist_52w_low = close_cad / roll_min_252.replace(0.0, np.nan) - 1.0
 
+        # MOMENTUM REVERSAL: Short-term mean reversion signal
+        # High recent returns tend to revert (negative predictor)
+        ret_5d = close_cad.pct_change(5, fill_method=None)
+        ret_20d = close_cad.pct_change(20, fill_method=None)
+        ret_60d = close_cad.pct_change(60, fill_method=None)
+        momentum_reversal = ret_5d - ret_20d  # Short-term vs medium-term
+        momentum_acceleration = ret_20d - ret_60d  # Acceleration signal
+        
+        # LAGGED MOMENTUM: Use momentum from 1 week ago to reduce autocorrelation
+        # This avoids "buying recent winners" which is already priced in
+        ret_20d_lagged = ret_20d.shift(5)  # 20d return, lagged by 5 days
+        ret_60d_lagged = ret_60d.shift(5)  # 60d return, lagged by 5 days
+
         vol_anom_30d = vol / vol.rolling(30).mean().replace(0.0, np.nan)
         avg_dollar_vol = (close_cad * vol).rolling(30).mean()
         n_days = close_cad.expanding().count()
@@ -142,10 +211,14 @@ def _build_panel_features(
         recommendation_mean = np.nan
         num_analyst_opinions = np.nan
         
+        sector = None
+        industry = None
         if fundamentals is not None and t in fundamentals.index:
             row = fundamentals.loc[t]
-            sector_hash = _hash_to_float(str(row.get("sector"))) if row.get("sector") else np.nan
-            industry_hash = _hash_to_float(str(row.get("industry"))) if row.get("industry") else np.nan
+            sector = str(row.get("sector")) if row.get("sector") else None
+            industry = str(row.get("industry")) if row.get("industry") else None
+            sector_hash = _hash_to_float(sector) if sector else np.nan
+            industry_hash = _hash_to_float(industry) if industry else np.nan
             market_cap = row.get("marketCap")
             market_cap_cad = None
             if market_cap is not None:
@@ -204,8 +277,15 @@ def _build_panel_features(
                 "dist_52w_high": dist_52w_high.values,
                 "dist_52w_low": dist_52w_low.values,
                 "vol_anom_30d": vol_anom_30d.values,
+                # New momentum features
+                "momentum_reversal": momentum_reversal.values,  # Short-term reversal signal
+                "momentum_acceleration": momentum_acceleration.values,  # Momentum change
+                "ret_20d_lagged": ret_20d_lagged.values,  # Lagged momentum (reduces autocorrelation)
+                "ret_60d_lagged": ret_60d_lagged.values,  # Lagged long-term momentum
                 "log_market_cap": log_market_cap,
                 "beta": beta,
+                "sector": sector,  # Raw sector for target encoding
+                "industry": industry,  # Raw industry for target encoding
                 "sector_hash": sector_hash,
                 "industry_hash": industry_hash,
                 "fx_ret_5d": fx_ret_5d_series.values if hasattr(fx_ret_5d_series, "values") else fx_ret_5d_series,
@@ -305,9 +385,82 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # This ensures we can act on predictions before market open
     panel["future_ret"] = panel.groupby("ticker")["last_close_cad"].shift(-(horizon + 1)) / panel["last_close_cad"] - 1.0
     
-    # Compute market benchmark return for each date (equal-weighted average)
-    market_returns = panel.groupby("date")["future_ret"].mean()
+    # Compute market benchmark return for each date using MARKET-CAP WEIGHTING
+    # This is more realistic than equal-weighted (approximates SPY/TSX benchmark)
+    def _compute_cap_weighted_return(group):
+        """Compute market-cap weighted return for a date."""
+        if "log_market_cap" not in group.columns:
+            return group["future_ret"].mean()  # Fallback to equal-weighted
+        
+        # Convert log10(market_cap) back to market cap
+        mcap = np.power(10, group["log_market_cap"].fillna(group["log_market_cap"].median()))
+        valid_mask = mcap.notna() & group["future_ret"].notna()
+        
+        if valid_mask.sum() < 2:
+            return group["future_ret"].mean()
+        
+        mcap_valid = mcap[valid_mask]
+        ret_valid = group.loc[valid_mask, "future_ret"]
+        weights = mcap_valid / mcap_valid.sum()
+        return (ret_valid * weights).sum()
+    
+    market_returns = panel.groupby("date").apply(_compute_cap_weighted_return)
     panel["market_ret"] = panel["date"].map(market_returns)
+    logger.info("Using cap-weighted market benchmark (approximates SPY/TSX)")
+    
+    # Compute RELATIVE MOMENTUM (stock vs market)
+    # These are cross-sectional features that show stock strength relative to market average
+    market_ret_20d = panel.groupby("date")["ret_20d"].transform(
+        lambda x: np.average(x.dropna(), weights=np.power(10, panel.loc[x.dropna().index, "log_market_cap"].fillna(9))) if len(x.dropna()) > 0 else x.mean()
+    )
+    market_ret_60d = panel.groupby("date")["ret_60d"].transform(
+        lambda x: np.average(x.dropna(), weights=np.power(10, panel.loc[x.dropna().index, "log_market_cap"].fillna(9))) if len(x.dropna()) > 0 else x.mean()
+    )
+    panel["relative_momentum_20d"] = panel["ret_20d"] - market_ret_20d
+    panel["relative_momentum_60d"] = panel["ret_60d"] - market_ret_60d
+    logger.info("Added relative momentum features (stock vs cap-weighted market)")
+    
+    # Compute MARKET REGIME features (same value for all stocks on each date)
+    # These help the model understand broader market conditions and adapt strategies
+    
+    # Market volatility regime: cap-weighted average volatility vs historical norm
+    if "vol_20d_ann" in panel.columns:
+        market_vol = panel.groupby("date")["vol_20d_ann"].transform(
+            lambda x: np.average(
+                x.fillna(0.20), 
+                weights=np.power(10, panel.loc[x.index, "log_market_cap"].fillna(9))
+            ) if len(x) > 0 else 0.20
+        )
+        historical_norm = 0.15  # ~15% annualized is "normal" volatility
+        panel["market_vol_regime"] = market_vol / historical_norm
+    else:
+        panel["market_vol_regime"] = 1.0
+    
+    # Market trend: cap-weighted 20-day return per date
+    panel["market_trend_20d"] = market_ret_20d  # Already computed above
+    
+    # Market breadth: % of stocks above their 20-day MA on each date
+    if "ma20_ratio" in panel.columns:
+        panel["market_breadth"] = panel.groupby("date")["ma20_ratio"].transform(
+            lambda x: (x > 1.0).sum() / len(x) if len(x) > 0 else 0.5
+        )
+    else:
+        panel["market_breadth"] = 0.5
+    
+    # Market momentum acceleration: short-term vs medium-term momentum
+    if "ret_5d" in panel.columns:
+        market_ret_5d = panel.groupby("date")["ret_5d"].transform(
+            lambda x: np.average(
+                x.dropna(), 
+                weights=np.power(10, panel.loc[x.dropna().index, "log_market_cap"].fillna(9))
+            ) if len(x.dropna()) > 0 else x.mean()
+        )
+        # Annualize the difference for scale consistency
+        panel["market_momentum_accel"] = (market_ret_5d * 4) - market_ret_20d
+    else:
+        panel["market_momentum_accel"] = 0.0
+    
+    logger.info("Added market regime features (vol_regime, trend, breadth, momentum_accel)")
     
     # Compute market-relative returns (alpha = stock return - market return)
     panel["future_alpha"] = panel["future_ret"] - panel["market_ret"]
@@ -320,6 +473,24 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     else:
         target_col = "future_ret"
         logger.info("Training on absolute returns.")
+
+    # Apply TARGET ENCODING for sector/industry (replaces useless hash encoding)
+    # This encodes sectors by their historical mean return, giving the model meaningful signals
+    if "sector" in panel.columns and panel["sector"].notna().any():
+        logger.info("Applying target encoding for sector...")
+        panel["sector_target_enc"] = _apply_target_encoding(
+            panel, cat_col="sector", target_col=target_col, date_col="date", smoothing=20.0
+        )
+        n_sectors = panel["sector"].nunique()
+        logger.info("Target-encoded %d unique sectors", n_sectors)
+    
+    if "industry" in panel.columns and panel["industry"].notna().any():
+        logger.info("Applying target encoding for industry...")
+        panel["industry_target_enc"] = _apply_target_encoding(
+            panel, cat_col="industry", target_col=target_col, date_col="date", smoothing=20.0
+        )
+        n_industries = panel["industry"].nunique()
+        logger.info("Target-encoded %d unique industries", n_industries)
 
     # Drop rows without labels/features
     panel = panel.dropna(subset=[target_col])
@@ -391,8 +562,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         temp["pred"] = pred
         # CRITICAL: Always use future_ret for portfolio returns, even when training on alpha
         # The model predicts alpha (relative returns), but portfolio P&L uses absolute returns
+        # Also pass market_ret and beta for alpha calculation
         return evaluate_topn_returns(
-            temp, date_col="date", label_col="future_ret", pred_col="pred", top_n=top_n, cost_bps=cost_bps
+            temp, date_col="date", label_col="future_ret", pred_col="pred", 
+            top_n=top_n, cost_bps=cost_bps,
+            market_ret_col="market_ret" if "market_ret" in temp.columns else None,
+            beta_col="beta" if "beta" in temp.columns else None,
         )
 
 
@@ -487,6 +662,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     n_xgb = getattr(cfg, 'ensemble_xgb_count', 3)
     n_lgbm = getattr(cfg, 'ensemble_lgbm_count', 3)
     use_lgbm = getattr(cfg, 'use_lightgbm', True)
+    use_ranking = getattr(cfg, 'use_ranking_objective', True)
     
     if not use_lgbm:
         n_xgb = 7  # Fallback to 7 XGBoost models
@@ -497,35 +673,131 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_rel_paths: list[str] = []
     model_types: list[str] = []
 
+    # Prepare group data for LTR (Learning-to-Rank)
+    # XGBRanker needs group sizes (number of samples per query/date)
+    train_groups = None
+    val_groups = None
+    if use_ranking:
+        train_df = train_df.sort_values("date")  # Sort by date for grouping
+        train_groups = train_df.groupby("date").size().values
+        if not val_df.empty:
+            val_df = val_df.sort_values("date")
+            val_groups = val_df.groupby("date").size().values
+        logger.info("Using LTR objective with %d training groups (dates)", len(train_groups))
+    
+    objective_type = "LTR (rank)" if use_ranking else "regression"
     logger.info(
-        "Training mixed ensemble: %d XGBoost + %d LightGBM models on %s samples, %s tickers",
+        "Training mixed ensemble: %d XGBoost + %d LightGBM models on %s samples, %s tickers (%s)",
         n_xgb,
         n_lgbm,
         len(train_df),
         train_df["ticker"].nunique(),
+        objective_type,
     )
     
-    # Train XGBoost models
+    # Track selected features for metadata
+    selected_features = feature_cols.copy()
+    dropped_features = []
+    
+    # Train XGBoost models (with ranking or regression objective)
     for i in range(n_xgb):
         seed = 42 + i * 10
-        m = build_model(random_state=seed)
-        m.set_params(**best_regressor_params, early_stopping_rounds=50)
-        if not val_df.empty:
-            m.fit(
-                train_df[feature_cols],
-                train_df[label_col].astype(float),
-                eval_set=[(val_df[feature_cols], val_df[label_col].astype(float))],
-                verbose=False,
+        
+        # Use selected_features (may be filtered after first model)
+        current_features = selected_features
+        
+        if use_ranking:
+            # Use XGBRanker for learning-to-rank
+            m = xgb.XGBRanker(
+                n_estimators=600,
+                learning_rate=best_regressor_params.get("learning_rate", 0.05),
+                max_depth=best_regressor_params.get("max_depth", 6),
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                min_child_weight=best_regressor_params.get("min_child_weight", 5),
+                objective="rank:pairwise",
+                eval_metric="ndcg@30",  # Optimize NDCG for top-30
+                n_jobs=0,
+                random_state=seed,
             )
+            # Recompute groups if features changed (same data, just fewer columns)
+            if not val_df.empty and val_groups is not None:
+                m.fit(
+                    train_df[current_features],
+                    train_df[label_col].astype(float),
+                    group=train_groups,
+                    eval_set=[(val_df[current_features], val_df[label_col].astype(float))],
+                    eval_group=[val_groups],
+                    verbose=False,
+                )
+            else:
+                m.fit(train_df[current_features], train_df[label_col].astype(float), group=train_groups)
         else:
-            m.fit(train_df[feature_cols], train_df[label_col].astype(float))
+            # Use XGBRegressor for regression
+            m = build_model(random_state=seed)
+            m.set_params(**best_regressor_params, early_stopping_rounds=50)
+            if not val_df.empty:
+                m.fit(
+                    train_df[current_features],
+                    train_df[label_col].astype(float),
+                    eval_set=[(val_df[current_features], val_df[label_col].astype(float))],
+                    verbose=False,
+                )
+            else:
+                m.fit(train_df[current_features], train_df[label_col].astype(float))
+        
+        # After first model: perform feature selection based on importance
+        if i == 0 and len(feature_cols) > 10:
+            try:
+                # Get feature importances (gain-based)
+                importance = m.get_booster().get_score(importance_type="gain")
+                if importance:
+                    # Map feature names (fX -> actual name)
+                    feature_name_map = {f"f{j}": fname for j, fname in enumerate(current_features)}
+                    importance_named = {feature_name_map.get(k, k): v for k, v in importance.items()}
+                    
+                    # Sort by importance
+                    sorted_imp = sorted(importance_named.items(), key=lambda x: x[1], reverse=True)
+                    total_importance = sum(v for _, v in sorted_imp)
+                    
+                    if total_importance > 0:
+                        # Keep features that account for top 90% of cumulative importance
+                        cumsum = 0.0
+                        keep_features = []
+                        threshold = 0.90  # Keep features up to 90% cumulative importance
+                        
+                        for fname, imp in sorted_imp:
+                            cumsum += imp / total_importance
+                            keep_features.append(fname)
+                            if cumsum >= threshold:
+                                break
+                        
+                        # Always keep at least 10 features
+                        min_features = min(10, len(feature_cols))
+                        if len(keep_features) < min_features:
+                            keep_features = [f for f, _ in sorted_imp[:min_features]]
+                        
+                        # Identify dropped features
+                        dropped_features = [f for f in feature_cols if f not in keep_features]
+                        
+                        if dropped_features:
+                            logger.info(
+                                "Feature selection: keeping %d/%d features (%.1f%% importance)",
+                                len(keep_features), len(feature_cols), threshold * 100
+                            )
+                            logger.info("Dropped features: %s", dropped_features[:10])  # Log first 10
+                            selected_features = keep_features
+            except Exception as e:
+                logger.warning("Feature selection failed, using all features: %s", e)
+        
         rel = f"xgb_model_{i}.json"
         save_model(m, model_dir / rel)
         reg_rel_paths.append(rel)
         model_types.append("xgboost")
-        logger.info("Trained XGBoost model %d/%d", i+1, n_xgb)
+        logger.info("Trained XGBoost %s model %d/%d", "ranker" if use_ranking else "regressor", i+1, n_xgb)
     
-    # Train LightGBM models if enabled
+    # Train LightGBM models if enabled (using selected features)
     if use_lgbm and n_lgbm > 0:
         for i in range(n_lgbm):
             seed = 42 + i * 10
@@ -542,13 +814,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             m.set_params(**lgbm_params)
             if not val_df.empty:
                 m.fit(
-                    train_df[feature_cols],
+                    train_df[selected_features],
                     train_df[label_col].astype(float),
-                    eval_set=[(val_df[feature_cols], val_df[label_col].astype(float))],
+                    eval_set=[(val_df[selected_features], val_df[label_col].astype(float))],
                     callbacks=[],  # Disable callbacks to reduce verbosity
                 )
             else:
-                m.fit(train_df[feature_cols], train_df[label_col].astype(float))
+                m.fit(train_df[selected_features], train_df[label_col].astype(float))
             rel = f"lgbm_model_{i}.txt"
             save_model(m, model_dir / rel)
             reg_rel_paths.append(rel)
@@ -561,14 +833,19 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         for rel, mtype in zip(reg_rel_paths, model_types):
             model = load_model(model_dir / rel, mtype)
             if mtype == "xgboost":
-                preds += model.predict(xgb.DMatrix(holdout_df[feature_cols])).astype(float)
+                preds += model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
             else:  # lightgbm
-                preds += model.predict(holdout_df[feature_cols]).astype(float)
+                preds += model.predict(holdout_df[selected_features]).astype(float)
         preds = preds / float(len(reg_rel_paths))
         reg_holdout_preds = preds.tolist()
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
+
+    # Load all trained models for walk-forward validation
+    reg_models = []
+    for rel, mtype in zip(reg_rel_paths, model_types):
+        reg_models.append(load_model(model_dir / rel, mtype))
 
 
 
@@ -666,19 +943,198 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         if "daily" in reg_holdout_topn and isinstance(reg_holdout_topn["daily"], pd.DataFrame):
             daily_df = reg_holdout_topn["daily"]
             if "mean_ret" in daily_df.columns and len(daily_df) > 0:
-                portfolio_metrics = compute_portfolio_metrics(daily_df["mean_ret"])
+                # Extract alpha columns if available
+                daily_alpha = None
+                daily_market = None
+                if "beta_adj_alpha" in daily_df.columns:
+                    daily_alpha = daily_df["beta_adj_alpha"]
+                elif "simple_alpha" in daily_df.columns:
+                    daily_alpha = daily_df["simple_alpha"]
+                if "market_ret" in daily_df.columns:
+                    daily_market = daily_df["market_ret"]
+                
+                portfolio_metrics = compute_portfolio_metrics(
+                    daily_df["mean_ret"],
+                    daily_alpha=daily_alpha,
+                    daily_market=daily_market,
+                )
+                
+                # Log both raw and alpha-adjusted metrics
+                alpha_ann = portfolio_metrics.get("alpha_ann", float("nan"))
+                alpha_sharpe = portfolio_metrics.get("alpha_sharpe", float("nan"))
                 logger.info(
                     "Portfolio metrics: Sharpe=%.2f, Sortino=%.2f, MaxDD=%.2f%%",
                     portfolio_metrics.get("sharpe_ratio", 0),
                     portfolio_metrics.get("sortino_ratio", 0),
                     portfolio_metrics.get("max_drawdown", 0) * 100,
                 )
+                if not np.isnan(alpha_ann):
+                    logger.info(
+                        "Alpha metrics: Ann.Alpha=%.2f%%, Alpha.Sharpe=%.2f",
+                        alpha_ann * 100,
+                        alpha_sharpe,
+                    )
+
+    # Run REALISTIC portfolio simulation (5-day holding, proper costs)
+    # This is more realistic than daily rebalancing
+    realistic_metrics = {}
+    if not holdout_df.empty and len(reg_holdout_preds) > 0:
+        holdout_with_preds = holdout_df.copy()
+        holdout_with_preds["pred_return"] = reg_holdout_preds
+        holdout_with_preds["ticker"] = holdout_with_preds.index if "ticker" not in holdout_with_preds.columns else holdout_with_preds["ticker"]
+        
+        realistic_result = simulate_realistic_portfolio(
+            holdout_with_preds.reset_index(drop=True),
+            date_col="date",
+            ticker_col="ticker",
+            label_col="future_ret",
+            pred_col="pred_return",
+            top_n=top_n,
+            hold_days=horizon,  # Hold for prediction horizon
+            cost_bps=20.0,  # More realistic round-trip cost
+            market_ret_col="market_ret" if "market_ret" in holdout_with_preds.columns else None,
+        )
+        realistic_metrics = realistic_result.get("summary", {})
+        
+        if realistic_metrics.get("n_rebalances", 0) > 0:
+            logger.info(
+                "Realistic portfolio (%d-day hold): Sharpe=%.2f, Ann.Ret=%.1f%%, MaxDD=%.1f%%, Turnover=%.0f%%",
+                horizon,
+                realistic_metrics.get("sharpe_ratio", 0),
+                realistic_metrics.get("ann_return", 0) * 100,
+                realistic_metrics.get("max_drawdown", 0) * 100,
+                realistic_metrics.get("avg_turnover", 0) * 100,
+            )
+            if not np.isnan(realistic_metrics.get("alpha_ann", float("nan"))):
+                logger.info(
+                    "Realistic alpha: Ann.Alpha=%.2f%%",
+                    realistic_metrics.get("alpha_ann", 0) * 100,
+                )
+
+    # Walk-forward validation across multiple periods
+    # This gives more robust evaluation across different market regimes
+    walk_forward_results = {}
+    wf_periods = build_walk_forward_periods(
+        dates, n_periods=4, test_window=60, embargo_days=cfg.train_embargo_days, min_train=252
+    )
+    
+    if len(wf_periods) >= 2 and reg_models:
+        logger.info("Running walk-forward validation across %d periods...", len(wf_periods))
+        period_metrics = []
+        
+        for period in wf_periods:
+            # Get data for this period
+            period_test_df = panel[panel["date"].isin(period.test_dates)]
+            
+            if period_test_df.empty or len(period_test_df) < 100:
+                continue
+            
+            # Make predictions using ensemble (use selected features)
+            period_X = period_test_df[selected_features].astype(float)
+            period_preds = np.zeros(len(period_test_df))
+            for m in reg_models:
+                if hasattr(m, "predict"):
+                    try:
+                        period_preds += m.predict(xgb.DMatrix(period_X) if isinstance(m, xgb.Booster) else period_X)
+                    except Exception:
+                        period_preds += m.predict(period_X)
+                else:
+                    period_preds += m.predict(xgb.DMatrix(period_X))
+            period_preds /= len(reg_models)
+            
+            # Evaluate with realistic simulation
+            period_test_df = period_test_df.copy()
+            period_test_df["pred_return"] = period_preds
+            period_test_df["ticker"] = period_test_df.index if "ticker" not in period_test_df.columns else period_test_df["ticker"]
+            
+            period_result = simulate_realistic_portfolio(
+                period_test_df.reset_index(drop=True),
+                date_col="date",
+                ticker_col="ticker",
+                label_col="future_ret",
+                pred_col="pred_return",
+                top_n=top_n,
+                hold_days=horizon,
+                cost_bps=20.0,
+                market_ret_col="market_ret" if "market_ret" in period_test_df.columns else None,
+            )
+            
+            period_summary = period_result.get("summary", {})
+            period_summary["period_id"] = period.period_id
+            period_summary["test_start"] = str(period.test_start.date())
+            period_summary["test_end"] = str(period.test_end.date())
+            period_summary["n_test_samples"] = len(period_test_df)
+            period_metrics.append(period_summary)
+            
+            logger.info(
+                "  Period %d (%s to %s): Sharpe=%.2f, Alpha=%.1f%%",
+                period.period_id,
+                period.test_start.strftime("%Y-%m"),
+                period.test_end.strftime("%Y-%m"),
+                period_summary.get("sharpe_ratio", 0),
+                period_summary.get("alpha_ann", 0) * 100,
+            )
+        
+        if period_metrics:
+            walk_forward_results = aggregate_walk_forward_results(period_metrics)
+            agg = walk_forward_results.get("aggregate", {})
+            consistency = walk_forward_results.get("consistency", 0)
+            
+            sharpe_agg = agg.get("sharpe_ratio", {})
+            alpha_agg = agg.get("alpha_ann", {})
+            
+            logger.info(
+                "Walk-forward summary: Sharpe=%.2f±%.2f, Alpha=%.1f%%±%.1f%%, Consistency=%.0f%%",
+                sharpe_agg.get("mean", 0),
+                sharpe_agg.get("std", 0),
+                alpha_agg.get("mean", 0) * 100,
+                alpha_agg.get("std", 0) * 100,
+                consistency * 100,
+            )
+
+    # Compute final sector/industry encodings for inference
+    # These are the mean target values per category from ALL training data
+    sector_encodings = {}
+    industry_encodings = {}
+    global_mean = float(panel[label_col].mean())
+    
+    if "sector" in panel.columns:
+        sector_stats = panel.groupby("sector")[label_col].agg(["mean", "count"])
+        smoothing = 20.0
+        for sector in sector_stats.index:
+            n = sector_stats.loc[sector, "count"]
+            mean = sector_stats.loc[sector, "mean"]
+            # Apply same smoothing as during training
+            encoded = (n * mean + smoothing * global_mean) / (n + smoothing)
+            sector_encodings[str(sector)] = float(encoded)
+        logger.info("Saved %d sector encodings for inference", len(sector_encodings))
+    
+    if "industry" in panel.columns:
+        industry_stats = panel.groupby("industry")[label_col].agg(["mean", "count"])
+        for industry in industry_stats.index:
+            n = industry_stats.loc[industry, "count"]
+            mean = industry_stats.loc[industry, "mean"]
+            encoded = (n * mean + smoothing * global_mean) / (n + smoothing)
+            industry_encodings[str(industry)] = float(encoded)
+        logger.info("Saved %d industry encodings for inference", len(industry_encodings))
 
     metadata = {
         "horizon_days": horizon,
         "prediction_offset": 1,
         "note": "Model predicts (horizon+1) days forward to enable same-day actionability",
-        "feature_columns": FEATURE_COLUMNS,
+        "training_config": {
+            "use_market_relative_returns": use_market_relative,
+            "use_ranking_objective": use_ranking,
+            "target_column": label_col,
+            "n_xgb_models": n_xgb,
+            "n_lgbm_models": n_lgbm,
+        },
+        "feature_columns": selected_features,  # Features used in final models (after selection)
+        "feature_selection": {
+            "original_count": len(feature_cols),
+            "selected_count": len(selected_features),
+            "dropped_features": dropped_features,
+        },
         "filters": {
             "min_price_cad": float(cfg.min_price_cad),
             "min_avg_dollar_volume_cad": float(cfg.min_avg_dollar_volume_cad),
@@ -701,7 +1157,17 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "validation_metrics": validation_metrics,
         "calibration": calibration_metrics,
         "portfolio_metrics": portfolio_metrics,
+        "realistic_portfolio_metrics": realistic_metrics,  # 5-day hold simulation
+        "walk_forward_validation": walk_forward_results,  # Multi-period robustness
         "feature_importance": feature_importance,
+        # Calibration map for realistic prediction magnitudes
+        "prediction_calibration": build_calibration_map(panel["future_ret"].dropna(), n_quantiles=20),
+        # Target encodings for inference
+        "target_encodings": {
+            "sector": sector_encodings,
+            "industry": industry_encodings,
+            "global_mean": global_mean,
+        },
     }
     metadata_rel = "metrics.json"
     write_json(model_dir / metadata_rel, metadata)

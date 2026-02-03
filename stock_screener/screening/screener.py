@@ -63,15 +63,96 @@ def score_universe(
     return df
 
 
+def select_sector_neutral(
+    df: pd.DataFrame,
+    top_n: int,
+    sector_col: str = "sector",
+    score_col: str = "score",
+    min_per_sector: int = 1,
+    max_per_sector: int | None = None,
+) -> pd.DataFrame:
+    """Select top stocks with sector diversification.
+    
+    Instead of simply taking top-N overall (which may concentrate in 1-2 sectors),
+    this allocates picks across sectors proportionally, then fills remaining
+    slots with the best overall picks.
+    """
+    n = max(1, int(top_n))
+    
+    # If no sector info, fall back to simple top-N
+    if sector_col not in df.columns:
+        return df.head(n)
+    
+    df = df.copy()
+    df["_sector"] = df[sector_col].fillna("Unknown")
+    
+    # Count stocks per sector
+    sector_counts = df.groupby("_sector").size()
+    n_sectors = len(sector_counts)
+    
+    if n_sectors <= 1:
+        return df.drop(columns=["_sector"]).head(n)
+    
+    # Calculate target allocation per sector (proportional to sector size)
+    # Each sector gets at least min_per_sector, up to max_per_sector
+    base_per_sector = max(min_per_sector, n // n_sectors)
+    if max_per_sector is not None:
+        base_per_sector = min(base_per_sector, max_per_sector)
+    
+    selected = []
+    remaining_slots = n
+    
+    # First pass: pick top stocks from each sector
+    for sector in sector_counts.index:
+        sector_df = df[df["_sector"] == sector].sort_values(score_col, ascending=False)
+        
+        # Allocate proportionally to sector size
+        sector_weight = sector_counts[sector] / len(df)
+        sector_slots = max(min_per_sector, int(n * sector_weight))
+        sector_slots = min(sector_slots, remaining_slots, len(sector_df))
+        if max_per_sector is not None:
+            sector_slots = min(sector_slots, max_per_sector)
+        
+        if sector_slots > 0:
+            picks = sector_df.head(sector_slots)
+            selected.append(picks)
+            remaining_slots -= len(picks)
+    
+    if not selected:
+        return df.drop(columns=["_sector"]).head(n)
+    
+    result = pd.concat(selected, ignore_index=False)
+    
+    # Second pass: fill remaining slots with best overall (not already selected)
+    if remaining_slots > 0:
+        already_picked = set(result.index)
+        remaining = df[~df.index.isin(already_picked)].sort_values(score_col, ascending=False)
+        fill = remaining.head(remaining_slots)
+        result = pd.concat([result, fill], ignore_index=False)
+    
+    # Sort by score and return
+    result = result.sort_values(score_col, ascending=False).drop(columns=["_sector"])
+    return result.head(n)
+
+
 def screen_universe(
     features: pd.DataFrame,
     min_price_cad: float,
     min_avg_dollar_volume_cad: float,
     top_n: int,
     logger,
+    sector_neutral: bool = True,
 ) -> pd.DataFrame:
-    """Filter and rank tickers by a robust multi-factor score."""
-
+    """Filter and rank tickers by a robust multi-factor score.
+    
+    Args:
+        features: Feature DataFrame with tickers
+        min_price_cad: Minimum stock price filter
+        min_avg_dollar_volume_cad: Minimum liquidity filter
+        top_n: Number of stocks to select
+        logger: Logger instance
+        sector_neutral: If True, diversify picks across sectors
+    """
     scored = score_universe(
         features=features,
         min_price_cad=min_price_cad,
@@ -82,7 +163,103 @@ def screen_universe(
     n = int(top_n)
     if n <= 0:
         n = 50
-    out = scored.head(n).copy()
-    logger.info("Screened universe: %s tickers (from %s after filters)", len(out), len(scored))
+    
+    if sector_neutral and "sector" in scored.columns:
+        out = select_sector_neutral(scored, top_n=n, sector_col="sector", score_col="score")
+        n_sectors = scored["sector"].nunique()
+        logger.info(
+            "Sector-neutral selection: %d tickers from %d sectors (from %d after filters)",
+            len(out), out["sector"].nunique() if "sector" in out.columns else 0, len(scored)
+        )
+    else:
+        out = scored.head(n).copy()
+        logger.info("Screened universe: %s tickers (from %s after filters)", len(out), len(scored))
+    
     return out
+
+
+def apply_entry_filters(
+    df: pd.DataFrame,
+    *,
+    min_confidence: float | None = None,
+    min_pred_return: float | None = None,
+    max_volatility: float | None = None,
+    min_momentum_5d: float | None = None,
+    momentum_alignment: bool = True,
+    logger=None,
+) -> tuple[pd.DataFrame, dict]:
+    """Apply entry confirmation filters to reduce false positives.
+    
+    Returns:
+        Tuple of (filtered DataFrame, stats dict)
+    """
+    original_count = len(df)
+    filtered = df.copy()
+    rejection_reasons = {}
+    
+    # Filter by model confidence
+    if min_confidence is not None and "pred_confidence" in filtered.columns:
+        mask = filtered["pred_confidence"] >= min_confidence
+        rejected = (~mask).sum()
+        if rejected > 0:
+            rejection_reasons["low_confidence"] = int(rejected)
+        filtered = filtered[mask]
+    
+    # Filter by predicted return (calibrated)
+    if min_pred_return is not None and "pred_return" in filtered.columns:
+        mask = filtered["pred_return"] >= min_pred_return
+        rejected = (~mask).sum()
+        if rejected > 0:
+            rejection_reasons["low_pred_return"] = int(rejected)
+        filtered = filtered[mask]
+    
+    # Filter by volatility (avoid highly volatile stocks)
+    if max_volatility is not None and "vol_60d_ann" in filtered.columns:
+        mask = filtered["vol_60d_ann"] <= max_volatility
+        rejected = (~mask).sum()
+        if rejected > 0:
+            rejection_reasons["high_volatility"] = int(rejected)
+        filtered = filtered[mask]
+    
+    # Filter by recent momentum (avoid stocks in freefall)
+    if min_momentum_5d is not None and "ret_5d" in filtered.columns:
+        mask = filtered["ret_5d"] >= min_momentum_5d
+        rejected = (~mask).sum()
+        if rejected > 0:
+            rejection_reasons["negative_momentum"] = int(rejected)
+        filtered = filtered[mask]
+    
+    # Momentum-price alignment: reject if model is bullish but price trend is strongly bearish
+    # This helps avoid "catching falling knives"
+    if momentum_alignment and "pred_return" in filtered.columns and "ret_5d" in filtered.columns:
+        # For stocks with positive prediction, require 5d momentum not severely negative
+        # Threshold: if predicting +X%, allow momentum down to -2X%
+        pred_ret = filtered["pred_return"].fillna(0)
+        ret_5d = filtered["ret_5d"].fillna(0)
+        
+        # Calculate alignment threshold: more bullish prediction allows slightly worse momentum
+        alignment_threshold = -2.0 * pred_ret.clip(lower=0)
+        alignment_threshold = alignment_threshold.clip(lower=-0.10)  # Max -10% floor
+        
+        # Misalignment: bullish prediction (>0) but momentum far below threshold
+        misaligned = (pred_ret > 0.005) & (ret_5d < alignment_threshold)
+        rejected = misaligned.sum()
+        if rejected > 0:
+            rejection_reasons["momentum_misalignment"] = int(rejected)
+        filtered = filtered[~misaligned]
+    
+    stats = {
+        "original_count": original_count,
+        "filtered_count": len(filtered),
+        "rejected_count": original_count - len(filtered),
+        "rejection_reasons": rejection_reasons,
+    }
+    
+    if logger and stats["rejected_count"] > 0:
+        logger.info(
+            "Entry filters: %d -> %d stocks (rejected: %s)",
+            original_count, len(filtered), rejection_reasons
+        )
+    
+    return filtered, stats
 

@@ -168,6 +168,12 @@ def compute_features(
         vol_base = float(avg_vol_30d.iloc[-1]) if not avg_vol_30d.empty else float("nan")
         vol_anom_30d = float(vol.iloc[-1] / vol_base) if vol_base and not pd.isna(vol_base) else float("nan")
 
+        # Momentum quality features
+        momentum_reversal = ret_5d - ret_20d  # Short-term reversal signal
+        momentum_acceleration = ret_20d - ret_60d  # Momentum change
+        ret_20d_lagged = _safe_pct_change(close_cad.iloc[:-5], 20) if len(close_cad) > 25 else float("nan")  # Lagged momentum
+        ret_60d_lagged = _safe_pct_change(close_cad.iloc[:-5], 60) if len(close_cad) > 65 else float("nan")  # Lagged long-term momentum
+
         fx_ret_5d = float(fx.pct_change(5).iloc[-1]) if not is_tsx and len(fx) >= 6 else 0.0
         fx_ret_20d = float(fx.pct_change(20).iloc[-1]) if not is_tsx and len(fx) >= 21 else 0.0
 
@@ -257,10 +263,22 @@ def compute_features(
                 "dist_52w_high": dist_52w_high,
                 "dist_52w_low": dist_52w_low,
                 "vol_anom_30d": vol_anom_30d,
+                # Momentum quality features
+                "momentum_reversal": momentum_reversal,
+                "momentum_acceleration": momentum_acceleration,
+                "ret_20d_lagged": ret_20d_lagged,
+                "ret_60d_lagged": ret_60d_lagged,
+                # Relative momentum (computed cross-sectionally after all tickers)
+                "relative_momentum_20d": float("nan"),  # Placeholder - filled after DataFrame is built
+                "relative_momentum_60d": float("nan"),  # Placeholder - filled after DataFrame is built
                 "log_market_cap": float(np.log10(market_cap_cad)) if market_cap_cad and market_cap_cad > 0 else float("nan"),
                 "beta": beta,
+                "sector": sector,  # Raw sector for target encoding
+                "industry": industry,  # Raw industry for target encoding
                 "sector_hash": _hash_to_float(str(sector)) if sector else float("nan"),
                 "industry_hash": _hash_to_float(str(industry)) if industry else float("nan"),
+                "sector_target_enc": float("nan"),  # Placeholder - filled by apply_target_encodings()
+                "industry_target_enc": float("nan"),  # Placeholder - filled by apply_target_encodings()
                 "fx_ret_5d": fx_ret_5d,
                 "fx_ret_20d": fx_ret_20d,
                 # Raw fundamental fields
@@ -304,6 +322,54 @@ def compute_features(
         if col in df.columns:
             df[out_col] = df[col].rank(pct=True)
 
+    # Compute RELATIVE MOMENTUM (stock vs cap-weighted market average)
+    if "ret_20d" in df.columns and "log_market_cap" in df.columns:
+        mcap = np.power(10, df["log_market_cap"].fillna(9))
+        weights = mcap / mcap.sum()
+        market_ret_20d = (df["ret_20d"].fillna(0) * weights).sum()
+        market_ret_60d = (df["ret_60d"].fillna(0) * weights).sum() if "ret_60d" in df.columns else 0
+        df["relative_momentum_20d"] = df["ret_20d"] - market_ret_20d
+        df["relative_momentum_60d"] = df["ret_60d"] - market_ret_60d if "ret_60d" in df.columns else float("nan")
+
+    # Compute MARKET REGIME features (same value for all stocks on this date)
+    # These help the model understand broader market conditions
+    if "vol_20d_ann" in df.columns and "log_market_cap" in df.columns:
+        # Market volatility regime: cap-weighted average volatility vs historical norm (~15%)
+        mcap = np.power(10, df["log_market_cap"].fillna(9))
+        weights = mcap / mcap.sum()
+        market_vol = (df["vol_20d_ann"].fillna(0.20) * weights).sum()
+        historical_norm = 0.15  # ~15% annualized is "normal" volatility
+        df["market_vol_regime"] = market_vol / historical_norm  # >1 = high vol, <1 = low vol
+    else:
+        df["market_vol_regime"] = 1.0
+
+    if "ret_20d" in df.columns and "log_market_cap" in df.columns:
+        # Market trend: cap-weighted 20-day return
+        mcap = np.power(10, df["log_market_cap"].fillna(9))
+        weights = mcap / mcap.sum()
+        df["market_trend_20d"] = (df["ret_20d"].fillna(0) * weights).sum()
+    else:
+        df["market_trend_20d"] = 0.0
+
+    if "ma20_ratio" in df.columns:
+        # Market breadth: % of stocks above their 20-day MA
+        above_ma = (df["ma20_ratio"] > 1.0).sum()
+        total = len(df)
+        df["market_breadth"] = above_ma / total if total > 0 else 0.5
+    else:
+        df["market_breadth"] = 0.5
+
+    if "ret_5d" in df.columns and "ret_20d" in df.columns and "log_market_cap" in df.columns:
+        # Market momentum acceleration: difference between short and medium term
+        mcap = np.power(10, df["log_market_cap"].fillna(9))
+        weights = mcap / mcap.sum()
+        market_ret_5d = (df["ret_5d"].fillna(0) * weights).sum()
+        market_ret_20d_val = (df["ret_20d"].fillna(0) * weights).sum()
+        # Annualize the difference for scale consistency
+        df["market_momentum_accel"] = (market_ret_5d * 4) - market_ret_20d_val  # 5d * 4 ≈ 20d
+    else:
+        df["market_momentum_accel"] = 0.0
+
     # Add fundamental composite scores
     # Note: date_col=None is correct here since compute_features() produces single-date snapshots.
     # Z-scoring across all tickers for the current date IS cross-sectional normalization.
@@ -313,4 +379,41 @@ def compute_features(
     # Keep the most recent observations per ticker (should already be unique).
     df = df.drop_duplicates(subset=["ticker"]).set_index("ticker").sort_index()
     logger.info("Computed features: %s tickers", len(df))
+    return df
+
+
+def apply_target_encodings(
+    features: pd.DataFrame,
+    target_encodings: dict,
+    logger,
+) -> pd.DataFrame:
+    """Apply saved target encodings from training to inference features.
+    
+    Args:
+        features: DataFrame with 'sector' and 'industry' columns
+        target_encodings: Dict from training metadata with 'sector', 'industry', and 'global_mean'
+        logger: Logger instance
+    """
+    if not target_encodings:
+        logger.warning("No target encodings provided")
+        return features
+    
+    global_mean = target_encodings.get("global_mean", 0.0)
+    sector_enc = target_encodings.get("sector", {})
+    industry_enc = target_encodings.get("industry", {})
+    
+    df = features.copy()
+    
+    # Apply sector encoding
+    if sector_enc and "sector" in df.columns:
+        df["sector_target_enc"] = df["sector"].map(sector_enc).fillna(global_mean)
+        n_mapped = df["sector_target_enc"].notna().sum()
+        logger.info("Applied sector target encoding: %d/%d tickers mapped", n_mapped, len(df))
+    
+    # Apply industry encoding
+    if industry_enc and "industry" in df.columns:
+        df["industry_target_enc"] = df["industry"].map(industry_enc).fillna(global_mean)
+        n_mapped = df["industry_target_enc"].notna().sum()
+        logger.info("Applied industry target encoding: %d/%d tickers mapped", n_mapped, len(df))
+    
     return df

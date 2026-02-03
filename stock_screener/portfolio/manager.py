@@ -21,6 +21,8 @@ class TradeAction:
     shares: int
     price_cad: float
     days_held: int | None = None
+    pred_return: float | None = None  # Predicted return for this position
+    expected_sell_date: str | None = None  # Expected sell date (based on max hold days)
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,20 @@ class PortfolioManager:
         max_positions: int,
         stop_loss_pct: float | None,
         take_profit_pct: float | None,
+        trailing_stop_enabled: bool = True,
+        trailing_stop_activation_pct: float = 0.05,
+        trailing_stop_distance_pct: float = 0.08,
+        signal_decay_exit_enabled: bool = True,
+        signal_decay_threshold: float = -0.02,
+        dynamic_holding_enabled: bool = True,
+        dynamic_holding_vol_scale: float = 0.5,
+        vol_adjusted_stop_enabled: bool = True,
+        vol_adjusted_stop_base: float = 0.08,
+        vol_adjusted_stop_min: float = 0.04,
+        vol_adjusted_stop_max: float = 0.15,
+        age_urgency_enabled: bool = True,
+        age_urgency_start_day: int = 2,
+        age_urgency_min_return: float = 0.01,
         peak_detection_enabled: bool,
         peak_sell_portion_pct: float,
         peak_min_gain_pct: float | None,
@@ -59,6 +75,20 @@ class PortfolioManager:
         self.max_positions = max(1, int(max_positions))
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.trailing_stop_enabled = trailing_stop_enabled
+        self.trailing_stop_activation_pct = trailing_stop_activation_pct
+        self.trailing_stop_distance_pct = trailing_stop_distance_pct
+        self.signal_decay_exit_enabled = signal_decay_exit_enabled
+        self.signal_decay_threshold = signal_decay_threshold
+        self.dynamic_holding_enabled = dynamic_holding_enabled
+        self.dynamic_holding_vol_scale = dynamic_holding_vol_scale
+        self.vol_adjusted_stop_enabled = vol_adjusted_stop_enabled
+        self.vol_adjusted_stop_base = vol_adjusted_stop_base
+        self.vol_adjusted_stop_min = vol_adjusted_stop_min
+        self.vol_adjusted_stop_max = vol_adjusted_stop_max
+        self.age_urgency_enabled = age_urgency_enabled
+        self.age_urgency_start_day = max(1, int(age_urgency_start_day))
+        self.age_urgency_min_return = age_urgency_min_return
         self.peak_detection_enabled = peak_detection_enabled
         self.peak_sell_portion_pct = peak_sell_portion_pct
         self.peak_min_gain_pct = peak_min_gain_pct
@@ -255,6 +285,82 @@ class PortfolioManager:
         if len(state.pnl_history) > int(max_points):
             state.pnl_history = state.pnl_history[-int(max_points) :]
 
+    def compute_dynamic_holding_days(
+        self,
+        market_vol_regime: float | None,
+    ) -> tuple[int, int]:
+        """Compute adjusted holding days based on market volatility.
+        
+        In high volatility (regime > 1), reduce holding period.
+        In low volatility (regime < 1), extend holding period.
+        
+        Returns:
+            Tuple of (adjusted_max_holding_days, adjusted_hard_limit)
+        """
+        if not self.dynamic_holding_enabled or market_vol_regime is None:
+            return self.max_holding_days, self.max_holding_days_hard
+        
+        # Clamp regime to reasonable bounds [0.5, 2.0]
+        regime = max(0.5, min(2.0, float(market_vol_regime)))
+        
+        # Scale factor: high vol (regime=2) -> 0.5x days, low vol (regime=0.5) -> 1.5x days
+        # Formula: scale = 1 + (1 - regime) * vol_scale
+        # regime=1.0 -> scale=1.0 (normal)
+        # regime=2.0 -> scale=0.5 (shorter holds in high vol)
+        # regime=0.5 -> scale=1.25 (longer holds in low vol)
+        scale = 1.0 + (1.0 - regime) * self.dynamic_holding_vol_scale
+        scale = max(0.5, min(1.5, scale))  # Clamp to [0.5, 1.5]
+        
+        adjusted_max = max(2, int(round(self.max_holding_days * scale)))
+        adjusted_hard = max(adjusted_max + 2, int(round(self.max_holding_days_hard * scale)))
+        
+        return adjusted_max, adjusted_hard
+
+    def compute_vol_adjusted_stop(
+        self,
+        ticker: str,
+        features: pd.DataFrame | None,
+    ) -> float | None:
+        """Compute volatility-adjusted stop-loss for a ticker.
+        
+        High volatility stocks get wider stops to avoid noise-triggered exits.
+        Low volatility stocks get tighter stops to protect capital.
+        
+        Returns:
+            Stop-loss percentage (e.g., 0.08 for 8%) or None if disabled
+        """
+        if not self.vol_adjusted_stop_enabled:
+            return self.stop_loss_pct
+        
+        if features is None or "vol_60d_ann" not in features.columns:
+            return self.vol_adjusted_stop_base
+        
+        # Get volatility for this ticker
+        if ticker in features.index:
+            vol = features.loc[ticker, "vol_60d_ann"]
+        elif "ticker" in features.columns:
+            row = features[features["ticker"] == ticker]
+            vol = row["vol_60d_ann"].iloc[0] if len(row) > 0 else None
+        else:
+            vol = None
+        
+        if vol is None or pd.isna(vol):
+            return self.vol_adjusted_stop_base
+        
+        # Typical stock volatility ~30% annualized, scale stop-loss proportionally
+        # vol_ratio = stock_vol / typical_vol
+        typical_vol = 0.30
+        vol_ratio = float(vol) / typical_vol
+        
+        # Scale stop-loss: higher vol -> wider stop
+        # At vol_ratio=1.0, use base stop
+        # At vol_ratio=2.0, use wider stop (approaching max)
+        # At vol_ratio=0.5, use tighter stop (approaching min)
+        adjusted_stop = self.vol_adjusted_stop_base * vol_ratio
+        adjusted_stop = max(self.vol_adjusted_stop_min, min(self.vol_adjusted_stop_max, adjusted_stop))
+        
+        return adjusted_stop
+
     def apply_exits(
         self,
         state: PortfolioState,
@@ -263,11 +369,22 @@ class PortfolioManager:
         pred_return: pd.Series | None = None,
         score: pd.Series | None = None,
         features: pd.DataFrame | None = None,
+        market_vol_regime: float | None = None,
     ) -> list[TradeAction]:
         actions: list[TradeAction] = []
         now = _utcnow()
         open_positions: list[Position] = [p for p in state.positions if p.status == "OPEN"]
         keep: list[Position] = []
+        
+        # Compute dynamic holding period based on market volatility
+        max_hold, max_hold_hard = self.compute_dynamic_holding_days(market_vol_regime)
+        if self.dynamic_holding_enabled and market_vol_regime is not None:
+            if max_hold != self.max_holding_days:
+                self.logger.info(
+                    "Dynamic holding: vol_regime=%.2f, max_days=%d->%d, hard=%d->%d",
+                    market_vol_regime, self.max_holding_days, max_hold,
+                    self.max_holding_days_hard, max_hold_hard
+                )
 
         for p in open_positions:
             px = float(prices_cad.get(p.ticker, float("nan")))
@@ -277,10 +394,10 @@ class PortfolioManager:
 
             days = p.days_held(now)
             # Time exits:
-            # - Default behavior: exit at max_holding_days.
+            # - Default behavior: exit at max_holding_days (dynamic if enabled).
             # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
-            if days >= self.max_holding_days:
-                if days >= self.max_holding_days_hard:
+            if days >= max_hold:
+                if days >= max_hold_hard:
                     actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT_HARD", days_held=days))
                     continue
 
@@ -320,13 +437,70 @@ class PortfolioManager:
             else:
                 ret = 0.0
 
-            if self.stop_loss_pct is not None and ret <= -abs(float(self.stop_loss_pct)):
+            # Volatility-adjusted or fixed stop-loss
+            effective_stop = self.compute_vol_adjusted_stop(p.ticker, features)
+            if effective_stop is not None and ret <= -abs(float(effective_stop)):
+                if self.vol_adjusted_stop_enabled:
+                    self.logger.info(
+                        "%s vol-adjusted stop: ret=%.1f%%, stop=%.1f%%",
+                        p.ticker, ret * 100, effective_stop * 100
+                    )
                 actions.append(self._sell_position(state, p, price_cad=px, reason="STOP_LOSS", days_held=days))
                 continue
 
             if self.take_profit_pct is not None and ret >= abs(float(self.take_profit_pct)):
                 actions.append(self._sell_position(state, p, price_cad=px, reason="TAKE_PROFIT", days_held=days))
                 continue
+
+            # Age urgency: exit underperformers earlier as they age
+            # As positions age, we require progressively higher returns to justify holding
+            if self.age_urgency_enabled and days >= self.age_urgency_start_day:
+                # Calculate required return that increases with age
+                # At start_day: require min_return
+                # At max_hold: require 2x min_return
+                age_ratio = min(1.0, (days - self.age_urgency_start_day) / max(1, max_hold - self.age_urgency_start_day))
+                required_return = self.age_urgency_min_return * (1.0 + age_ratio)
+                
+                if ret < required_return:
+                    # Position is underperforming for its age
+                    self.logger.info(
+                        "%s age urgency: day %d, ret=%.1f%% < required=%.1f%%",
+                        p.ticker, days, ret * 100, required_return * 100
+                    )
+                    actions.append(self._sell_position(state, p, price_cad=px, reason="AGE_URGENCY", days_held=days))
+                    continue
+
+            # Trailing stop: update highest price and check trailing stop trigger
+            if self.trailing_stop_enabled and p.entry_price > 0:
+                # Update highest price for this position
+                p.update_highest_price(px)
+                
+                # Check if trailing stop is activated (position has gained enough)
+                gain_from_entry = px / float(p.entry_price) - 1.0
+                if gain_from_entry >= self.trailing_stop_activation_pct and p.highest_price:
+                    # Trailing stop is active - check if we should exit
+                    trailing_stop_level = p.highest_price * (1.0 - self.trailing_stop_distance_pct)
+                    if px <= trailing_stop_level:
+                        # Price has dropped below trailing stop
+                        pct_from_peak = (px / p.highest_price - 1.0) * 100
+                        self.logger.info(
+                            "%s trailing stop: price $%.2f dropped %.1f%% from peak $%.2f",
+                            p.ticker, px, pct_from_peak, p.highest_price
+                        )
+                        actions.append(self._sell_position(state, p, price_cad=px, reason="TRAILING_STOP", days_held=days))
+                        continue
+
+            # Signal decay exit: exit if prediction has turned significantly negative
+            if self.signal_decay_exit_enabled and pred_return is not None:
+                pr_val = float(pred_return.get(p.ticker, float("nan")))
+                if not pd.isna(pr_val) and pr_val <= self.signal_decay_threshold:
+                    # Model now predicts negative return - exit early
+                    self.logger.info(
+                        "%s signal decay: pred_return=%.2f%% (threshold=%.2f%%)",
+                        p.ticker, pr_val * 100, self.signal_decay_threshold * 100
+                    )
+                    actions.append(self._sell_position(state, p, price_cad=px, reason="SIGNAL_DECAY", days_held=days))
+                    continue
 
             # Peak detection with partial exit (only for winning positions)
             if self.peak_detection_enabled and p.entry_price > 0:
@@ -475,8 +649,23 @@ class PortfolioManager:
                     take_profit_pct=self.take_profit_pct,
                 )
                 state.positions.append(pos)
+                # Get pred_return from weights if available
+                pred_ret = None
+                try:
+                    if "pred_return" in weights.columns:
+                        pred_ret = float(weights.loc[t, "pred_return"])
+                except Exception:
+                    pass
+                # Compute expected sell date
+                expected_sell = None
+                if self.max_holding_days:
+                    sell_dt = now + timedelta(days=self.max_holding_days)
+                    expected_sell = sell_dt.strftime("%Y-%m-%d")
                 actions.append(
-                    TradeAction(ticker=t, action="BUY", reason="TOP_RANKED", shares=int(shares), price_cad=px, days_held=0)
+                    TradeAction(
+                        ticker=t, action="BUY", reason="TOP_RANKED", shares=int(shares), 
+                        price_cad=px, days_held=0, pred_return=pred_ret, expected_sell_date=expected_sell
+                    )
                 )
                 open_tickers.add(t)
                 slots -= 1
@@ -488,7 +677,24 @@ class PortfolioManager:
             p = open_by_ticker.get(t)
             px = float(prices_cad.get(t, float("nan")))
             days = p.days_held(now) if p else None
-            actions.append(TradeAction(ticker=t, action="HOLD", reason="IN_TARGET", shares=p.shares if p else 0, price_cad=px, days_held=days))
+            # Get pred_return from weights if available
+            pred_ret = None
+            try:
+                if "pred_return" in weights.columns:
+                    pred_ret = float(weights.loc[t, "pred_return"])
+            except Exception:
+                pass
+            # Compute expected sell date from entry
+            expected_sell = None
+            if p and self.max_holding_days:
+                sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
+                expected_sell = sell_dt.strftime("%Y-%m-%d")
+            actions.append(
+                TradeAction(
+                    ticker=t, action="HOLD", reason="IN_TARGET", shares=p.shares if p else 0, 
+                    price_cad=px, days_held=days, pred_return=pred_ret, expected_sell_date=expected_sell
+                )
+            )
 
         # Build holdings view: join weights with state-derived fields.
         holdings = weights.copy()

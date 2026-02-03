@@ -39,6 +39,14 @@ FEATURE_COLUMNS = [
     "dist_52w_high",
     "dist_52w_low",
     "vol_anom_30d",
+    # Momentum quality features
+    "momentum_reversal",
+    "momentum_acceleration",
+    "ret_20d_lagged",
+    "ret_60d_lagged",
+    # Relative momentum (vs market)
+    "relative_momentum_20d",
+    "relative_momentum_60d",
     "rank_ret_20d",
     "rank_ret_60d",
     "rank_vol_60d",
@@ -49,6 +57,14 @@ FEATURE_COLUMNS = [
     # Fundamental features
     "log_market_cap",
     "beta",
+    # Target-encoded categorical features (meaningful sector/industry signals)
+    "sector_target_enc",
+    "industry_target_enc",
+    # Market regime features (same for all stocks on a given day)
+    "market_vol_regime",  # Current market volatility vs historical
+    "market_trend_20d",   # Market 20-day return
+    "market_breadth",     # % of stocks above their 20-day MA
+    "market_momentum_accel",  # Market momentum acceleration
     # Fundamental composite scores
     "value_score",
     "quality_score",
@@ -81,6 +97,14 @@ TECHNICAL_FEATURES_ONLY = [
     "dist_52w_high",
     "dist_52w_low",
     "vol_anom_30d",
+    # Momentum quality features
+    "momentum_reversal",
+    "momentum_acceleration",
+    "ret_20d_lagged",
+    "ret_60d_lagged",
+    # Relative momentum (vs market)
+    "relative_momentum_20d",
+    "relative_momentum_60d",
     "rank_ret_20d",
     "rank_ret_60d",
     "rank_vol_60d",
@@ -88,6 +112,11 @@ TECHNICAL_FEATURES_ONLY = [
     "fx_ret_5d",
     "fx_ret_20d",
     "is_tsx",
+    # Market regime features (same for all stocks on a given day)
+    "market_vol_regime",
+    "market_trend_20d",
+    "market_breadth",
+    "market_momentum_accel",
 ]
 
 
@@ -164,10 +193,17 @@ def build_lgbm_model(random_state: int = 42):
     )
 
 
-def _coerce_features(df: pd.DataFrame) -> pd.DataFrame:
+def _coerce_features(df: pd.DataFrame, feature_cols: list[str] | None = None) -> pd.DataFrame:
+    """Prepare features for model prediction.
+    
+    Args:
+        df: Raw features DataFrame
+        feature_cols: Feature columns to use. If None, uses FEATURE_COLUMNS.
+    """
+    cols = feature_cols if feature_cols is not None else FEATURE_COLUMNS
     x = df.copy()
     missing = []
-    for c in FEATURE_COLUMNS:
+    for c in cols:
         if c not in x.columns:
             x[c] = np.nan
             missing.append(c)
@@ -181,11 +217,18 @@ def _coerce_features(df: pd.DataFrame) -> pd.DataFrame:
     # Convert bool to int for sklearn
     if "is_tsx" in x.columns:
         x["is_tsx"] = x["is_tsx"].astype(int, errors="ignore")
-    return x[FEATURE_COLUMNS]
+    return x[cols]
 
 
-def predict(model, features: pd.DataFrame) -> pd.Series:
-    x = _coerce_features(features)
+def predict(model, features: pd.DataFrame, feature_cols: list[str] | None = None) -> pd.Series:
+    """Predict with a single model.
+    
+    Args:
+        model: Trained model (XGBoost/LightGBM)
+        features: Features DataFrame
+        feature_cols: Feature columns to use. If None, uses FEATURE_COLUMNS.
+    """
+    x = _coerce_features(features, feature_cols)
     
     # Handle different model types
     if xgb and isinstance(model, xgb.Booster):
@@ -216,7 +259,20 @@ def predict_score(model, features: pd.DataFrame) -> pd.Series:
     return pd.Series(preds, index=features.index, name="pred_score")
 
 
-def predict_ensemble(models: list, weights: list[float] | None, features: pd.DataFrame) -> pd.Series:
+def predict_ensemble(
+    models: list, 
+    weights: list[float] | None, 
+    features: pd.DataFrame, 
+    feature_cols: list[str] | None = None
+) -> pd.Series:
+    """Ensemble prediction with optional feature selection.
+    
+    Args:
+        models: List of trained models
+        weights: Model weights (None = equal weights)
+        features: Features DataFrame
+        feature_cols: Feature columns used during training. If None, uses FEATURE_COLUMNS.
+    """
     if not models:
         raise ValueError("No models provided for ensemble prediction")
     if weights is None:
@@ -229,17 +285,29 @@ def predict_ensemble(models: list, weights: list[float] | None, features: pd.Dat
 
     out = np.zeros(len(features), dtype=float)
     for i, m in enumerate(models):
-        out += w[i] * predict(m, features).astype(float).values
+        out += w[i] * predict(m, features, feature_cols).astype(float).values
     return pd.Series(out, index=features.index, name="pred_return")
 
 
-def predict_ensemble_with_uncertainty(models: list, weights: list[float] | None, features: pd.DataFrame) -> pd.DataFrame:
-    """Return mean prediction, uncertainty (std across models), and confidence."""
+def predict_ensemble_with_uncertainty(
+    models: list, 
+    weights: list[float] | None, 
+    features: pd.DataFrame,
+    feature_cols: list[str] | None = None
+) -> pd.DataFrame:
+    """Return mean prediction, uncertainty (std across models), and confidence.
+    
+    Args:
+        models: List of trained models
+        weights: Model weights (None = equal weights)
+        features: Features DataFrame
+        feature_cols: Feature columns used during training. If None, uses FEATURE_COLUMNS.
+    """
     if not models:
         raise ValueError("No models provided for ensemble prediction")
     
     # Get predictions from all models
-    preds_list = [predict(m, features).values for m in models]
+    preds_list = [predict(m, features, feature_cols).values for m in models]
     preds_array = np.array(preds_list)  # shape: (n_models, n_samples)
     
     # Apply weights if provided

@@ -54,6 +54,117 @@ def build_time_splits(
     return splits, holdout
 
 
+@dataclass(frozen=True)
+class WalkForwardPeriod:
+    """A single walk-forward test period."""
+    period_id: int
+    train_end: pd.Timestamp
+    test_start: pd.Timestamp
+    test_end: pd.Timestamp
+    train_dates: list[pd.Timestamp]
+    test_dates: list[pd.Timestamp]
+
+
+def build_walk_forward_periods(
+    dates: Iterable[pd.Timestamp],
+    *,
+    n_periods: int = 4,
+    test_window: int = 60,
+    embargo_days: int = 5,
+    min_train: int = 252,
+) -> list[WalkForwardPeriod]:
+    """Create multiple walk-forward test periods for robust out-of-sample evaluation.
+    
+    Unlike single holdout, this creates N non-overlapping test periods, each with
+    its own training set (all data before the test period). This gives:
+    1. More robust evaluation across different market regimes
+    2. Larger total out-of-sample data
+    3. Detection of regime-specific failures
+    """
+    uniq = _as_dates(dates)
+    total_days = len(uniq)
+    
+    # Calculate how much space we need for all periods
+    space_needed = min_train + (n_periods * test_window) + (n_periods * embargo_days)
+    if total_days < space_needed:
+        # Reduce number of periods if not enough data
+        n_periods = max(1, (total_days - min_train) // (test_window + embargo_days))
+    
+    if n_periods < 1:
+        return []
+    
+    periods = []
+    
+    # Work backwards from the end to create non-overlapping periods
+    # This ensures the most recent data is always tested
+    for i in range(n_periods):
+        # Calculate test period boundaries (working backwards)
+        test_end_idx = total_days - (i * (test_window + embargo_days))
+        test_start_idx = test_end_idx - test_window
+        train_end_idx = test_start_idx - embargo_days
+        
+        if train_end_idx < min_train:
+            break  # Not enough training data
+        
+        period = WalkForwardPeriod(
+            period_id=n_periods - i,  # 1-indexed, oldest first
+            train_end=uniq[train_end_idx - 1],
+            test_start=uniq[test_start_idx],
+            test_end=uniq[test_end_idx - 1],
+            train_dates=uniq[:train_end_idx],
+            test_dates=uniq[test_start_idx:test_end_idx],
+        )
+        periods.append(period)
+    
+    # Reverse so oldest period is first
+    return list(reversed(periods))
+
+
+def aggregate_walk_forward_results(period_results: list[dict]) -> dict[str, object]:
+    """Aggregate metrics across walk-forward periods.
+    
+    Returns mean, std, and per-period breakdown for key metrics.
+    """
+    if not period_results:
+        return {"n_periods": 0, "aggregate": {}, "per_period": []}
+    
+    # Key metrics to aggregate
+    metrics_to_agg = [
+        "sharpe_ratio", "sortino_ratio", "max_drawdown", "total_return",
+        "ann_return", "alpha_ann", "alpha_sharpe", "avg_turnover",
+        "mean_ic", "ic_ir",
+    ]
+    
+    aggregated = {}
+    for metric in metrics_to_agg:
+        values = []
+        for result in period_results:
+            val = result.get(metric)
+            if val is not None and not np.isnan(val):
+                values.append(val)
+        
+        if values:
+            aggregated[metric] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "min": float(np.min(values)),
+                "max": float(np.max(values)),
+                "n": len(values),
+            }
+    
+    # Calculate consistency score (% of periods with positive Sharpe)
+    sharpe_values = [r.get("sharpe_ratio", float("nan")) for r in period_results]
+    sharpe_positive = sum(1 for s in sharpe_values if s and not np.isnan(s) and s > 0)
+    consistency = sharpe_positive / len(sharpe_values) if sharpe_values else 0.0
+    
+    return {
+        "n_periods": len(period_results),
+        "consistency": consistency,  # % of periods with positive Sharpe
+        "aggregate": aggregated,
+        "per_period": period_results,
+    }
+
+
 def compute_daily_rank_ic(
     df: pd.DataFrame,
     *,
@@ -90,13 +201,24 @@ def compute_daily_topn_returns(
     pred_col: str,
     top_n: int,
     cost_bps: float = 0.0,
+    market_ret_col: str | None = None,
+    beta_col: str | None = None,
 ) -> pd.DataFrame:
-    """Compute per-date top-N mean returns with optional per-day cost in bps."""
+    """Compute per-date top-N mean returns with optional per-day cost in bps.
+    
+    If market_ret_col and beta_col are provided, also computes beta-adjusted alpha.
+    """
 
     if df.empty:
         return pd.DataFrame(columns=["date", "n", "mean_ret", "net_ret"])
 
-    frame = df[[date_col, label_col, pred_col]].copy()
+    cols_needed = [date_col, label_col, pred_col]
+    if market_ret_col and market_ret_col in df.columns:
+        cols_needed.append(market_ret_col)
+    if beta_col and beta_col in df.columns:
+        cols_needed.append(beta_col)
+    
+    frame = df[cols_needed].copy()
     frame[date_col] = pd.to_datetime(frame[date_col]).dt.normalize()
     frame = frame.dropna(subset=[label_col, pred_col])
 
@@ -110,7 +232,25 @@ def compute_daily_topn_returns(
         top = grp.sort_values(pred_col, ascending=False).head(n)
         mean_ret = float(top[label_col].mean())
         net_ret = float(mean_ret - cost)
-        rows.append({"date": dt, "n": float(len(top)), "mean_ret": mean_ret, "net_ret": net_ret})
+        
+        row = {"date": dt, "n": float(len(top)), "mean_ret": mean_ret, "net_ret": net_ret}
+        
+        # Compute beta-adjusted alpha if market data available
+        if market_ret_col and market_ret_col in top.columns:
+            market_ret = float(top[market_ret_col].mean())
+            row["market_ret"] = market_ret
+            
+            if beta_col and beta_col in top.columns:
+                portfolio_beta = float(top[beta_col].fillna(1.0).mean())
+                # Alpha = portfolio return - beta * market return
+                beta_adj_alpha = mean_ret - portfolio_beta * market_ret
+                row["portfolio_beta"] = portfolio_beta
+                row["beta_adj_alpha"] = beta_adj_alpha
+            else:
+                # Simple alpha (assumes beta = 1)
+                row["simple_alpha"] = mean_ret - market_ret
+        
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -160,14 +300,190 @@ def evaluate_topn_returns(
     pred_col: str,
     top_n: int,
     cost_bps: float = 0.0,
+    market_ret_col: str | None = None,
+    beta_col: str | None = None,
 ) -> dict[str, object]:
     """Evaluate top-N realized returns across dates."""
 
     daily = compute_daily_topn_returns(
-        df, date_col=date_col, label_col=label_col, pred_col=pred_col, top_n=top_n, cost_bps=cost_bps
+        df, date_col=date_col, label_col=label_col, pred_col=pred_col, top_n=top_n, cost_bps=cost_bps,
+        market_ret_col=market_ret_col, beta_col=beta_col,
     )
     summary = summarize_topn_returns(daily)
     return {"summary": summary, "daily": daily}
+
+
+def simulate_realistic_portfolio(
+    df: pd.DataFrame,
+    *,
+    date_col: str,
+    ticker_col: str,
+    label_col: str,
+    pred_col: str,
+    top_n: int = 30,
+    hold_days: int = 5,
+    cost_bps: float = 20.0,
+    market_ret_col: str | None = None,
+) -> dict[str, object]:
+    """Simulate realistic portfolio with periodic rebalancing.
+    
+    Unlike daily top-N which assumes 100% daily turnover, this:
+    1. Rebalances every `hold_days` trading days
+    2. Tracks actual positions held between rebalances
+    3. Applies transaction costs only on trades (not daily)
+    4. Computes realistic turnover metrics
+    """
+    if df.empty:
+        return {
+            "summary": {
+                "total_return": float("nan"),
+                "ann_return": float("nan"),
+                "sharpe_ratio": float("nan"),
+                "max_drawdown": float("nan"),
+                "avg_turnover": float("nan"),
+                "total_cost_bps": float("nan"),
+                "n_rebalances": 0,
+            },
+            "daily": pd.DataFrame(),
+        }
+    
+    frame = df[[date_col, ticker_col, label_col, pred_col]].copy()
+    if market_ret_col and market_ret_col in df.columns:
+        frame[market_ret_col] = df[market_ret_col]
+    
+    frame[date_col] = pd.to_datetime(frame[date_col]).dt.normalize()
+    frame = frame.dropna(subset=[label_col, pred_col])
+    
+    dates = sorted(frame[date_col].unique())
+    if len(dates) < hold_days + 1:
+        return {
+            "summary": {
+                "total_return": float("nan"),
+                "ann_return": float("nan"),
+                "sharpe_ratio": float("nan"),
+                "max_drawdown": float("nan"),
+                "avg_turnover": float("nan"),
+                "total_cost_bps": float("nan"),
+                "n_rebalances": 0,
+            },
+            "daily": pd.DataFrame(),
+        }
+    
+    # Rebalance dates (every hold_days)
+    rebalance_dates = dates[::hold_days]
+    
+    n = max(1, int(top_n))
+    cost = float(cost_bps) * 1e-4
+    
+    portfolio_returns = []
+    market_returns_list = []
+    current_holdings = set()
+    total_turnover = 0.0
+    n_rebalances = 0
+    total_cost_paid = 0.0
+    
+    for i, date in enumerate(dates):
+        day_data = frame[frame[date_col] == date]
+        if day_data.empty:
+            continue
+        
+        # Check if rebalance day
+        if date in rebalance_dates:
+            # Select new top-N
+            new_holdings = set(
+                day_data.sort_values(pred_col, ascending=False)
+                .head(n)[ticker_col]
+                .tolist()
+            )
+            
+            # Calculate turnover (% of portfolio changed)
+            if current_holdings:
+                overlap = len(current_holdings & new_holdings)
+                turnover = 1.0 - (overlap / max(len(current_holdings), len(new_holdings)))
+                total_turnover += turnover
+                
+                # Apply transaction costs on changed positions
+                positions_changed = len(current_holdings - new_holdings) + len(new_holdings - current_holdings)
+                day_cost = cost * (positions_changed / n) if n > 0 else 0
+                total_cost_paid += day_cost
+            else:
+                day_cost = cost  # Initial entry
+                total_cost_paid += day_cost
+            
+            current_holdings = new_holdings
+            n_rebalances += 1
+        
+        # Calculate portfolio return for the day (equal-weighted current holdings)
+        if current_holdings:
+            held_data = day_data[day_data[ticker_col].isin(current_holdings)]
+            if not held_data.empty:
+                day_return = float(held_data[label_col].mean())
+                
+                # Apply cost on rebalance day
+                if date in rebalance_dates and n_rebalances > 1:
+                    day_return -= day_cost
+                
+                portfolio_returns.append({"date": date, "return": day_return})
+                
+                if market_ret_col and market_ret_col in held_data.columns:
+                    market_returns_list.append(float(held_data[market_ret_col].mean()))
+    
+    if not portfolio_returns:
+        return {
+            "summary": {
+                "total_return": float("nan"),
+                "ann_return": float("nan"),
+                "sharpe_ratio": float("nan"),
+                "max_drawdown": float("nan"),
+                "avg_turnover": float("nan"),
+                "total_cost_bps": float("nan"),
+                "n_rebalances": 0,
+            },
+            "daily": pd.DataFrame(),
+        }
+    
+    daily_df = pd.DataFrame(portfolio_returns)
+    returns = daily_df["return"]
+    
+    # Compute metrics
+    cumulative = (1 + returns).cumprod()
+    total_return = float(cumulative.iloc[-1] - 1)
+    n_days = len(returns)
+    ann_return = float((1 + total_return) ** (252 / n_days) - 1) if n_days > 0 else float("nan")
+    
+    # Sharpe
+    if returns.std() > 0:
+        sharpe = float(np.sqrt(252) * returns.mean() / returns.std())
+    else:
+        sharpe = float("nan")
+    
+    # Max Drawdown
+    rolling_max = cumulative.cummax()
+    drawdown = (cumulative - rolling_max) / rolling_max
+    max_dd = float(drawdown.min())
+    
+    # Average turnover per rebalance
+    avg_turnover = float(total_turnover / n_rebalances) if n_rebalances > 0 else 0.0
+    
+    # Alpha metrics if market data available
+    alpha_ann = float("nan")
+    if market_returns_list and len(market_returns_list) == len(returns):
+        alpha_daily = returns.values - np.array(market_returns_list)
+        alpha_ann = float(np.nanmean(alpha_daily) * 252)
+    
+    summary = {
+        "total_return": total_return,
+        "ann_return": ann_return,
+        "sharpe_ratio": sharpe,
+        "max_drawdown": max_dd,
+        "avg_turnover": avg_turnover,
+        "total_cost_bps": float(total_cost_paid * 10000),
+        "n_rebalances": n_rebalances,
+        "n_days": n_days,
+        "alpha_ann": alpha_ann,
+    }
+    
+    return {"summary": summary, "daily": daily_df}
 
 
 def evaluate_predictions(
@@ -194,8 +510,20 @@ def evaluate_predictions(
     return payload
 
 
-def compute_portfolio_metrics(daily_returns: pd.Series, rf_annual: float = 0.05) -> dict[str, float]:
-    """Compute comprehensive portfolio performance metrics including Sharpe, Sortino, and max drawdown."""
+def compute_portfolio_metrics(
+    daily_returns: pd.Series, 
+    rf_annual: float = 0.05,
+    daily_alpha: pd.Series | None = None,
+    daily_market: pd.Series | None = None,
+) -> dict[str, float]:
+    """Compute comprehensive portfolio performance metrics including Sharpe, Sortino, max drawdown, and alpha.
+    
+    Args:
+        daily_returns: Portfolio daily returns (absolute)
+        rf_annual: Annual risk-free rate (default 5%)
+        daily_alpha: Optional beta-adjusted alpha series
+        daily_market: Optional market benchmark returns
+    """
     if daily_returns.empty or len(daily_returns) < 2:
         return {
             "sharpe_ratio": float("nan"),
@@ -203,6 +531,8 @@ def compute_portfolio_metrics(daily_returns: pd.Series, rf_annual: float = 0.05)
             "max_drawdown": float("nan"),
             "volatility_ann": float("nan"),
             "total_return": float("nan"),
+            "alpha_ann": float("nan"),
+            "alpha_sharpe": float("nan"),
             "n_days": 0,
         }
     
@@ -228,12 +558,31 @@ def compute_portfolio_metrics(daily_returns: pd.Series, rf_annual: float = 0.05)
     # Total Return
     total_return = cumulative.iloc[-1] - 1 if len(cumulative) > 0 else 0.0
     
+    # Alpha metrics (if available)
+    alpha_ann = float("nan")
+    alpha_sharpe = float("nan")
+    
+    if daily_alpha is not None and len(daily_alpha) > 1:
+        alpha_ann = float(daily_alpha.mean() * 252)  # Annualized alpha
+        alpha_std = daily_alpha.std()
+        if alpha_std > 0:
+            alpha_sharpe = float(np.sqrt(252) * daily_alpha.mean() / alpha_std)
+    elif daily_market is not None and len(daily_market) == len(daily_returns):
+        # Compute simple alpha if beta-adjusted not available
+        simple_alpha = daily_returns.values - daily_market.values
+        alpha_ann = float(np.nanmean(simple_alpha) * 252)
+        alpha_std = float(np.nanstd(simple_alpha))
+        if alpha_std > 0:
+            alpha_sharpe = float(np.sqrt(252) * np.nanmean(simple_alpha) / alpha_std)
+    
     return {
         "sharpe_ratio": float(sharpe),
         "sortino_ratio": float(sortino),
         "max_drawdown": float(max_drawdown),
         "volatility_ann": float(volatility_ann),
         "total_return": float(total_return),
+        "alpha_ann": alpha_ann,
+        "alpha_sharpe": alpha_sharpe,
         "n_days": int(len(daily_returns)),
     }
 

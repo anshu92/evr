@@ -198,7 +198,10 @@ def render_reports(
             shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
             px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
             days = getattr(a, "days_held", None) or (a.get("days_held") if isinstance(a, dict) else "")
-            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px} days_held={days} reason={reason}")
+            pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
+            sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
+            pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px} days_held={days} pred_ret={pred_ret_str} sell_date={sell_date or 'N/A'} reason={reason}")
         lines.append("")
 
     # Portfolio P&L history (stateful; computed from portfolio state positions)
@@ -332,13 +335,42 @@ def render_reports(
 
     # Build actions block outside the f-string to avoid complex nested expressions.
     if trade_actions:
-        parts: list[str] = []
+        # Build actions as a table for better readability
+        action_rows: list[str] = []
         for a in trade_actions:
             ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
             action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
             reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
-            parts.append(_html_escape(f"{action} {ticker} ({reason})"))
-        actions_html = "<br/>".join(parts) if parts else _html_escape("No actions (portfolio already aligned).")
+            shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
+            px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
+            pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
+            sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
+            pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+            px_str = _fmt_money(px) if px else "N/A"
+            action_rows.append(
+                f"<tr><td style='padding:4px 8px;'>{_html_escape(action)}</td>"
+                f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
+                f"<td style='padding:4px 8px;'>{shares}</td>"
+                f"<td style='padding:4px 8px;'>{px_str}</td>"
+                f"<td style='padding:4px 8px;'>{pred_ret_str}</td>"
+                f"<td style='padding:4px 8px;'>{sell_date or 'N/A'}</td>"
+                f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
+            )
+        if action_rows:
+            actions_html = f"""<table style="border-collapse:collapse;width:100%;font-size:13px;">
+            <thead><tr>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Action</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Ticker</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Shares</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Pred Ret</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Sell Date</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Reason</th>
+            </tr></thead>
+            <tbody>{"".join(action_rows)}</tbody>
+            </table>"""
+        else:
+            actions_html = _html_escape("No actions (portfolio already aligned).")
     else:
         actions_html = _html_escape("No actions (portfolio already aligned).")
 
@@ -451,6 +483,8 @@ def render_reports(
                             "shares": getattr(a, "shares", None),
                             "price_cad": getattr(a, "price_cad", None),
                             "days_held": getattr(a, "days_held", None),
+                            "pred_return": getattr(a, "pred_return", None),
+                            "expected_sell_date": getattr(a, "expected_sell_date", None),
                         }
                     )
             (reports_dir / "trade_actions.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

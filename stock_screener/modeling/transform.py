@@ -59,3 +59,92 @@ def normalize_features_cross_section(
                 continue
             out[col] = zscore(winsorize_mad(out[col]))
     return out
+
+
+def build_calibration_map(
+    actual_returns: pd.Series,
+    n_quantiles: int = 20,
+) -> dict:
+    """Build quantile-based calibration map from training data.
+    
+    Returns a dict with quantile edges and corresponding return values
+    that can be used to map predictions to realistic return magnitudes.
+    """
+    import numpy as np
+    
+    clean = actual_returns.dropna()
+    if len(clean) < n_quantiles * 2:
+        return {"quantiles": [], "values": [], "mean": float(clean.mean()), "std": float(clean.std())}
+    
+    # Compute quantile edges and values
+    quantile_edges = np.linspace(0, 1, n_quantiles + 1)
+    quantile_values = [float(clean.quantile(q)) for q in quantile_edges]
+    
+    return {
+        "quantiles": quantile_edges.tolist(),
+        "values": quantile_values,
+        "mean": float(clean.mean()),
+        "std": float(clean.std()),
+        "min": float(clean.min()),
+        "max": float(clean.max()),
+        "n_samples": len(clean),
+    }
+
+
+def calibrate_predictions(
+    predictions: pd.Series,
+    calibration_map: dict,
+    method: str = "rank_preserve",
+) -> pd.Series:
+    """Calibrate raw predictions to realistic return magnitudes.
+    
+    Args:
+        predictions: Raw model predictions (any scale)
+        calibration_map: Dict from build_calibration_map()
+        method: 'rank_preserve' (default) or 'linear'
+        
+    Returns:
+        Calibrated predictions matching the training return distribution
+    """
+    import numpy as np
+    
+    if not calibration_map or not calibration_map.get("values"):
+        # Fallback: just center around training mean
+        mean = calibration_map.get("mean", 0.0) if calibration_map else 0.0
+        std = calibration_map.get("std", 1.0) if calibration_map else 1.0
+        pred_mean = predictions.mean()
+        pred_std = predictions.std()
+        if pred_std > 0:
+            return mean + (predictions - pred_mean) / pred_std * std
+        return predictions
+    
+    quantiles = calibration_map["quantiles"]
+    values = calibration_map["values"]
+    
+    if method == "rank_preserve":
+        # Map prediction ranks to return quantiles (preserves ranking)
+        ranks = predictions.rank(pct=True)
+        
+        # Interpolate to get calibrated values
+        calibrated = np.interp(ranks, quantiles, values)
+        return pd.Series(calibrated, index=predictions.index, name="pred_return_calibrated")
+    
+    elif method == "linear":
+        # Linear scaling to match mean and std
+        target_mean = calibration_map["mean"]
+        target_std = calibration_map["std"]
+        
+        pred_mean = predictions.mean()
+        pred_std = predictions.std()
+        
+        if pred_std > 0:
+            scaled = (predictions - pred_mean) / pred_std * target_std + target_mean
+        else:
+            scaled = predictions - pred_mean + target_mean
+        
+        # Clip to reasonable bounds
+        scaled = scaled.clip(calibration_map.get("min", -0.5), calibration_map.get("max", 0.5))
+        return pd.Series(scaled, index=predictions.index, name="pred_return_calibrated")
+    
+    else:
+        return predictions

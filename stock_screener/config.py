@@ -52,8 +52,55 @@ class Config:
     use_correlation_weights: bool = False  # Requires scipy; set True to enable
     confidence_weight_floor: float = 0.3
     
-    # Training target
+    # Training target and objective
     use_market_relative_returns: bool = True  # Train on alpha (stock return - market return) instead of absolute returns
+    use_ranking_objective: bool = True  # Use LTR (learning-to-rank) objective instead of regression
+    
+    # Portfolio construction
+    sector_neutral_selection: bool = True  # Diversify picks across sectors instead of pure top-N
+    volatility_targeting: bool = True  # Scale exposure based on market volatility
+    target_volatility: float = 0.15  # Target annualized portfolio volatility (15%)
+    
+    # Drawdown risk management
+    drawdown_management: bool = True  # Reduce exposure when in drawdown
+    max_drawdown_threshold: float = -0.10  # Drawdown level to minimize exposure (-10%)
+    drawdown_min_scalar: float = 0.25  # Minimum position size multiplier (25%)
+    
+    # Conviction-based position sizing
+    conviction_sizing: bool = True  # Scale positions by prediction strength and confidence
+    conviction_min_scalar: float = 0.5  # Minimum position scaling (0.5x normal)
+    conviction_max_scalar: float = 2.0  # Maximum position scaling (2x normal)
+    
+    # Liquidity-adjusted sizing
+    liquidity_adjustment: bool = True  # Scale positions by stock liquidity
+    min_liquidity_cad: float = 100_000  # Min daily volume to include stock
+    target_liquidity_cad: float = 1_000_000  # Full-size threshold
+    max_position_pct_of_volume: float = 0.05  # Max position as % of daily volume
+    
+    # Correlation-based position limits
+    correlation_limits: bool = True  # Limit combined weight of correlated stocks
+    max_corr_weight: float = 0.25  # Max combined weight for correlated pair (25%)
+    corr_threshold: float = 0.70  # Correlation level to trigger limit (70%)
+    
+    # Beta-adjusted position sizing
+    beta_adjustment: bool = True  # Scale positions by inverse beta
+    target_portfolio_beta: float = 1.0  # Target overall portfolio beta
+    beta_min_scalar: float = 0.5  # Min adjustment for high-beta stocks
+    beta_max_scalar: float = 1.5  # Max adjustment for low-beta stocks
+    
+    # Maximum position cap
+    max_position_pct: float = 0.20  # Max 20% in any single position
+    
+    # Minimum position size
+    min_position_pct: float = 0.02  # Min 2% - remove smaller "dust" positions
+    
+    # Regime-aware exposure scaling
+    regime_exposure_enabled: bool = True  # Scale exposure based on market regime
+    regime_trend_weight: float = 0.4  # Weight for market trend signal
+    regime_breadth_weight: float = 0.3  # Weight for market breadth signal
+    regime_vol_weight: float = 0.3  # Weight for inverse volatility signal
+    regime_min_scalar: float = 0.5  # Minimum exposure in bearish regime
+    regime_max_scalar: float = 1.2  # Maximum exposure in bullish regime
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
@@ -64,6 +111,30 @@ class Config:
     portfolio_state_path: str = "screener_portfolio_state.json"
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
+    
+    # Trailing stop settings
+    trailing_stop_enabled: bool = True  # Enable trailing stop-loss
+    trailing_stop_activation_pct: float = 0.05  # Activate after 5% gain
+    trailing_stop_distance_pct: float = 0.08  # Trail 8% below peak
+    
+    # Signal decay exit settings
+    signal_decay_exit_enabled: bool = True  # Exit when prediction turns negative
+    signal_decay_threshold: float = -0.02  # Exit if predicted return drops below -2%
+    
+    # Dynamic holding period settings
+    dynamic_holding_enabled: bool = True  # Adjust holding period based on volatility
+    dynamic_holding_vol_scale: float = 0.5  # How much to adjust (0.5 = +/-50% at extremes)
+    
+    # Volatility-adjusted stop-loss settings
+    vol_adjusted_stop_enabled: bool = True  # Adjust stop-loss by stock volatility
+    vol_adjusted_stop_base: float = 0.08  # Base stop-loss for average volatility stock
+    vol_adjusted_stop_min: float = 0.04  # Minimum stop-loss (low vol stocks)
+    vol_adjusted_stop_max: float = 0.15  # Maximum stop-loss (high vol stocks)
+    
+    # Position age urgency settings
+    age_urgency_enabled: bool = True  # Exit underperformers earlier as they age
+    age_urgency_start_day: int = 2  # Start applying urgency after N days
+    age_urgency_min_return: float = 0.01  # Min return to avoid urgency exit (1%)
 
     # Peak detection and partial exit settings
     peak_detection_enabled: bool = True
@@ -74,6 +145,13 @@ class Config:
     peak_score_percentile_drop: float | None = 0.30
     peak_rsi_overbought: float | None = 70.0
     peak_above_ma_ratio: float | None = 0.15
+    
+    # Entry confirmation filters (reduce false positives)
+    entry_min_confidence: float | None = 0.5  # Minimum model confidence to enter
+    entry_min_pred_return: float | None = 0.01  # Minimum predicted return (calibrated)
+    entry_max_volatility: float | None = 0.60  # Max annualized volatility to enter
+    entry_min_momentum_5d: float | None = -0.05  # Reject stocks with recent sharp drops
+    entry_momentum_alignment: bool = True  # Reject bullish signals with bearish price action
 
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
@@ -148,6 +226,35 @@ class Config:
             use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
+            use_ranking_objective=os.getenv("USE_RANKING_OBJECTIVE", "1").strip() in {"1", "true", "True"},
+            sector_neutral_selection=os.getenv("SECTOR_NEUTRAL_SELECTION", "1").strip() in {"1", "true", "True"},
+            volatility_targeting=os.getenv("VOLATILITY_TARGETING", "1").strip() in {"1", "true", "True"},
+            target_volatility=_get_float("TARGET_VOLATILITY", 0.15),
+            drawdown_management=os.getenv("DRAWDOWN_MANAGEMENT", "1").strip() in {"1", "true", "True"},
+            max_drawdown_threshold=_get_float("MAX_DRAWDOWN_THRESHOLD", -0.10),
+            drawdown_min_scalar=_get_float("DRAWDOWN_MIN_SCALAR", 0.25),
+            conviction_sizing=os.getenv("CONVICTION_SIZING", "1").strip() in {"1", "true", "True"},
+            conviction_min_scalar=_get_float("CONVICTION_MIN_SCALAR", 0.5),
+            conviction_max_scalar=_get_float("CONVICTION_MAX_SCALAR", 2.0),
+            liquidity_adjustment=os.getenv("LIQUIDITY_ADJUSTMENT", "1").strip() in {"1", "true", "True"},
+            min_liquidity_cad=_get_float("MIN_LIQUIDITY_CAD", 100_000),
+            target_liquidity_cad=_get_float("TARGET_LIQUIDITY_CAD", 1_000_000),
+            max_position_pct_of_volume=_get_float("MAX_POSITION_PCT_OF_VOLUME", 0.05),
+            correlation_limits=os.getenv("CORRELATION_LIMITS", "1").strip() in {"1", "true", "True"},
+            max_corr_weight=_get_float("MAX_CORR_WEIGHT", 0.25),
+            corr_threshold=_get_float("CORR_THRESHOLD", 0.70),
+            beta_adjustment=os.getenv("BETA_ADJUSTMENT", "1").strip() in {"1", "true", "True"},
+            target_portfolio_beta=_get_float("TARGET_PORTFOLIO_BETA", 1.0),
+            beta_min_scalar=_get_float("BETA_MIN_SCALAR", 0.5),
+            beta_max_scalar=_get_float("BETA_MAX_SCALAR", 1.5),
+            max_position_pct=_get_float("MAX_POSITION_PCT", 0.20),
+            min_position_pct=_get_float("MIN_POSITION_PCT", 0.02),
+            regime_exposure_enabled=_get_bool("REGIME_EXPOSURE_ENABLED", True),
+            regime_trend_weight=_get_float("REGIME_TREND_WEIGHT", 0.4),
+            regime_breadth_weight=_get_float("REGIME_BREADTH_WEIGHT", 0.3),
+            regime_vol_weight=_get_float("REGIME_VOL_WEIGHT", 0.3),
+            regime_min_scalar=_get_float("REGIME_MIN_SCALAR", 0.5),
+            regime_max_scalar=_get_float("REGIME_MAX_SCALAR", 1.2),
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
             max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,
@@ -166,6 +273,20 @@ class Config:
             take_profit_pct=(
                 _get_float("TAKE_PROFIT_PCT", 0.0) if os.getenv("TAKE_PROFIT_PCT") not in {None, ""} else None
             ),
+            trailing_stop_enabled=os.getenv("TRAILING_STOP_ENABLED", "1").strip() in {"1", "true", "True"},
+            trailing_stop_activation_pct=_get_float("TRAILING_STOP_ACTIVATION_PCT", 0.05),
+            trailing_stop_distance_pct=_get_float("TRAILING_STOP_DISTANCE_PCT", 0.08),
+            signal_decay_exit_enabled=os.getenv("SIGNAL_DECAY_EXIT_ENABLED", "1").strip() in {"1", "true", "True"},
+            signal_decay_threshold=_get_float("SIGNAL_DECAY_THRESHOLD", -0.02),
+            dynamic_holding_enabled=os.getenv("DYNAMIC_HOLDING_ENABLED", "1").strip() in {"1", "true", "True"},
+            dynamic_holding_vol_scale=_get_float("DYNAMIC_HOLDING_VOL_SCALE", 0.5),
+            vol_adjusted_stop_enabled=os.getenv("VOL_ADJUSTED_STOP_ENABLED", "1").strip() in {"1", "true", "True"},
+            vol_adjusted_stop_base=_get_float("VOL_ADJUSTED_STOP_BASE", 0.08),
+            vol_adjusted_stop_min=_get_float("VOL_ADJUSTED_STOP_MIN", 0.04),
+            vol_adjusted_stop_max=_get_float("VOL_ADJUSTED_STOP_MAX", 0.15),
+            age_urgency_enabled=os.getenv("AGE_URGENCY_ENABLED", "1").strip() in {"1", "true", "True"},
+            age_urgency_start_day=_get_int("AGE_URGENCY_START_DAY", 2) or 2,
+            age_urgency_min_return=_get_float("AGE_URGENCY_MIN_RETURN", 0.01),
             peak_detection_enabled=os.getenv("PEAK_DETECTION_ENABLED", "1").strip() in {"1", "true", "True"},
             peak_sell_portion_pct=_get_float("PEAK_SELL_PORTION_PCT", 0.50),
             peak_min_gain_pct=(
@@ -194,6 +315,27 @@ class Config:
                 if os.getenv("PEAK_ABOVE_MA_RATIO") not in {None, ""}
                 else None
             ),
+            entry_min_confidence=(
+                _get_float("ENTRY_MIN_CONFIDENCE", 0.5)
+                if os.getenv("ENTRY_MIN_CONFIDENCE") not in {None, ""}
+                else None
+            ),
+            entry_min_pred_return=(
+                _get_float("ENTRY_MIN_PRED_RETURN", 0.01)
+                if os.getenv("ENTRY_MIN_PRED_RETURN") not in {None, ""}
+                else None
+            ),
+            entry_max_volatility=(
+                _get_float("ENTRY_MAX_VOLATILITY", 0.60)
+                if os.getenv("ENTRY_MAX_VOLATILITY") not in {None, ""}
+                else None
+            ),
+            entry_min_momentum_5d=(
+                _get_float("ENTRY_MIN_MOMENTUM_5D", -0.05)
+                if os.getenv("ENTRY_MIN_MOMENTUM_5D") not in {None, ""}
+                else None
+            ),
+            entry_momentum_alignment=os.getenv("ENTRY_MOMENTUM_ALIGNMENT", "1").strip() in {"1", "true", "True"},
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(
