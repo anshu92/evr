@@ -39,6 +39,18 @@ class Config:
     train_val_window_days: int = 60
     train_embargo_days: int = 5  # Should match label_horizon_days
     fundamentals_cache_ttl_days: int = 7
+    
+    # Advanced modeling
+    use_lightgbm: bool = True
+    use_optuna: bool = True
+    optuna_n_trials: int = 12
+    optuna_timeout_seconds: int = 180
+    ensemble_xgb_count: int = 3
+    ensemble_lgbm_count: int = 3
+    
+    # Portfolio optimization
+    use_correlation_weights: bool = False  # Requires scipy; set True to enable
+    confidence_weight_floor: float = 0.3
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
@@ -124,6 +136,14 @@ class Config:
             train_val_window_days=_get_int("TRAIN_VAL_WINDOW_DAYS", 60) or 60,
             train_embargo_days=_get_int("TRAIN_EMBARGO_DAYS", 5) or 5,
             fundamentals_cache_ttl_days=_get_int("FUNDAMENTALS_CACHE_TTL_DAYS", 7) or 7,
+            use_lightgbm=os.getenv("USE_LIGHTGBM", "1").strip() in {"1", "true", "True"},
+            use_optuna=os.getenv("USE_OPTUNA", "1").strip() in {"1", "true", "True"},
+            optuna_n_trials=_get_int("OPTUNA_N_TRIALS", 12) or 12,
+            optuna_timeout_seconds=_get_int("OPTUNA_TIMEOUT_SECONDS", 180) or 180,
+            ensemble_xgb_count=_get_int("ENSEMBLE_XGB_COUNT", 3) or 3,
+            ensemble_lgbm_count=_get_int("ENSEMBLE_LGBM_COUNT", 3) or 3,
+            use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
+            confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
             max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
             max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,

@@ -12,6 +12,12 @@ except Exception as _xgb_err:  # pragma: no cover
     xgb = None
     _XGB_IMPORT_ERROR = _xgb_err
 
+try:
+    import lightgbm as lgb
+except Exception as _lgb_err:  # pragma: no cover
+    lgb = None
+    _LGB_IMPORT_ERROR = _lgb_err
+
 
 FEATURE_COLUMNS = [
     "last_close_cad",
@@ -95,6 +101,14 @@ def _require_xgb() -> None:
         )
 
 
+def _require_lgb() -> None:
+    if lgb is None:  # pragma: no cover
+        raise RuntimeError(
+            "LightGBM is not available in this environment. "
+            f"Original error: {_LGB_IMPORT_ERROR}"
+        )
+
+
 def build_model(random_state: int = 42):
     """Build a strong baseline boosted-tree model for next-horizon returns."""
 
@@ -132,6 +146,24 @@ def build_ranker(random_state: int = 42):
     )
 
 
+def build_lgbm_model(random_state: int = 42):
+    """Build a LightGBM regressor for ensemble diversity."""
+    
+    _require_lgb()
+    return lgb.LGBMRegressor(
+        n_estimators=500,
+        learning_rate=0.05,
+        max_depth=6,
+        num_leaves=31,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=1.0,
+        min_child_samples=20,
+        random_state=random_state,
+        verbose=-1,
+    )
+
+
 def _coerce_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     missing = []
@@ -153,12 +185,24 @@ def _coerce_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def predict(model, features: pd.DataFrame) -> pd.Series:
-    _require_xgb()
     x = _coerce_features(features)
-    if isinstance(model, xgb.Booster):
+    
+    # Handle different model types
+    if xgb and isinstance(model, xgb.Booster):
+        _require_xgb()
         preds = model.predict(xgb.DMatrix(x))
-    else:
+    elif lgb and isinstance(model, lgb.Booster):
+        _require_lgb()
         preds = model.predict(x)
+    elif lgb and hasattr(model, '__class__') and 'LGB' in model.__class__.__name__:
+        # LightGBM sklearn wrapper
+        _require_lgb()
+        preds = model.predict(x)
+    else:
+        # XGBoost sklearn wrapper or other
+        _require_xgb()
+        preds = model.predict(x)
+    
     return pd.Series(preds, index=features.index, name="pred_return")
 
 
@@ -173,7 +217,6 @@ def predict_score(model, features: pd.DataFrame) -> pd.Series:
 
 
 def predict_ensemble(models: list, weights: list[float] | None, features: pd.DataFrame) -> pd.Series:
-    _require_xgb()
     if not models:
         raise ValueError("No models provided for ensemble prediction")
     if weights is None:
@@ -190,23 +233,69 @@ def predict_ensemble(models: list, weights: list[float] | None, features: pd.Dat
     return pd.Series(out, index=features.index, name="pred_return")
 
 
+def predict_ensemble_with_uncertainty(models: list, weights: list[float] | None, features: pd.DataFrame) -> pd.DataFrame:
+    """Return mean prediction, uncertainty (std across models), and confidence."""
+    if not models:
+        raise ValueError("No models provided for ensemble prediction")
+    
+    # Get predictions from all models
+    preds_list = [predict(m, features).values for m in models]
+    preds_array = np.array(preds_list)  # shape: (n_models, n_samples)
+    
+    # Apply weights if provided
+    if weights is not None:
+        w = np.asarray(weights, dtype=float)
+        if len(w) != len(models):
+            raise ValueError("weights length must match models length")
+        w = w / float(w.sum())
+        # Weighted mean
+        pred_mean = np.average(preds_array, axis=0, weights=w)
+    else:
+        pred_mean = np.mean(preds_array, axis=0)
+    
+    # Uncertainty as standard deviation across models (model disagreement)
+    pred_std = np.std(preds_array, axis=0)
+    
+    # Confidence: higher when models agree (lower std)
+    # Scale to 0-1 range where 1 = perfect agreement
+    pred_confidence = 1.0 / (1.0 + pred_std)
+    
+    return pd.DataFrame({
+        "pred_return": pred_mean,
+        "pred_uncertainty": pred_std,
+        "pred_confidence": pred_confidence,
+    }, index=features.index)
+
+
 def save_model(model, path: str | Path) -> None:
-    _require_xgb()
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # Save as JSON (non-pickle, portable).
-    # XGBoost's sklearn wrapper can raise `_estimator_type` errors in some envs when calling save_model().
-    # Saving the underlying Booster is stable across environments (including GitHub Actions).
-    booster = model.get_booster() if hasattr(model, "get_booster") else model
-    booster.save_model(str(p))
+    
+    # Handle LightGBM models
+    if lgb and hasattr(model, '__class__') and 'LGB' in model.__class__.__name__:
+        _require_lgb()
+        model.booster_.save_model(str(p))
+    elif lgb and isinstance(model, lgb.Booster):
+        _require_lgb()
+        model.save_model(str(p))
+    else:
+        # XGBoost models
+        _require_xgb()
+        # Save as JSON (non-pickle, portable).
+        # XGBoost's sklearn wrapper can raise `_estimator_type` errors in some envs when calling save_model().
+        # Saving the underlying Booster is stable across environments (including GitHub Actions).
+        booster = model.get_booster() if hasattr(model, "get_booster") else model
+        booster.save_model(str(p))
 
 
-def save_ensemble(manifest_path: str | Path, model_rel_paths: list[str], weights: list[float] | None = None) -> None:
+def save_ensemble(manifest_path: str | Path, model_rel_paths: list[str], model_types: list[str] | None = None, weights: list[float] | None = None) -> None:
+    """Save ensemble manifest with model paths and types."""
     p = Path(manifest_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "type": "xgboost_ensemble_v1",
+        "type": "mixed_ensemble_v1",  # Support both XGBoost and LightGBM
         "models": model_rel_paths,
+        "model_types": model_types or ["xgboost"] * len(model_rel_paths),
         "weights": weights,
     }
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -231,29 +320,46 @@ def save_bundle(
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def load_model(path: str | Path):
-    # Security: Avoid pickle/joblib. XGBoost JSON is safe to load.
-    _require_xgb()
-    booster = xgb.Booster()
-    booster.load_model(str(Path(path)))
-    return booster
+def load_model(path: str | Path, model_type: str = "xgboost"):
+    """Load a model from disk. Supports both XGBoost and LightGBM."""
+    p = Path(path)
+    
+    if model_type == "lightgbm":
+        _require_lgb()
+        return lgb.Booster(model_file=str(p))
+    else:
+        # Default to XGBoost for backward compatibility
+        _require_xgb()
+        booster = xgb.Booster()
+        booster.load_model(str(p))
+        return booster
 
 
 def load_ensemble(manifest_path: str | Path) -> tuple[list, list[float] | None]:
-    _require_xgb()
     mp = Path(manifest_path)
     manifest = json.loads(mp.read_text(encoding="utf-8"))
-    if manifest.get("type") != "xgboost_ensemble_v1":
-        raise ValueError("Unsupported ensemble manifest type")
-    model_rel = manifest.get("models") or []
-    weights = manifest.get("weights")
-    base = mp.parent
-    models = [load_model(base / rel) for rel in model_rel]
-    return models, weights
+    manifest_type = manifest.get("type")
+    
+    # Support both old and new formats
+    if manifest_type == "xgboost_ensemble_v1":
+        _require_xgb()
+        model_rel = manifest.get("models") or []
+        weights = manifest.get("weights")
+        base = mp.parent
+        models = [load_model(base / rel, "xgboost") for rel in model_rel]
+        return models, weights
+    elif manifest_type == "mixed_ensemble_v1":
+        model_rel = manifest.get("models") or []
+        model_types = manifest.get("model_types") or ["xgboost"] * len(model_rel)
+        weights = manifest.get("weights")
+        base = mp.parent
+        models = [load_model(base / rel, mtype) for rel, mtype in zip(model_rel, model_types)]
+        return models, weights
+    else:
+        raise ValueError(f"Unsupported ensemble manifest type: {manifest_type}")
 
 
 def load_bundle(manifest_path: str | Path) -> dict[str, object]:
-    _require_xgb()
     mp = Path(manifest_path)
     manifest = json.loads(mp.read_text(encoding="utf-8"))
     base = mp.parent
@@ -262,17 +368,21 @@ def load_bundle(manifest_path: str | Path) -> dict[str, object]:
     if mtype == "xgboost_ensemble_v1":
         models, weights = load_ensemble(mp)
         return {"type": mtype, "ranker": None, "regressor_models": models, "regressor_weights": weights, "metadata": None}
+    
+    if mtype == "mixed_ensemble_v1":
+        models, weights = load_ensemble(mp)
+        return {"type": mtype, "ranker": None, "regressor_models": models, "regressor_weights": weights, "metadata": None}
 
     if mtype != "xgboost_dual_v1":
-        raise ValueError("Unsupported ensemble manifest type")
+        raise ValueError(f"Unsupported ensemble manifest type: {mtype}")
     ranker_rel = manifest.get("ranker")
     reg_payload = manifest.get("regressor") or {}
     reg_models = reg_payload.get("models") or []
     reg_weights = reg_payload.get("weights")
     metadata = manifest.get("metadata")
 
-    ranker = load_model(base / ranker_rel) if ranker_rel else None
-    regressor_models = [load_model(base / rel) for rel in reg_models]
+    ranker = load_model(base / ranker_rel, "xgboost") if ranker_rel else None
+    regressor_models = [load_model(base / rel, "xgboost") for rel in reg_models]
     return {
         "type": mtype,
         "ranker": ranker,

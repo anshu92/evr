@@ -8,16 +8,23 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+try:
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)  # Reduce noise
+except ImportError:
+    optuna = None
+
 from stock_screener.config import Config
 from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.fundamental_scores import add_fundamental_composites
-from stock_screener.modeling.eval import build_time_splits, evaluate_predictions, evaluate_topn_returns
+from stock_screener.modeling.eval import build_time_splits, evaluate_predictions, evaluate_topn_returns, compute_calibration, compute_portfolio_metrics
 from stock_screener.modeling.model import (
     FEATURE_COLUMNS,
     TECHNICAL_FEATURES_ONLY,
     build_model,
+    build_lgbm_model,
     load_bundle,
     load_model,
     predict_ensemble,
@@ -365,33 +372,74 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         )
 
 
-    regressor_candidates = [
-        {"max_depth": 6, "learning_rate": 0.03, "min_child_weight": 5},
-        {"max_depth": 5, "learning_rate": 0.05, "min_child_weight": 8},
-    ]
+    # Hyperparameter tuning with Optuna (if available) or fallback to manual search
+    if optuna and getattr(cfg, 'use_optuna', False):
+        logger.info("Using Optuna for hyperparameter optimization...")
+        n_trials = getattr(cfg, 'optuna_n_trials', 12)
+        timeout = getattr(cfg, 'optuna_timeout_seconds', 180)
+        
+        def _optuna_objective(trial):
+            params = {
+                "max_depth": trial.suggest_int("max_depth", 4, 8),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+                "min_child_weight": trial.suggest_int("min_child_weight", 3, 10),
+                "subsample": trial.suggest_float("subsample", 0.6, 0.9),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 2.0),
+            }
+            scores: list[float] = []
+            for split in splits:
+                train_df = _subset_by_dates(split.train_dates)
+                val_df = _subset_by_dates(split.val_dates)
+                if train_df.empty or val_df.empty:
+                    continue
+                model = build_model(random_state=42)
+                model.set_params(**params, early_stopping_rounds=50)
+                model.fit(
+                    train_df[feature_cols],
+                    train_df["future_ret"].astype(float),
+                    eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                    verbose=False,
+                )
+                preds = model.predict(val_df[feature_cols])
+                metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
+                scores.append(float(metrics["summary"]["mean_net_ret"]))
+            return float(np.nanmean(scores)) if scores else float("nan")
+        
+        study = optuna.create_study(direction="maximize")
+        study.optimize(_optuna_objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
+        best_regressor_params = study.best_params
+        logger.info("Optuna best params: %s (score=%.6f)", best_regressor_params, study.best_value)
+    else:
+        # Fallback to manual hyperparameter search
+        logger.info("Using manual hyperparameter search...")
+        regressor_candidates = [
+            {"max_depth": 6, "learning_rate": 0.03, "min_child_weight": 5},
+            {"max_depth": 5, "learning_rate": 0.05, "min_child_weight": 8},
+        ]
 
-    def _eval_regressor_params(params: dict[str, float]) -> float:
-        scores: list[float] = []
-        for split in splits:
-            train_df = _subset_by_dates(split.train_dates)
-            val_df = _subset_by_dates(split.val_dates)
-            if train_df.empty or val_df.empty:
-                continue
-            model = build_model(random_state=42)
-            model.set_params(**params, early_stopping_rounds=50)
-            model.fit(
-                train_df[feature_cols],
-                train_df["future_ret"].astype(float),
-                eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
-                verbose=False,
-            )
-            preds = model.predict(val_df[feature_cols])
-            metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
-            scores.append(float(metrics["summary"]["mean_net_ret"]))
-        return float(np.nanmean(scores)) if scores else float("nan")
+        def _eval_regressor_params(params: dict[str, float]) -> float:
+            scores: list[float] = []
+            for split in splits:
+                train_df = _subset_by_dates(split.train_dates)
+                val_df = _subset_by_dates(split.val_dates)
+                if train_df.empty or val_df.empty:
+                    continue
+                model = build_model(random_state=42)
+                model.set_params(**params, early_stopping_rounds=50)
+                model.fit(
+                    train_df[feature_cols],
+                    train_df["future_ret"].astype(float),
+                    eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                    verbose=False,
+                )
+                preds = model.predict(val_df[feature_cols])
+                metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
+                scores.append(float(metrics["summary"]["mean_net_ret"]))
+            return float(np.nanmean(scores)) if scores else float("nan")
 
-    regressor_scores = {str(p): _eval_regressor_params(p) for p in regressor_candidates}
-    best_regressor_params = max(regressor_candidates, key=lambda p: regressor_scores.get(str(p), float("-inf")))
+        regressor_scores = {str(p): _eval_regressor_params(p) for p in regressor_candidates}
+        best_regressor_params = max(regressor_candidates, key=lambda p: regressor_scores.get(str(p), float("-inf")))
 
     train_df = _subset_by_dates(holdout.train_dates)
     val_df = _subset_by_dates(val_dates)
@@ -399,20 +447,32 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
 
 
-    # Use configured ensemble seeds or default
-    seeds = cfg.train_ensemble_seeds if cfg.train_ensemble_seeds else [7, 13, 21, 42, 73, 99, 123]
+    # Use configured ensemble composition or default
+    n_xgb = getattr(cfg, 'ensemble_xgb_count', 3)
+    n_lgbm = getattr(cfg, 'ensemble_lgbm_count', 3)
+    use_lgbm = getattr(cfg, 'use_lightgbm', True)
+    
+    if not use_lgbm:
+        n_xgb = 7  # Fallback to 7 XGBoost models
+        n_lgbm = 0
+    
     model_dir = Path(cfg.model_path).parent
     model_dir.mkdir(parents=True, exist_ok=True)
     reg_rel_paths: list[str] = []
+    model_types: list[str] = []
 
     logger.info(
-        "Training ML regressor ensemble on %s samples, %s tickers (seeds=%s)",
+        "Training mixed ensemble: %d XGBoost + %d LightGBM models on %s samples, %s tickers",
+        n_xgb,
+        n_lgbm,
         len(train_df),
         train_df["ticker"].nunique(),
-        seeds,
     )
-    for s in seeds:
-        m = build_model(random_state=s)
+    
+    # Train XGBoost models
+    for i in range(n_xgb):
+        seed = 42 + i * 10
+        m = build_model(random_state=seed)
         m.set_params(**best_regressor_params, early_stopping_rounds=50)
         if not val_df.empty:
             m.fit(
@@ -423,16 +483,51 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             )
         else:
             m.fit(train_df[feature_cols], train_df["future_ret"].astype(float))
-        rel = f"regressor_seed_{s}.json"
+        rel = f"xgb_model_{i}.json"
         save_model(m, model_dir / rel)
         reg_rel_paths.append(rel)
+        model_types.append("xgboost")
+        logger.info("Trained XGBoost model %d/%d", i+1, n_xgb)
+    
+    # Train LightGBM models if enabled
+    if use_lgbm and n_lgbm > 0:
+        for i in range(n_lgbm):
+            seed = 42 + i * 10
+            m = build_lgbm_model(random_state=seed)
+            # Translate XGBoost params to LightGBM equivalents
+            lgbm_params = {
+                "max_depth": best_regressor_params.get("max_depth", 6),
+                "learning_rate": best_regressor_params.get("learning_rate", 0.05),
+                "min_child_samples": best_regressor_params.get("min_child_weight", 5) * 4,  # Approximate conversion
+                "subsample": best_regressor_params.get("subsample", 0.8),
+                "colsample_bytree": best_regressor_params.get("colsample_bytree", 0.8),
+                "reg_lambda": best_regressor_params.get("reg_lambda", 1.0),
+            }
+            m.set_params(**lgbm_params)
+            if not val_df.empty:
+                m.fit(
+                    train_df[feature_cols],
+                    train_df["future_ret"].astype(float),
+                    eval_set=[(val_df[feature_cols], val_df["future_ret"].astype(float))],
+                    callbacks=[],  # Disable callbacks to reduce verbosity
+                )
+            else:
+                m.fit(train_df[feature_cols], train_df["future_ret"].astype(float))
+            rel = f"lgbm_model_{i}.txt"
+            save_model(m, model_dir / rel)
+            reg_rel_paths.append(rel)
+            model_types.append("lightgbm")
+            logger.info("Trained LightGBM model %d/%d", i+1, n_lgbm)
 
     reg_holdout_preds: list[float] = []
     if not holdout_df.empty:
         preds = np.zeros(len(holdout_df), dtype=float)
-        for rel in reg_rel_paths:
-            model = load_model(model_dir / rel)
-            preds += model.predict(xgb.DMatrix(holdout_df[feature_cols])).astype(float)
+        for rel, mtype in zip(reg_rel_paths, model_types):
+            model = load_model(model_dir / rel, mtype)
+            if mtype == "xgboost":
+                preds += model.predict(xgb.DMatrix(holdout_df[feature_cols])).astype(float)
+            else:  # lightgbm
+                preds += model.predict(holdout_df[feature_cols]).astype(float)
         preds = preds / float(len(reg_rel_paths))
         reg_holdout_preds = preds.tolist()
 
@@ -441,10 +536,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
 
 
-    # Compute feature importance from first regressor
+    # Compute feature importance from first XGBoost model
     feature_importance = {}
-    if reg_rel_paths:
-        first_model = load_model(model_dir / reg_rel_paths[0])
+    xgb_models = [rel for rel, mtype in zip(reg_rel_paths, model_types) if mtype == "xgboost"]
+    if xgb_models:
+        first_model = load_model(model_dir / xgb_models[0], "xgboost")
         # Use get_score() for xgb.Booster
         try:
             importance = first_model.get_score(importance_type="gain")
@@ -506,6 +602,35 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 validation_metrics["by_market_cap_quintile"] = mcap_ics
                 logger.info("IC by market cap quintile: %d quintiles evaluated", len(mcap_ics))
 
+    # Enhanced metrics including calibration and portfolio stats
+    calibration_metrics = {}
+    portfolio_metrics = {}
+    
+    if not holdout_df.empty and len(reg_holdout_preds) > 0:
+        # Compute calibration
+        calibration_result = compute_calibration(
+            pd.Series(reg_holdout_preds, index=holdout_df.index),
+            holdout_df["future_ret"],
+            n_bins=10
+        )
+        calibration_metrics = {
+            "calibration_error": calibration_result["calibration_error"],
+            "n_deciles": len(calibration_result["by_decile"]) if isinstance(calibration_result["by_decile"], pd.DataFrame) else 0,
+        }
+        logger.info("Calibration error: %.6f", calibration_result["calibration_error"])
+        
+        # Compute portfolio metrics from top-N daily returns
+        if "daily" in reg_holdout_topn and isinstance(reg_holdout_topn["daily"], pd.DataFrame):
+            daily_df = reg_holdout_topn["daily"]
+            if "mean_ret" in daily_df.columns and len(daily_df) > 0:
+                portfolio_metrics = compute_portfolio_metrics(daily_df["mean_ret"])
+                logger.info(
+                    "Portfolio metrics: Sharpe=%.2f, Sortino=%.2f, MaxDD=%.2f%%",
+                    portfolio_metrics.get("sharpe_ratio", 0),
+                    portfolio_metrics.get("sortino_ratio", 0),
+                    portfolio_metrics.get("max_drawdown", 0) * 100,
+                )
+
     metadata = {
         "horizon_days": horizon,
         "prediction_offset": 1,
@@ -531,11 +656,15 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "n_samples": int(len(panel)),
         "n_tickers": int(panel["ticker"].nunique()),
         "validation_metrics": validation_metrics,
+        "calibration": calibration_metrics,
+        "portfolio_metrics": portfolio_metrics,
+        "feature_importance": feature_importance,
     }
     metadata_rel = "metrics.json"
     write_json(model_dir / metadata_rel, metadata)
 
-    save_ensemble(cfg.model_path, model_rel_paths=reg_rel_paths, weights=None)
+    # Save the ensemble manifest with model types
+    save_ensemble(cfg.model_path, model_rel_paths=reg_rel_paths, model_types=model_types, weights=None)
     logger.info("Saved model bundle manifest to %s", cfg.model_path)
     return TrainResult(n_samples=int(len(panel)), n_tickers=int(panel["ticker"].nunique()), horizon_days=horizon)
 

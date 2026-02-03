@@ -12,13 +12,13 @@ from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.technical import compute_features
-from stock_screener.optimization.risk_parity import compute_inverse_vol_weights
+from stock_screener.optimization.risk_parity import compute_inverse_vol_weights, compute_correlation_aware_weights, apply_confidence_weighting
 from stock_screener.reporting.render import render_reports
 from stock_screener.screening.screener import score_universe
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, read_json, write_json
-from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble
+from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty
 from stock_screener.modeling.transform import normalize_features_cross_section
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
@@ -91,7 +91,17 @@ def run_daily(cfg: Config, logger) -> None:
                 ensemble = load_ensemble(mp)
                 models, weights = ensemble
                 if models:
-                    features["pred_return"] = predict_ensemble(models, weights, features_ml)
+                    # Use uncertainty-aware predictions
+                    pred_df = predict_ensemble_with_uncertainty(models, weights, features_ml)
+                    features["pred_return"] = pred_df["pred_return"]
+                    features["pred_uncertainty"] = pred_df["pred_uncertainty"]
+                    features["pred_confidence"] = pred_df["pred_confidence"]
+                    logger.info(
+                        "ML predictions: mean=%.4f, confidence range=[%.3f, %.3f]",
+                        pred_df["pred_return"].mean(),
+                        pred_df["pred_confidence"].min(),
+                        pred_df["pred_confidence"].max(),
+                    )
                     logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(models))
                 # Try to load metadata from manifest parent
                 metadata_path = mp.parent / "metrics.json"
@@ -121,13 +131,35 @@ def run_daily(cfg: Config, logger) -> None:
     logger.info("Screened universe: %s tickers (from %s after filters)", len(screened), len(scored))
 
     alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
-    target_weights = compute_inverse_vol_weights(
-        features=screened,
-        portfolio_size=cfg.portfolio_size,
-        weight_cap=cfg.weight_cap,
-        logger=logger,
-        alpha_col=alpha_col,
-    )
+    
+    # Compute portfolio weights with optional correlation awareness
+    if cfg.use_correlation_weights:
+        logger.info("Using correlation-aware risk parity weights")
+        target_weights = compute_correlation_aware_weights(
+            features=screened,
+            prices=prices,  # Need historical prices for covariance
+            portfolio_size=cfg.portfolio_size,
+            weight_cap=cfg.weight_cap,
+            logger=logger,
+        )
+    else:
+        target_weights = compute_inverse_vol_weights(
+            features=screened,
+            portfolio_size=cfg.portfolio_size,
+            weight_cap=cfg.weight_cap,
+            logger=logger,
+            alpha_col=alpha_col,
+        )
+    
+    # Apply confidence weighting if available
+    if "pred_confidence" in screened.columns:
+        confidence = screened["pred_confidence"]
+        target_weights = apply_confidence_weighting(
+            target_weights,
+            confidence,
+            cfg.confidence_weight_floor,
+            logger,
+        )
 
     # Portfolio actions (stateful)
     # Use full `features` for exits so we can manage holdings even if they are not in today's top-N.

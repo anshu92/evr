@@ -192,3 +192,79 @@ def evaluate_predictions(
         payload["by_group"] = group_stats
 
     return payload
+
+
+def compute_portfolio_metrics(daily_returns: pd.Series, rf_annual: float = 0.05) -> dict[str, float]:
+    """Compute comprehensive portfolio performance metrics including Sharpe, Sortino, and max drawdown."""
+    if daily_returns.empty or len(daily_returns) < 2:
+        return {
+            "sharpe_ratio": float("nan"),
+            "sortino_ratio": float("nan"),
+            "max_drawdown": float("nan"),
+            "volatility_ann": float("nan"),
+            "total_return": float("nan"),
+            "n_days": 0,
+        }
+    
+    rf_daily = rf_annual / 252  # Convert annual risk-free rate to daily
+    excess = daily_returns - rf_daily
+    
+    # Sharpe Ratio
+    sharpe = np.sqrt(252) * excess.mean() / excess.std() if excess.std() > 0 else float("nan")
+    
+    # Sortino Ratio (only penalize downside volatility)
+    downside = excess[excess < 0]
+    sortino = np.sqrt(252) * excess.mean() / downside.std() if len(downside) > 0 and downside.std() > 0 else float("nan")
+    
+    # Max Drawdown
+    cumulative = (1 + daily_returns).cumprod()
+    rolling_max = cumulative.cummax()
+    drawdown = (cumulative - rolling_max) / rolling_max
+    max_drawdown = drawdown.min()
+    
+    # Volatility (annualized)
+    volatility_ann = daily_returns.std() * np.sqrt(252)
+    
+    # Total Return
+    total_return = cumulative.iloc[-1] - 1 if len(cumulative) > 0 else 0.0
+    
+    return {
+        "sharpe_ratio": float(sharpe),
+        "sortino_ratio": float(sortino),
+        "max_drawdown": float(max_drawdown),
+        "volatility_ann": float(volatility_ann),
+        "total_return": float(total_return),
+        "n_days": int(len(daily_returns)),
+    }
+
+
+def compute_calibration(predictions: pd.Series, realized: pd.Series, n_bins: int = 10) -> dict[str, object]:
+    """Measure prediction calibration across deciles."""
+    if predictions.empty or realized.empty:
+        return {"calibration_error": float("nan"), "by_decile": pd.DataFrame()}
+    
+    df = pd.DataFrame({"pred": predictions, "real": realized}).dropna()
+    
+    if len(df) < n_bins:
+        return {"calibration_error": float("nan"), "by_decile": pd.DataFrame()}
+    
+    try:
+        df["decile"] = pd.qcut(df["pred"], n_bins, labels=False, duplicates="drop")
+    except ValueError:
+        # Not enough unique values for binning
+        return {"calibration_error": float("nan"), "by_decile": pd.DataFrame()}
+    
+    calibration = df.groupby("decile").agg({
+        "pred": ["mean", "count"],
+        "real": "mean",
+    })
+    calibration.columns = ["pred_mean", "count", "real_mean"]
+    
+    # Perfect calibration: pred_mean == real_mean for each decile
+    # Use MSE as calibration error
+    calibration_error = np.mean((calibration["pred_mean"] - calibration["real_mean"])**2)
+    
+    return {
+        "calibration_error": float(calibration_error),
+        "by_decile": calibration.reset_index(),
+    }

@@ -3,6 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+try:
+    from scipy.optimize import minimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 
 def _cap_weights(w: pd.Series, cap: float, *, allow_cash: bool) -> pd.Series:
     cap = float(cap)
@@ -92,3 +98,113 @@ def compute_inverse_vol_weights(
     out = out.sort_values("weight", ascending=False)
     logger.info("Computed weights: %s tickers (cap=%s)", len(out), weight_cap)
     return out
+
+
+def compute_correlation_aware_weights(
+    features: pd.DataFrame,
+    prices: pd.DataFrame,
+    portfolio_size: int,
+    weight_cap: float,
+    logger,
+) -> pd.DataFrame:
+    """Risk parity with correlation adjustment using equal risk contribution."""
+    if not SCIPY_AVAILABLE:
+        logger.warning("scipy not available, falling back to inverse-vol weights")
+        return compute_inverse_vol_weights(features, portfolio_size, weight_cap, logger)
+    
+    df = features.head(portfolio_size).copy()
+    tickers = list(df.index)
+    
+    # Get returns for covariance estimation
+    try:
+        # Extract ticker columns from MultiIndex if needed
+        if isinstance(prices.columns, pd.MultiIndex):
+            ticker_prices = pd.DataFrame({t: prices[(t, "Close")] for t in tickers if (t, "Close") in prices.columns})
+        else:
+            ticker_prices = prices[tickers]
+        
+        returns = ticker_prices.pct_change().dropna()
+        
+        if len(returns) < 60:
+            logger.warning("Insufficient price history (%d days) for covariance, using inverse-vol", len(returns))
+            return compute_inverse_vol_weights(features, portfolio_size, weight_cap, logger)
+        
+        # Compute annualized covariance matrix
+        cov_matrix = returns.cov() * 252
+        
+        # Equal risk contribution optimization
+        def risk_budget_objective(weights):
+            port_var = weights @ cov_matrix @ weights
+            if port_var <= 0:
+                return 1e10
+            marginal_contrib = cov_matrix @ weights
+            risk_contrib = weights * marginal_contrib / np.sqrt(port_var + 1e-10)
+            target = 1.0 / len(weights)
+            return np.sum((risk_contrib - target)**2)
+        
+        # Constraints: weights sum to 1, all positive, respect cap
+        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
+        bounds = [(0.0, float(weight_cap)) for _ in range(len(tickers))]
+        initial_weights = np.ones(len(tickers)) / len(tickers)
+        
+        result = minimize(
+            risk_budget_objective,
+            initial_weights,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'maxiter': 100, 'ftol': 1e-6},
+        )
+        
+        if result.success:
+            weights_series = pd.Series(result.x, index=tickers)
+            df["weight"] = weights_series
+            logger.info("Correlation-aware weights computed successfully")
+            return df.sort_values("weight", ascending=False)
+        else:
+            logger.warning("Optimization failed: %s. Using inverse-vol", result.message)
+            return compute_inverse_vol_weights(features, portfolio_size, weight_cap, logger)
+    
+    except Exception as e:
+        logger.warning("Correlation weights failed: %s. Using inverse-vol", str(e))
+        return compute_inverse_vol_weights(features, portfolio_size, weight_cap, logger)
+
+
+def apply_confidence_weighting(
+    weights_df: pd.DataFrame,
+    confidence: pd.Series | None,
+    confidence_floor: float = 0.3,
+    logger=None,
+) -> pd.DataFrame:
+    """Adjust position sizes by model confidence."""
+    result = weights_df.copy()
+    
+    if confidence is None:
+        if logger:
+            logger.info("No confidence data provided, skipping confidence weighting")
+        return result
+    
+    # Merge confidence if not already in DataFrame
+    if "pred_confidence" not in result.columns:
+        result = result.join(confidence.rename("pred_confidence"), how="left")
+    
+    if "pred_confidence" not in result.columns or result["pred_confidence"].isna().all():
+        if logger:
+            logger.warning("No confidence data available, skipping confidence weighting")
+        return result
+    
+    # Clip confidence to floor
+    adj_confidence = result["pred_confidence"].fillna(confidence_floor).clip(lower=confidence_floor)
+    
+    # Adjust weights by confidence
+    result["weight"] = result["weight"] * adj_confidence
+    
+    # Renormalize
+    weight_sum = result["weight"].sum()
+    if weight_sum > 0:
+        result["weight"] = result["weight"] / weight_sum
+    
+    if logger:
+        logger.info("Applied confidence weighting (floor=%.2f)", confidence_floor)
+    
+    return result.sort_values("weight", ascending=False)
