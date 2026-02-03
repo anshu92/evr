@@ -44,13 +44,33 @@ FEATURE_COLUMNS = [
     "momentum_acceleration",
     "ret_20d_lagged",
     "ret_60d_lagged",
+    # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like signals)
+    "ret_5d_sharpe",
+    "ret_20d_sharpe",
+    "ret_60d_sharpe",
+    # HIGH-IMPACT: Volume-price divergence signals
+    "volume_momentum_20d",
+    "volume_surge_5d",
+    "price_volume_div",
+    # HIGH-IMPACT: Mean reversion signals
+    "ma20_zscore",
+    "mean_reversion_signal",
+    # HIGH-IMPACT: Trend quality features
+    "ret_consistency_20d",
+    "up_days_ratio_20d",
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
+    # Cross-sectional ranks (position relative to peers on each date)
+    "rank_ret_5d",
     "rank_ret_20d",
     "rank_ret_60d",
     "rank_vol_60d",
     "rank_avg_dollar_volume",
+    "rank_ret_5d_sharpe",
+    "rank_momentum_reversal",
+    "rank_ma20_zscore",
+    "momentum_strength",
     "fx_ret_5d",
     "fx_ret_20d",
     "is_tsx",
@@ -65,6 +85,17 @@ FEATURE_COLUMNS = [
     "market_trend_20d",   # Market 20-day return
     "market_breadth",     # % of stocks above their 20-day MA
     "market_momentum_accel",  # Market momentum acceleration
+    # Macro regime indicators
+    "vix",  # CBOE Volatility Index
+    "treasury_10y",  # 10-Year Treasury Yield
+    "treasury_13w",  # 13-Week Treasury Bill
+    "yield_curve_slope",  # 10Y - 3M yield spread
+    # HIGH-IMPACT: Feature interaction terms
+    "sharpe_x_rank",  # Sharpe ratio × momentum rank
+    "momentum_vol_interaction",  # Momentum × volatility
+    "rsi_momentum_interaction",  # RSI extreme × momentum direction
+    "size_momentum_interaction",  # Size × relative momentum
+    "zscore_reversal",  # Mean reversion potential
     # Fundamental composite scores
     "value_score",
     "quality_score",
@@ -102,13 +133,33 @@ TECHNICAL_FEATURES_ONLY = [
     "momentum_acceleration",
     "ret_20d_lagged",
     "ret_60d_lagged",
+    # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like signals)
+    "ret_5d_sharpe",
+    "ret_20d_sharpe",
+    "ret_60d_sharpe",
+    # HIGH-IMPACT: Volume-price divergence signals
+    "volume_momentum_20d",
+    "volume_surge_5d",
+    "price_volume_div",
+    # HIGH-IMPACT: Mean reversion signals
+    "ma20_zscore",
+    "mean_reversion_signal",
+    # HIGH-IMPACT: Trend quality features
+    "ret_consistency_20d",
+    "up_days_ratio_20d",
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
+    # Cross-sectional ranks
+    "rank_ret_5d",
     "rank_ret_20d",
     "rank_ret_60d",
     "rank_vol_60d",
     "rank_avg_dollar_volume",
+    "rank_ret_5d_sharpe",
+    "rank_momentum_reversal",
+    "rank_ma20_zscore",
+    "momentum_strength",
     "fx_ret_5d",
     "fx_ret_20d",
     "is_tsx",
@@ -117,6 +168,17 @@ TECHNICAL_FEATURES_ONLY = [
     "market_trend_20d",
     "market_breadth",
     "market_momentum_accel",
+    # Macro regime indicators
+    "vix",
+    "treasury_10y",
+    "treasury_13w",
+    "yield_curve_slope",
+    # HIGH-IMPACT: Feature interaction terms
+    "sharpe_x_rank",
+    "momentum_vol_interaction",
+    "rsi_momentum_interaction",
+    "size_momentum_interaction",
+    "zscore_reversal",
 ]
 
 
@@ -143,14 +205,14 @@ def build_model(random_state: int = 42):
 
     _require_xgb()
     return xgb.XGBRegressor(
-        n_estimators=500,  # Reduced from 800
-        learning_rate=0.02,  # Reduced from 0.03 for better generalization
-        max_depth=4,  # Reduced from 6 to prevent overfitting
-        subsample=0.7,  # Reduced from 0.8
-        colsample_bytree=0.7,  # Reduced from 0.8
-        reg_lambda=5.0,  # Increased from 1.0 for stronger regularization
-        reg_alpha=0.5,  # Added L1 regularization
-        min_child_weight=10,  # Increased from 5
+        n_estimators=400,  # Balanced: quality vs speed
+        learning_rate=0.025,
+        max_depth=5,  # Moderate depth
+        subsample=0.75,
+        colsample_bytree=0.75,
+        reg_lambda=3.0,  # L2 regularization
+        reg_alpha=0.3,  # L1 regularization
+        min_child_weight=8,
         objective="reg:squarederror",
         n_jobs=0,
         random_state=random_state,
@@ -181,15 +243,15 @@ def build_lgbm_model(random_state: int = 42):
     
     _require_lgb()
     return lgb.LGBMRegressor(
-        n_estimators=400,  # Reduced
-        learning_rate=0.02,  # Reduced for better generalization
-        max_depth=4,  # Reduced to prevent overfitting
-        num_leaves=15,  # Reduced from 31
-        subsample=0.7,  # Reduced
-        colsample_bytree=0.7,  # Reduced
-        reg_lambda=5.0,  # Increased regularization
-        reg_alpha=0.5,  # Added L1 regularization
-        min_child_samples=50,  # Increased from 20
+        n_estimators=350,  # Balanced: quality vs speed
+        learning_rate=0.025,
+        max_depth=5,  # Moderate depth
+        num_leaves=20,
+        subsample=0.75,
+        colsample_bytree=0.75,
+        reg_lambda=3.0,  # L2 regularization
+        reg_alpha=0.3,  # L1 regularization
+        min_child_samples=30,
         random_state=random_state,
         verbose=-1,
     )

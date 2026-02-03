@@ -174,6 +174,37 @@ def compute_features(
         ret_20d_lagged = _safe_pct_change(close_cad.iloc[:-5], 20) if len(close_cad) > 25 else float("nan")  # Lagged momentum
         ret_60d_lagged = _safe_pct_change(close_cad.iloc[:-5], 60) if len(close_cad) > 65 else float("nan")  # Lagged long-term momentum
 
+        # HIGH-IMPACT FEATURES: Volatility-adjusted returns (Sharpe-like signals)
+        ret_5d_sharpe = ret_5d / vol_20d if vol_20d and not pd.isna(vol_20d) and vol_20d > 0 else float("nan")
+        ret_20d_sharpe = ret_20d / vol_20d if vol_20d and not pd.isna(vol_20d) and vol_20d > 0 else float("nan")
+        ret_60d_sharpe = ret_60d / vol_60d if vol_60d and not pd.isna(vol_60d) and vol_60d > 0 else float("nan")
+        
+        # Volume momentum and price-volume divergence
+        vol_20d_ago = vol.iloc[-20] if len(vol) > 20 else float("nan")
+        vol_5d_ago = vol.iloc[-5] if len(vol) > 5 else float("nan")
+        volume_momentum_20d = (vol.iloc[-1] / vol_20d_ago - 1.0) if vol_20d_ago and not pd.isna(vol_20d_ago) and vol_20d_ago > 0 else float("nan")
+        volume_surge_5d = (vol.iloc[-1] / vol_5d_ago - 1.0) if vol_5d_ago and not pd.isna(vol_5d_ago) and vol_5d_ago > 0 else float("nan")
+        price_volume_div = ret_20d - volume_momentum_20d if not pd.isna(volume_momentum_20d) else float("nan")
+        
+        # Mean reversion signals
+        ma20_zscore = float("nan")
+        if len(close_cad) >= 20:
+            ma20 = close_cad.rolling(20).mean()
+            ma20_std = close_cad.rolling(20).std()
+            if ma20_std.iloc[-1] and ma20_std.iloc[-1] > 0:
+                ma20_zscore = float((close_cad.iloc[-1] - ma20.iloc[-1]) / ma20_std.iloc[-1])
+        mean_reversion_signal = -ret_5d * drawdown_60d if not pd.isna(drawdown_60d) else float("nan")
+        
+        # Trend consistency (quality of momentum)
+        ret_consistency_20d = float("nan")
+        up_days_ratio_20d = float("nan")
+        if len(rets) >= 20:
+            recent_rets = rets.iloc[-20:]
+            ret_std = recent_rets.std()
+            if ret_std and ret_std > 0:
+                ret_consistency_20d = 1.0 / (1.0 + float(ret_std) * np.sqrt(252))
+            up_days_ratio_20d = float((recent_rets > 0).sum() / len(recent_rets))
+
         fx_ret_5d = float(fx.pct_change(5).iloc[-1]) if not is_tsx and len(fx) >= 6 else 0.0
         fx_ret_20d = float(fx.pct_change(20).iloc[-1]) if not is_tsx and len(fx) >= 21 else 0.0
 
@@ -268,6 +299,20 @@ def compute_features(
                 "momentum_acceleration": momentum_acceleration,
                 "ret_20d_lagged": ret_20d_lagged,
                 "ret_60d_lagged": ret_60d_lagged,
+                # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like)
+                "ret_5d_sharpe": ret_5d_sharpe,
+                "ret_20d_sharpe": ret_20d_sharpe,
+                "ret_60d_sharpe": ret_60d_sharpe,
+                # HIGH-IMPACT: Volume-price signals
+                "volume_momentum_20d": volume_momentum_20d,
+                "volume_surge_5d": volume_surge_5d,
+                "price_volume_div": price_volume_div,
+                # HIGH-IMPACT: Mean reversion signals
+                "ma20_zscore": ma20_zscore,
+                "mean_reversion_signal": mean_reversion_signal,
+                # HIGH-IMPACT: Trend quality
+                "ret_consistency_20d": ret_consistency_20d,
+                "up_days_ratio_20d": up_days_ratio_20d,
                 # Relative momentum (computed cross-sectionally after all tickers)
                 "relative_momentum_20d": float("nan"),  # Placeholder - filled after DataFrame is built
                 "relative_momentum_60d": float("nan"),  # Placeholder - filled after DataFrame is built

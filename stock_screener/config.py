@@ -42,11 +42,11 @@ class Config:
     
     # Advanced modeling
     use_lightgbm: bool = True
-    use_optuna: bool = True
-    optuna_n_trials: int = 12
-    optuna_timeout_seconds: int = 180
-    ensemble_xgb_count: int = 3
-    ensemble_lgbm_count: int = 3
+    use_optuna: bool = False  # Set USE_OPTUNA=1 to enable (adds ~10 min)
+    optuna_n_trials: int = 6  # Quick search
+    optuna_timeout_seconds: int = 90
+    ensemble_xgb_count: int = 3  # XGBoost models (fast)
+    ensemble_lgbm_count: int = 2  # LightGBM models (slower but diverse)
     
     # Portfolio optimization
     use_correlation_weights: bool = False  # Requires scipy; set True to enable

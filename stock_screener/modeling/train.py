@@ -23,6 +23,7 @@ from stock_screener.config import Config
 from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.prices import download_price_history
+from stock_screener.data.macro import fetch_macro_indicators
 from stock_screener.features.fundamental_scores import add_fundamental_composites
 from stock_screener.modeling.eval import (
     build_time_splits,
@@ -337,15 +338,25 @@ def _build_panel_features(
 
     panel = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not panel.empty:
+        # Cross-sectional ranks - captures relative position within each date
         rank_map = {
             "ret_20d": "rank_ret_20d",
             "ret_60d": "rank_ret_60d",
             "vol_60d_ann": "rank_vol_60d",
             "avg_dollar_volume_cad": "rank_avg_dollar_volume",
+            # HIGH-IMPACT: Additional cross-sectional ranks
+            "ret_5d": "rank_ret_5d",
+            "ret_5d_sharpe": "rank_ret_5d_sharpe",
+            "momentum_reversal": "rank_momentum_reversal",
+            "ma20_zscore": "rank_ma20_zscore",
         }
         for col, out_col in rank_map.items():
             if col in panel.columns:
                 panel[out_col] = panel.groupby("date")[col].rank(pct=True)
+        
+        # HIGH-IMPACT: Momentum strength (composite rank)
+        if "rank_ret_20d" in panel.columns and "rank_ret_60d" in panel.columns:
+            panel["momentum_strength"] = (panel["rank_ret_20d"] + panel["rank_ret_60d"]) / 2
         
         panel = add_fundamental_composites(panel, date_col="date")
     
@@ -392,10 +403,24 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         cache_ttl_days=cfg.fundamentals_cache_ttl_days,
         logger=logger,
     )
+    
+    # Fetch macro indicators for regime detection
+    macro = fetch_macro_indicators(
+        lookback_days=cfg.feature_lookback_days + 365,
+        logger=logger,
+    )
+    
     panel = _build_panel_features(prices=prices, fx_usdcad=fx, fundamentals=fundamentals)
     if panel.empty:
         raise RuntimeError("No training panel built")
-
+    
+    # Merge macro indicators as date-level features
+    if not macro.empty:
+        macro_reset = macro.reset_index()
+        macro_reset["date"] = pd.to_datetime(macro_reset["date"]).dt.normalize()
+        panel = panel.merge(macro_reset, on="date", how="left")
+        logger.info(f"Merged macro indicators: {list(macro.columns)}")
+    
     horizon = int(cfg.label_horizon_days)
     max_horizon = int(getattr(cfg, "max_holding_days_hard", 10))  # Extended horizon for peak detection
     top_n = max(1, int(cfg.portfolio_size))
@@ -480,59 +505,75 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     panel["market_ret"] = panel["date"].map(market_returns)
     logger.info("Using cap-weighted market benchmark (approximates SPY/TSX)")
     
-    # Compute RELATIVE MOMENTUM (stock vs market)
-    # These are cross-sectional features that show stock strength relative to market average
-    market_ret_20d = panel.groupby("date")["ret_20d"].transform(
-        lambda x: np.average(x.dropna(), weights=np.power(10, panel.loc[x.dropna().index, "log_market_cap"].fillna(9))) if len(x.dropna()) > 0 else x.mean()
-    )
-    market_ret_60d = panel.groupby("date")["ret_60d"].transform(
-        lambda x: np.average(x.dropna(), weights=np.power(10, panel.loc[x.dropna().index, "log_market_cap"].fillna(9))) if len(x.dropna()) > 0 else x.mean()
-    )
+    # Compute RELATIVE MOMENTUM (stock vs market) - VECTORIZED for speed
+    # Pre-compute market cap weights once
+    panel["_mcap"] = np.power(10, panel["log_market_cap"].fillna(9))
+    
+    def _fast_weighted_mean(df, val_col, weight_col):
+        """Fast vectorized weighted mean per date using groupby aggregation."""
+        df = df.copy()
+        df["_weighted_val"] = df[val_col].fillna(0) * df[weight_col]
+        agg = df.groupby("date").agg({
+            "_weighted_val": "sum",
+            weight_col: "sum"
+        })
+        agg["_wmean"] = agg["_weighted_val"] / agg[weight_col].replace(0, np.nan)
+        return df["date"].map(agg["_wmean"])
+    
+    market_ret_20d = _fast_weighted_mean(panel, "ret_20d", "_mcap")
+    market_ret_60d = _fast_weighted_mean(panel, "ret_60d", "_mcap")
     panel["relative_momentum_20d"] = panel["ret_20d"] - market_ret_20d
     panel["relative_momentum_60d"] = panel["ret_60d"] - market_ret_60d
     logger.info("Added relative momentum features (stock vs cap-weighted market)")
     
     # Compute MARKET REGIME features (same value for all stocks on each date)
-    # These help the model understand broader market conditions and adapt strategies
-    
     # Market volatility regime: cap-weighted average volatility vs historical norm
     if "vol_20d_ann" in panel.columns:
-        market_vol = panel.groupby("date")["vol_20d_ann"].transform(
-            lambda x: np.average(
-                x.fillna(0.20), 
-                weights=np.power(10, panel.loc[x.index, "log_market_cap"].fillna(9))
-            ) if len(x) > 0 else 0.20
-        )
+        market_vol = _fast_weighted_mean(panel, "vol_20d_ann", "_mcap")
         historical_norm = 0.15  # ~15% annualized is "normal" volatility
         panel["market_vol_regime"] = market_vol / historical_norm
     else:
         panel["market_vol_regime"] = 1.0
     
     # Market trend: cap-weighted 20-day return per date
-    panel["market_trend_20d"] = market_ret_20d  # Already computed above
+    panel["market_trend_20d"] = market_ret_20d
     
-    # Market breadth: % of stocks above their 20-day MA on each date
+    # Market breadth: % of stocks above their 20-day MA on each date (fast)
     if "ma20_ratio" in panel.columns:
-        panel["market_breadth"] = panel.groupby("date")["ma20_ratio"].transform(
-            lambda x: (x > 1.0).sum() / len(x) if len(x) > 0 else 0.5
-        )
+        above_ma = (panel["ma20_ratio"] > 1.0).astype(int)
+        breadth_agg = panel.groupby("date").agg({"ma20_ratio": "count"})
+        above_agg = panel.assign(_above=above_ma).groupby("date")["_above"].sum()
+        breadth_agg["breadth"] = above_agg / breadth_agg["ma20_ratio"]
+        panel["market_breadth"] = panel["date"].map(breadth_agg["breadth"].fillna(0.5))
     else:
         panel["market_breadth"] = 0.5
     
     # Market momentum acceleration: short-term vs medium-term momentum
     if "ret_5d" in panel.columns:
-        market_ret_5d = panel.groupby("date")["ret_5d"].transform(
-            lambda x: np.average(
-                x.dropna(), 
-                weights=np.power(10, panel.loc[x.dropna().index, "log_market_cap"].fillna(9))
-            ) if len(x.dropna()) > 0 else x.mean()
-        )
-        # Annualize the difference for scale consistency
+        market_ret_5d = _fast_weighted_mean(panel, "ret_5d", "_mcap")
         panel["market_momentum_accel"] = (market_ret_5d * 4) - market_ret_20d
     else:
         panel["market_momentum_accel"] = 0.0
     
+    # Clean up temp column
+    panel.drop(columns=["_mcap"], inplace=True, errors="ignore")
     logger.info("Added market regime features (vol_regime, trend, breadth, momentum_accel)")
+    
+    # HIGH-IMPACT: Feature interaction terms
+    # These capture non-linear relationships that boost trees might miss
+    if "ret_20d_sharpe" in panel.columns and "momentum_strength" in panel.columns:
+        panel["sharpe_x_rank"] = panel["ret_20d_sharpe"] * panel["momentum_strength"]
+    if "ret_5d" in panel.columns and "vol_20d_ann" in panel.columns:
+        panel["momentum_vol_interaction"] = panel["ret_5d"] * panel["vol_20d_ann"]
+    if "rsi_14" in panel.columns and "ret_5d" in panel.columns:
+        # RSI extremes with momentum direction
+        panel["rsi_momentum_interaction"] = (panel["rsi_14"] - 50) / 50 * panel["ret_5d"]
+    if "log_market_cap" in panel.columns and "relative_momentum_20d" in panel.columns:
+        panel["size_momentum_interaction"] = panel["log_market_cap"] * panel["relative_momentum_20d"]
+    if "ma20_zscore" in panel.columns and "ret_5d" in panel.columns:
+        # Mean reversion potential
+        panel["zscore_reversal"] = -panel["ma20_zscore"] * np.sign(panel["ret_5d"])
+    logger.info("Added feature interaction terms")
     
     # Compute market-relative returns (alpha = stock return - market return)
     panel["future_alpha"] = panel["future_ret"] - panel["market_ret"]
@@ -579,6 +620,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
     # Also winsorize labels to remove extreme outliers (MAD-based)
     panel["future_ret"] = panel.groupby("date")["future_ret"].transform(winsorize_mad)
+    if "future_alpha" in panel.columns:
+        panel["future_alpha"] = panel.groupby("date")["future_alpha"].transform(winsorize_mad)
+    logger.info("Winsorized target labels to reduce outlier impact")
     
     # Validate that required features exist
     missing_features = [c for c in feature_cols if c not in panel.columns]
@@ -728,7 +772,19 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     val_df = _subset_by_dates(val_dates)
     holdout_df = _subset_by_dates(holdout.holdout_dates)
 
-
+    # Compute sample weights: more recent samples get higher weight
+    # This helps the model adapt to recent market conditions
+    train_dates_sorted = sorted(train_df["date"].unique())
+    date_to_idx = {d: i for i, d in enumerate(train_dates_sorted)}
+    train_df = train_df.copy()
+    train_df["_date_idx"] = train_df["date"].map(date_to_idx)
+    # Exponential decay weight: recent data weighted ~2x more than oldest
+    decay_rate = 1.0 / len(train_dates_sorted)  # ~2x weight for newest vs oldest
+    train_df["_sample_weight"] = np.exp(decay_rate * train_df["_date_idx"])
+    # Normalize weights to mean=1
+    train_df["_sample_weight"] = train_df["_sample_weight"] / train_df["_sample_weight"].mean()
+    sample_weights = train_df["_sample_weight"].values
+    logger.info("Added recency sample weights: oldest=%.2f, newest=%.2f", sample_weights.min(), sample_weights.max())
 
     # Use configured ensemble composition or default
     n_xgb = getattr(cfg, 'ensemble_xgb_count', 3)
@@ -801,15 +857,15 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         if use_ranking:
             # Use XGBRanker for learning-to-rank
             m = xgb.XGBRanker(
-                n_estimators=600,
-                learning_rate=best_regressor_params.get("learning_rate", 0.05),
-                max_depth=best_regressor_params.get("max_depth", 6),
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_lambda=1.0,
-                min_child_weight=best_regressor_params.get("min_child_weight", 5),
+                n_estimators=400,  # Balanced: quality vs speed
+                learning_rate=best_regressor_params.get("learning_rate", 0.04),
+                max_depth=best_regressor_params.get("max_depth", 5),
+                subsample=0.75,
+                colsample_bytree=0.75,
+                reg_lambda=2.0,
+                min_child_weight=best_regressor_params.get("min_child_weight", 8),
                 objective="rank:pairwise",
-                eval_metric="ndcg@30",  # Optimize NDCG for top-30
+                eval_metric="ndcg@30",
                 n_jobs=0,
                 random_state=seed,
             )
@@ -833,11 +889,16 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 m.fit(
                     train_df[current_features],
                     train_df[label_col].astype(float),
+                    sample_weight=sample_weights,
                     eval_set=[(val_df[current_features], val_df[label_col].astype(float))],
                     verbose=False,
                 )
             else:
-                m.fit(train_df[current_features], train_df[label_col].astype(float))
+                m.fit(
+                    train_df[current_features], 
+                    train_df[label_col].astype(float),
+                    sample_weight=sample_weights
+                )
         
         # After first model: perform feature selection based on importance
         if i == 0 and len(feature_cols) > 10:
@@ -908,11 +969,16 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 m.fit(
                     train_df[selected_features],
                     train_df[label_col].astype(float),
+                    sample_weight=sample_weights,
                     eval_set=[(val_df[selected_features], val_df[label_col].astype(float))],
                     callbacks=[],  # Disable callbacks to reduce verbosity
                 )
             else:
-                m.fit(train_df[selected_features], train_df[label_col].astype(float))
+                m.fit(
+                    train_df[selected_features], 
+                    train_df[label_col].astype(float),
+                    sample_weight=sample_weights
+                )
             rel = f"lgbm_model_{i}.txt"
             save_model(m, model_dir / rel)
             reg_rel_paths.append(rel)
@@ -920,15 +986,40 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             logger.info("Trained LightGBM model %d/%d", i+1, n_lgbm)
 
     reg_holdout_preds: list[float] = []
+    model_ics: list[float] = []  # Track IC per model for adaptive weighting
+    
     if not holdout_df.empty:
         preds = np.zeros(len(holdout_df), dtype=float)
+        all_model_preds = []  # Store individual model predictions
+        
+        # Get predictions from each model and compute its IC
         for rel, mtype in zip(reg_rel_paths, model_types):
             model = load_model(model_dir / rel, mtype)
             if mtype == "xgboost":
-                preds += model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
+                model_pred = model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
             else:  # lightgbm
-                preds += model.predict(holdout_df[selected_features]).astype(float)
-        preds = preds / float(len(reg_rel_paths))
+                model_pred = model.predict(holdout_df[selected_features]).astype(float)
+            
+            all_model_preds.append(model_pred)
+            
+            # Compute IC for this model
+            model_metrics = _rank_ic_for_preds(holdout_df, pd.Series(model_pred, index=holdout_df.index))
+            model_ic = model_metrics.get("summary", {}).get("mean_ic", 0.0)
+            model_ics.append(max(model_ic, 0.0))  # Floor at 0 (don't reward negative IC)
+        
+        # IC-weighted ensemble: weight each model by its IC
+        if sum(model_ics) > 0:
+            weights = np.array(model_ics) / sum(model_ics)
+            logger.info(f"IC-weighted ensemble: model ICs={[f'{ic:.4f}' for ic in model_ics]}, weights={[f'{w:.3f}' for w in weights]}")
+            for i, model_pred in enumerate(all_model_preds):
+                preds += model_pred * weights[i]
+        else:
+            # Fallback to equal weighting if all ICs are <= 0
+            logger.warning("All model ICs <= 0, using equal weighting")
+            for model_pred in all_model_preds:
+                preds += model_pred
+            preds = preds / float(len(reg_rel_paths))
+        
         reg_holdout_preds = preds.tolist()
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
@@ -1344,6 +1435,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "realistic_portfolio_metrics": realistic_metrics,  # 5-day hold simulation
         "walk_forward_validation": walk_forward_results,  # Multi-period robustness
         "feature_importance": feature_importance,
+        "feature_ic": feature_ic,  # Per-feature IC for adaptive selection
+        "model_ics": model_ics,  # Per-model IC for ensemble weighting
         # Calibration map for realistic prediction magnitudes
         # Use label_col (future_alpha or future_ret) for calibration to match training target
         "prediction_calibration": build_calibration_map(panel[label_col].dropna(), n_quantiles=20),
@@ -1403,6 +1496,13 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
         cache_ttl_days=cfg.fundamentals_cache_ttl_days,
         logger=logger,
     )
+    
+    # Fetch macro indicators for regime detection
+    macro = fetch_macro_indicators(
+        lookback_days=cfg.feature_lookback_days + 365,
+        logger=logger,
+    )
+    
     panel = _build_panel_features(prices=prices, fx_usdcad=fx, fundamentals=fundamentals)
     if panel.empty:
         raise RuntimeError("No evaluation panel built")
