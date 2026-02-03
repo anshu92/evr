@@ -389,8 +389,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             }
         temp = df.copy()
         temp["pred"] = pred
+        # CRITICAL: Always use future_ret for portfolio returns, even when training on alpha
+        # The model predicts alpha (relative returns), but portfolio P&L uses absolute returns
         return evaluate_topn_returns(
-            temp, date_col="date", label_col=label_col, pred_col="pred", top_n=top_n, cost_bps=cost_bps
+            temp, date_col="date", label_col="future_ret", pred_col="pred", top_n=top_n, cost_bps=cost_bps
         )
 
 
@@ -645,7 +647,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     portfolio_metrics = {}
     
     if not holdout_df.empty and len(reg_holdout_preds) > 0:
-        # Compute calibration
+        # Compute calibration against the TRAINED target (alpha or absolute)
+        # This measures how well the model predicts what it was trained to predict
         calibration_result = compute_calibration(
             pd.Series(reg_holdout_preds, index=holdout_df.index),
             holdout_df[label_col],
@@ -658,6 +661,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         logger.info("Calibration error: %.6f", calibration_result["calibration_error"])
         
         # Compute portfolio metrics from top-N daily returns
+        # NOTE: These returns are ALWAYS absolute returns (future_ret), not alpha
+        # This is correct because portfolio P&L is measured in absolute terms
         if "daily" in reg_holdout_topn and isinstance(reg_holdout_topn["daily"], pd.DataFrame):
             daily_df = reg_holdout_topn["daily"]
             if "mean_ret" in daily_df.columns and len(daily_df) > 0:
