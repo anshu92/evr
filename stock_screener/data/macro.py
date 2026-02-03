@@ -27,27 +27,40 @@ def fetch_macro_indicators(lookback_days: int = 730, logger=None) -> pd.DataFram
             data = yf.download(ticker, start=start, progress=False, auto_adjust=True)
             if not data.empty and "Close" in data.columns:
                 results[name] = data["Close"]
+            else:
+                results[name] = pd.Series(dtype=float)
         except Exception as e:
             if logger:
                 logger.warning(f"Failed to fetch {name} ({ticker}): {e}")
             results[name] = pd.Series(dtype=float)
     
     # Combine into single DataFrame
-    df = pd.DataFrame(results)
-    df.index.name = "date"
+    # Handle case where all Series are empty
+    if not results or all(len(s) == 0 for s in results.values()):
+        if logger:
+            logger.warning("All macro indicator fetches failed, returning empty DataFrame")
+        df = pd.DataFrame()
+    else:
+        # Align all series to common index
+        df = pd.DataFrame(results)
+        df.index.name = "date"
     
     # Add derived features
-    if "treasury_10y" in df.columns and "treasury_13w" in df.columns:
+    if not df.empty and "treasury_10y" in df.columns and "treasury_13w" in df.columns:
         # Yield curve slope (10Y - 3M)
         df["yield_curve_slope"] = df["treasury_10y"] - df["treasury_13w"]
     
     # Forward-fill missing values (holidays, etc.)
-    df = df.ffill().bfill()
+    if not df.empty:
+        df = df.ffill().bfill()
     
     if logger:
-        logger.info(
-            f"Fetched macro indicators: {len(df)} days, "
-            f"columns={list(df.columns)}, date_range={df.index.min()} to {df.index.max()}"
-        )
+        if not df.empty:
+            logger.info(
+                f"Fetched macro indicators: {len(df)} days, "
+                f"columns={list(df.columns)}, date_range={df.index.min()} to {df.index.max()}"
+            )
+        else:
+            logger.info("No macro indicators fetched - proceeding without macro features")
     
     return df
