@@ -25,25 +25,31 @@ def fetch_macro_indicators(lookback_days: int = 730, logger=None) -> pd.DataFram
     for ticker, name in indicators.items():
         try:
             data = yf.download(ticker, start=start, progress=False, auto_adjust=True)
-            if not data.empty and "Close" in data.columns:
-                results[name] = data["Close"]
-            else:
-                results[name] = pd.Series(dtype=float)
+            if data is not None and not data.empty:
+                # Handle both single and multi-level column formats from yfinance
+                if isinstance(data.columns, pd.MultiIndex):
+                    # Multi-level columns: ('Close', 'TICKER')
+                    if "Close" in data.columns.get_level_values(0):
+                        close_data = data["Close"]
+                        if isinstance(close_data, pd.DataFrame):
+                            close_data = close_data.iloc[:, 0]
+                        results[name] = close_data.squeeze()
+                elif "Close" in data.columns:
+                    results[name] = data["Close"].squeeze()
         except Exception as e:
             if logger:
                 logger.warning(f"Failed to fetch {name} ({ticker}): {e}")
-            results[name] = pd.Series(dtype=float)
     
     # Combine into single DataFrame
-    # Handle case where all Series are empty
-    if not results or all(len(s) == 0 for s in results.values()):
+    # Handle case where no data was fetched
+    if not results:
         if logger:
             logger.warning("All macro indicator fetches failed, returning empty DataFrame")
-        df = pd.DataFrame()
-    else:
-        # Align all series to common index
-        df = pd.DataFrame(results)
-        df.index.name = "date"
+        return pd.DataFrame()
+    
+    # Build DataFrame from successfully fetched series
+    df = pd.concat(results, axis=1)
+    df.index.name = "date"
     
     # Add derived features
     if not df.empty and "treasury_10y" in df.columns and "treasury_13w" in df.columns:
