@@ -78,41 +78,51 @@ def _apply_target_encoding(
 ) -> pd.Series:
     """Apply target encoding with smoothing to prevent overfitting.
     
-    Uses leave-one-out encoding within each date to prevent data leakage.
-    Smoothing pulls extreme values toward the global mean.
+    Uses expanding window with vectorized merge - fast O(n) implementation.
     """
     if cat_col not in panel.columns or panel[cat_col].isna().all():
         return pd.Series(np.nan, index=panel.index)
     
-    # Global mean for smoothing
     global_mean = panel[target_col].mean()
     
-    # Compute per-category stats using historical data only (no leakage)
-    result = pd.Series(np.nan, index=panel.index)
+    # Compute per-date aggregates per category
+    daily_agg = panel.groupby([date_col, cat_col])[target_col].agg(["sum", "count"]).reset_index()
+    daily_agg.columns = [date_col, cat_col, "day_sum", "day_count"]
     
-    for date in panel[date_col].unique():
-        # Use only data BEFORE this date for encoding
-        historical = panel[panel[date_col] < date]
-        current = panel[panel[date_col] == date]
-        
-        if historical.empty:
-            # No history yet - use global mean
-            result.loc[current.index] = global_mean
-            continue
-        
-        # Calculate category means from historical data
-        cat_stats = historical.groupby(cat_col)[target_col].agg(["mean", "count"])
-        
-        # Apply smoothing: blend category mean with global mean based on sample size
-        # Formula: (n * cat_mean + m * global_mean) / (n + m) where m = smoothing
-        cat_encoded = (
-            cat_stats["count"] * cat_stats["mean"] + smoothing * global_mean
-        ) / (cat_stats["count"] + smoothing)
-        
-        # Map to current date's rows
-        current_cats = current[cat_col]
-        result.loc[current.index] = current_cats.map(cat_encoded).fillna(global_mean)
+    # Sort dates and pivot to get (date x category) matrix
+    dates_sorted = sorted(daily_agg[date_col].unique())
+    all_cats = daily_agg[cat_col].unique()
     
+    # Create pivot tables for cumulative computation
+    sum_pivot = daily_agg.pivot_table(
+        index=date_col, columns=cat_col, values="day_sum", fill_value=0, aggfunc="sum"
+    ).reindex(dates_sorted, fill_value=0)
+    count_pivot = daily_agg.pivot_table(
+        index=date_col, columns=cat_col, values="day_count", fill_value=0, aggfunc="sum"
+    ).reindex(dates_sorted, fill_value=0)
+    
+    # Compute LAGGED cumulative sums (shift by 1 to exclude current date)
+    cumsum = sum_pivot.cumsum().shift(1, fill_value=0)
+    cumcount = count_pivot.cumsum().shift(1, fill_value=0)
+    
+    # Compute smoothed encoding: (n * mean + m * global) / (n + m)
+    # mean = cumsum / cumcount, so: (cumsum + m * global) / (cumcount + m)
+    encoded_pivot = (cumsum + smoothing * global_mean) / (cumcount + smoothing)
+    
+    # Melt back to long format for merge
+    encoded_long = encoded_pivot.reset_index().melt(
+        id_vars=[date_col], var_name=cat_col, value_name="_enc"
+    )
+    
+    # Merge with original panel
+    panel_with_idx = panel[[date_col, cat_col]].copy()
+    panel_with_idx["_orig_idx"] = panel.index
+    
+    merged = panel_with_idx.merge(encoded_long, on=[date_col, cat_col], how="left")
+    merged = merged.set_index("_orig_idx").sort_index()
+    
+    result = merged["_enc"].fillna(global_mean)
+    result.index = panel.index
     return result
 
 
