@@ -839,11 +839,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     val_df = _subset_by_dates(val_dates)
     holdout_df = _subset_by_dates(holdout.holdout_dates)
     
-    # MEMORY OPTIMIZATION: Delete main panel after splitting
-    # Keep only the splits we need for training
-    del panel
+    # Note: panel is kept for walk-forward validation and metadata
     gc.collect()
-    logger.info("Memory: freed main panel, using train/val/holdout splits")
 
     # Compute sample weights: more recent samples get higher weight
     # This helps the model adapt to recent market conditions
