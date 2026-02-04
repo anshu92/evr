@@ -1059,6 +1059,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             logger.warning("All model ICs <= 0, using equal weighting")
         
         # Second pass: compute weighted predictions (memory efficient)
+        # IMPORTANT: Standardize predictions before combining to handle scale mismatch
+        # XGBRanker outputs ranking scores (~0-10) while LightGBM outputs alpha (~-0.5 to +0.5)
         preds = np.zeros(len(holdout_df), dtype=float)
         for i, (rel, mtype) in enumerate(zip(reg_rel_paths, model_types)):
             model = load_model(model_dir / rel, mtype)
@@ -1066,6 +1068,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 model_pred = model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
             else:  # lightgbm
                 model_pred = model.predict(holdout_df[selected_features]).astype(float)
+            
+            # Standardize to z-scores before combining (handles scale mismatch)
+            pred_std = float(np.nanstd(model_pred))
+            if pred_std > 0:
+                model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
+            
             preds += model_pred * weights[i]
             del model_pred, model
         
@@ -1076,14 +1084,20 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
 
     # Compute train IC to compare with holdout IC (detect overfitting)
+    # Use same IC-weighted ensemble with standardization as holdout
     train_preds = np.zeros(len(train_df), dtype=float)
-    for rel, mtype in zip(reg_rel_paths, model_types):
+    for i, (rel, mtype) in enumerate(zip(reg_rel_paths, model_types)):
         model = load_model(model_dir / rel, mtype)
         if mtype == "xgboost":
-            train_preds += model.predict(xgb.DMatrix(train_df[selected_features])).astype(float)
+            model_pred = model.predict(xgb.DMatrix(train_df[selected_features])).astype(float)
         else:  # lightgbm
-            train_preds += model.predict(train_df[selected_features]).astype(float)
-    train_preds = train_preds / float(len(reg_rel_paths))
+            model_pred = model.predict(train_df[selected_features]).astype(float)
+        # Standardize before combining (same as holdout)
+        pred_std = float(np.nanstd(model_pred))
+        if pred_std > 0:
+            model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
+        train_preds += model_pred * weights[i]
+        del model_pred, model
     train_metrics = _rank_ic_for_preds(train_df, pd.Series(train_preds, index=train_df.index))
     
     # Log train vs holdout IC to detect overfitting
@@ -1354,18 +1368,23 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if period_test_df.empty or len(period_test_df) < 100:
                 continue
             
-            # Make predictions using ensemble (use selected features)
+            # Make predictions using IC-weighted ensemble with standardization
             period_X = period_test_df[selected_features].astype(float)
             period_preds = np.zeros(len(period_test_df))
-            for m in reg_models:
+            for i, m in enumerate(reg_models):
                 if hasattr(m, "predict"):
                     try:
-                        period_preds += m.predict(xgb.DMatrix(period_X) if isinstance(m, xgb.Booster) else period_X)
+                        model_pred = m.predict(xgb.DMatrix(period_X) if isinstance(m, xgb.Booster) else period_X)
                     except Exception:
-                        period_preds += m.predict(period_X)
+                        model_pred = m.predict(period_X)
                 else:
-                    period_preds += m.predict(xgb.DMatrix(period_X))
-            period_preds /= len(reg_models)
+                    model_pred = m.predict(xgb.DMatrix(period_X))
+                model_pred = np.asarray(model_pred, dtype=float)
+                # Standardize before combining (handles XGBRanker vs LightGBM scale mismatch)
+                pred_std = float(np.nanstd(model_pred))
+                if pred_std > 0:
+                    model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
+                period_preds += model_pred * weights[i]
             
             # Evaluate with realistic simulation
             period_test_df = period_test_df.copy()

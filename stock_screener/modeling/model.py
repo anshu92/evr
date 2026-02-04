@@ -349,7 +349,12 @@ def predict_ensemble(
 
     out = np.zeros(len(features), dtype=float)
     for i, m in enumerate(models):
-        out += w[i] * predict(m, features, feature_cols).astype(float).values
+        model_pred = predict(m, features, feature_cols).astype(float).values
+        # Standardize to z-scores before combining (handles scale mismatch between XGBRanker and LightGBM)
+        pred_std = float(np.nanstd(model_pred))
+        if pred_std > 0:
+            model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
+        out += w[i] * model_pred
     return pd.Series(out, index=features.index, name="pred_return")
 
 
@@ -370,8 +375,15 @@ def predict_ensemble_with_uncertainty(
     if not models:
         raise ValueError("No models provided for ensemble prediction")
     
-    # Get predictions from all models
-    preds_list = [predict(m, features, feature_cols).values for m in models]
+    # Get predictions from all models and standardize to handle scale mismatch
+    preds_list = []
+    for m in models:
+        model_pred = predict(m, features, feature_cols).values.astype(float)
+        # Standardize to z-scores (handles XGBRanker vs LightGBM scale mismatch)
+        pred_std_val = float(np.nanstd(model_pred))
+        if pred_std_val > 0:
+            model_pred = (model_pred - np.nanmean(model_pred)) / pred_std_val
+        preds_list.append(model_pred)
     preds_array = np.array(preds_list)  # shape: (n_models, n_samples)
     
     # Apply weights if provided
