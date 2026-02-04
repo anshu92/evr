@@ -199,6 +199,29 @@ def _build_panel_features(
         # This avoids "buying recent winners" which is already priced in
         ret_20d_lagged = ret_20d.shift(5)  # 20d return, lagged by 5 days
         ret_60d_lagged = ret_60d.shift(5)  # 60d return, lagged by 5 days
+        
+        # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like signals)
+        ret_5d_sharpe = ret_5d / vol_20.replace(0, np.nan)
+        ret_20d_sharpe = ret_20d / vol_20.replace(0, np.nan)
+        ret_60d_sharpe = ret_60d / vol_60.replace(0, np.nan)
+        
+        # Volume momentum and price-volume divergence
+        vol_20d_ago = vol.shift(20)
+        vol_5d_ago = vol.shift(5)
+        volume_momentum_20d = (vol / vol_20d_ago.replace(0, np.nan)) - 1.0
+        volume_surge_5d = (vol / vol_5d_ago.replace(0, np.nan)) - 1.0
+        price_volume_div = ret_20d - volume_momentum_20d
+        
+        # Mean reversion signals
+        ma20_std = close_cad.rolling(20).std()
+        ma20_zscore = (close_cad - ma20) / ma20_std.replace(0, np.nan)
+        mean_reversion_signal = -ret_5d * drawdown_60d
+        
+        # Trend consistency (quality of momentum)
+        rolling_std_20 = rets.rolling(20).std()
+        ret_consistency_20d = 1.0 / (1.0 + rolling_std_20 * np.sqrt(252))
+        up_days_20d = (rets > 0).rolling(20).sum()
+        up_days_ratio_20d = up_days_20d / 20.0
 
         vol_anom_30d = vol / vol.rolling(30).mean().replace(0.0, np.nan)
         avg_dollar_vol = (close_cad * vol).rolling(30).mean()
@@ -302,6 +325,20 @@ def _build_panel_features(
                 "momentum_acceleration": momentum_acceleration.values,  # Momentum change
                 "ret_20d_lagged": ret_20d_lagged.values,  # Lagged momentum (reduces autocorrelation)
                 "ret_60d_lagged": ret_60d_lagged.values,  # Lagged long-term momentum
+                # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like)
+                "ret_5d_sharpe": ret_5d_sharpe.values,
+                "ret_20d_sharpe": ret_20d_sharpe.values,
+                "ret_60d_sharpe": ret_60d_sharpe.values,
+                # HIGH-IMPACT: Volume-price signals
+                "volume_momentum_20d": volume_momentum_20d.values,
+                "volume_surge_5d": volume_surge_5d.values,
+                "price_volume_div": price_volume_div.values,
+                # HIGH-IMPACT: Mean reversion signals
+                "ma20_zscore": ma20_zscore.values,
+                "mean_reversion_signal": mean_reversion_signal.values,
+                # HIGH-IMPACT: Trend quality
+                "ret_consistency_20d": ret_consistency_20d.values,
+                "up_days_ratio_20d": up_days_ratio_20d.values,
                 "log_market_cap": log_market_cap,
                 "beta": beta,
                 "sector": sector,  # Raw sector for target encoding
