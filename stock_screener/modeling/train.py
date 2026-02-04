@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
@@ -419,7 +420,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         macro_reset = macro.reset_index()
         macro_reset["date"] = pd.to_datetime(macro_reset["date"]).dt.normalize()
         panel = panel.merge(macro_reset, on="date", how="left")
-        logger.info(f"Merged macro indicators: {list(macro.columns)}")
+        del macro, macro_reset
+        gc.collect()
+        logger.info(f"Merged macro indicators: {list(panel.columns[-4:])}")
     
     horizon = int(cfg.label_horizon_days)
     max_horizon = int(getattr(cfg, "max_holding_days_hard", 10))  # Extended horizon for peak detection
@@ -481,6 +484,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     panel["days_to_peak"] = peak_df["days_to_peak"]
     panel["peak_return"] = peak_df["peak_return"]
     logger.info("Computed peak detection targets: days_to_peak (1-%d), peak_return", max_horizon)
+    del peak_df
+    gc.collect()
     
     # Compute market benchmark return for each date using MARKET-CAP WEIGHTING
     # This is more realistic than equal-weighted (approximates SPY/TSX benchmark)
@@ -506,22 +511,23 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     logger.info("Using cap-weighted market benchmark (approximates SPY/TSX)")
     
     # Compute RELATIVE MOMENTUM (stock vs market) - VECTORIZED for speed
-    # Pre-compute market cap weights once
-    panel["_mcap"] = np.power(10, panel["log_market_cap"].fillna(9))
+    # Pre-compute market cap weights once (avoid repeated computation)
+    _mcap = np.power(10, panel["log_market_cap"].fillna(9).values)
     
-    def _fast_weighted_mean(df, val_col, weight_col):
-        """Fast vectorized weighted mean per date using groupby aggregation."""
-        df = df.copy()
-        df["_weighted_val"] = df[val_col].fillna(0) * df[weight_col]
-        agg = df.groupby("date").agg({
-            "_weighted_val": "sum",
-            weight_col: "sum"
-        })
-        agg["_wmean"] = agg["_weighted_val"] / agg[weight_col].replace(0, np.nan)
-        return df["date"].map(agg["_wmean"])
+    def _fast_weighted_mean(val_col, weights, dates):
+        """Memory-efficient weighted mean per date - no DataFrame copy."""
+        vals = panel[val_col].fillna(0).values
+        weighted_vals = vals * weights
+        # Use pandas groupby on Series (not DataFrame) to minimize memory
+        date_series = pd.Series(dates)
+        weighted_sum = pd.Series(weighted_vals).groupby(date_series).sum()
+        weight_sum = pd.Series(weights).groupby(date_series).sum().replace(0, np.nan)
+        wmean = weighted_sum / weight_sum
+        return date_series.map(wmean).values
     
-    market_ret_20d = _fast_weighted_mean(panel, "ret_20d", "_mcap")
-    market_ret_60d = _fast_weighted_mean(panel, "ret_60d", "_mcap")
+    _dates = panel["date"].values
+    market_ret_20d = _fast_weighted_mean("ret_20d", _mcap, _dates)
+    market_ret_60d = _fast_weighted_mean("ret_60d", _mcap, _dates)
     panel["relative_momentum_20d"] = panel["ret_20d"] - market_ret_20d
     panel["relative_momentum_60d"] = panel["ret_60d"] - market_ret_60d
     logger.info("Added relative momentum features (stock vs cap-weighted market)")
@@ -529,7 +535,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Compute MARKET REGIME features (same value for all stocks on each date)
     # Market volatility regime: cap-weighted average volatility vs historical norm
     if "vol_20d_ann" in panel.columns:
-        market_vol = _fast_weighted_mean(panel, "vol_20d_ann", "_mcap")
+        market_vol = _fast_weighted_mean("vol_20d_ann", _mcap, _dates)
         historical_norm = 0.15  # ~15% annualized is "normal" volatility
         panel["market_vol_regime"] = market_vol / historical_norm
     else:
@@ -540,23 +546,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     
     # Market breadth: % of stocks above their 20-day MA on each date (fast)
     if "ma20_ratio" in panel.columns:
-        above_ma = (panel["ma20_ratio"] > 1.0).astype(int)
-        breadth_agg = panel.groupby("date").agg({"ma20_ratio": "count"})
-        above_agg = panel.assign(_above=above_ma).groupby("date")["_above"].sum()
-        breadth_agg["breadth"] = above_agg / breadth_agg["ma20_ratio"]
-        panel["market_breadth"] = panel["date"].map(breadth_agg["breadth"].fillna(0.5))
+        above_ma = (panel["ma20_ratio"] > 1.0).astype(int).values
+        date_series = pd.Series(_dates)
+        breadth_count = date_series.groupby(date_series).count()
+        above_sum = pd.Series(above_ma).groupby(date_series).sum()
+        breadth = (above_sum / breadth_count).fillna(0.5)
+        panel["market_breadth"] = date_series.map(breadth).values
     else:
         panel["market_breadth"] = 0.5
     
     # Market momentum acceleration: short-term vs medium-term momentum
     if "ret_5d" in panel.columns:
-        market_ret_5d = _fast_weighted_mean(panel, "ret_5d", "_mcap")
+        market_ret_5d = _fast_weighted_mean("ret_5d", _mcap, _dates)
         panel["market_momentum_accel"] = (market_ret_5d * 4) - market_ret_20d
     else:
         panel["market_momentum_accel"] = 0.0
     
-    # Clean up temp column
-    panel.drop(columns=["_mcap"], inplace=True, errors="ignore")
+    # Clean up temp arrays and free memory
+    del _mcap, _dates
+    gc.collect()
     logger.info("Added market regime features (vol_regime, trend, breadth, momentum_accel)")
     
     # HIGH-IMPACT: Feature interaction terms
@@ -989,10 +997,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     model_ics: list[float] = []  # Track IC per model for adaptive weighting
     
     if not holdout_df.empty:
-        preds = np.zeros(len(holdout_df), dtype=float)
-        all_model_preds = []  # Store individual model predictions
-        
-        # Get predictions from each model and compute its IC
+        # First pass: compute IC for each model to determine weights
         for rel, mtype in zip(reg_rel_paths, model_types):
             model = load_model(model_dir / rel, mtype)
             if mtype == "xgboost":
@@ -1000,27 +1005,35 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             else:  # lightgbm
                 model_pred = model.predict(holdout_df[selected_features]).astype(float)
             
-            all_model_preds.append(model_pred)
-            
             # Compute IC for this model
             model_metrics = _rank_ic_for_preds(holdout_df, pd.Series(model_pred, index=holdout_df.index))
             model_ic = model_metrics.get("summary", {}).get("mean_ic", 0.0)
             model_ics.append(max(model_ic, 0.0))  # Floor at 0 (don't reward negative IC)
+            del model_pred, model
         
-        # IC-weighted ensemble: weight each model by its IC
+        gc.collect()
+        
+        # Compute weights from ICs
         if sum(model_ics) > 0:
             weights = np.array(model_ics) / sum(model_ics)
             logger.info(f"IC-weighted ensemble: model ICs={[f'{ic:.4f}' for ic in model_ics]}, weights={[f'{w:.3f}' for w in weights]}")
-            for i, model_pred in enumerate(all_model_preds):
-                preds += model_pred * weights[i]
         else:
-            # Fallback to equal weighting if all ICs are <= 0
+            weights = np.ones(len(model_ics)) / len(model_ics)
             logger.warning("All model ICs <= 0, using equal weighting")
-            for model_pred in all_model_preds:
-                preds += model_pred
-            preds = preds / float(len(reg_rel_paths))
+        
+        # Second pass: compute weighted predictions (memory efficient)
+        preds = np.zeros(len(holdout_df), dtype=float)
+        for i, (rel, mtype) in enumerate(zip(reg_rel_paths, model_types)):
+            model = load_model(model_dir / rel, mtype)
+            if mtype == "xgboost":
+                model_pred = model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
+            else:  # lightgbm
+                model_pred = model.predict(holdout_df[selected_features]).astype(float)
+            preds += model_pred * weights[i]
+            del model_pred, model
         
         reg_holdout_preds = preds.tolist()
+        gc.collect()
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))

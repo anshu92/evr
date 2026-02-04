@@ -42,11 +42,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Show system resources
+        run: |
+          echo "=== Memory ==="
+          free -h
+          echo "=== CPU ==="
+          nproc
+          echo "=== Disk ==="
+          df -h
+      
       - name: Train model
         env:
           MODEL_PATH: "models/ensemble/manifest.json"
           LABEL_HORIZON_DAYS: "5"
-          # Increase training data for better signal
+          # Full universe for better signal
           MAX_TICKERS: "4000"
           FEATURE_LOOKBACK_DAYS: "730"
           BATCH_SIZE: "250"
