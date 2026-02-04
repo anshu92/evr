@@ -375,7 +375,15 @@ def _build_panel_features(
         frames.append(df)
 
     panel = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    del frames  # Free memory immediately
+    gc.collect()
+    
     if not panel.empty:
+        # MEMORY OPTIMIZATION: Convert float64 to float32 (50% RAM reduction)
+        float_cols = panel.select_dtypes(include=['float64']).columns
+        for col in float_cols:
+            panel[col] = panel[col].astype('float32')
+        gc.collect()
         # Cross-sectional ranks - captures relative position within each date
         rank_map = {
             "ret_20d": "rank_ret_20d",
@@ -459,6 +467,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     )
     
     panel = _build_panel_features(prices=prices, fx_usdcad=fx, fundamentals=fundamentals)
+    # Free source data immediately after panel is built
+    del prices, fx, fundamentals
+    gc.collect()
+    
     if panel.empty:
         raise RuntimeError("No training panel built")
     
@@ -826,6 +838,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     train_df = _subset_by_dates(holdout.train_dates)
     val_df = _subset_by_dates(val_dates)
     holdout_df = _subset_by_dates(holdout.holdout_dates)
+    
+    # MEMORY OPTIMIZATION: Delete main panel after splitting
+    # Keep only the splits we need for training
+    del panel
+    gc.collect()
+    logger.info("Memory: freed main panel, using train/val/holdout splits")
 
     # Compute sample weights: more recent samples get higher weight
     # This helps the model adapt to recent market conditions
