@@ -396,6 +396,16 @@ def _build_panel_features(
         if "rank_ret_20d" in panel.columns and "rank_ret_60d" in panel.columns:
             panel["momentum_strength"] = (panel["rank_ret_20d"] + panel["rank_ret_60d"]) / 2
         
+        # SECTOR-RELATIVE FEATURES: Rank within sector to remove sector bias
+        # This captures whether a stock is strong/weak relative to its sector peers
+        if "sector" in panel.columns:
+            sector_rank_features = ["ret_20d", "ret_60d", "ret_5d_sharpe", "vol_60d_ann", "momentum_reversal"]
+            for col in sector_rank_features:
+                if col in panel.columns:
+                    out_col = f"sector_rank_{col}"
+                    # Rank within (date, sector) group
+                    panel[out_col] = panel.groupby(["date", "sector"])[col].rank(pct=True)
+        
         panel = add_fundamental_composites(panel, date_col="date")
     
     return panel
@@ -879,6 +889,40 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         logger.info("Using LTR objective with %d training groups (dates), labels as grades 0-4", len(train_groups))
     
     objective_type = "LTR (rank)" if use_ranking else "regression"
+    
+    # PRE-TRAINING FEATURE IC SELECTION: Drop features with negative IC on validation data
+    # This removes features that are inversely correlated with future returns
+    pre_training_ic = {}
+    if not val_df.empty and len(feature_cols) > 10:
+        from scipy.stats import spearmanr
+        for col in feature_cols:
+            if col in val_df.columns and val_df[col].notna().sum() > 100:
+                try:
+                    mask = val_df[col].notna() & val_df[label_col].notna()
+                    if mask.sum() > 100:
+                        ic, _ = spearmanr(val_df.loc[mask, col], val_df.loc[mask, label_col])
+                        if not np.isnan(ic):
+                            pre_training_ic[col] = float(ic)
+                except Exception:
+                    pass
+        
+        # Keep only features with non-negative IC (neutral or helpful)
+        positive_ic_features = [f for f in feature_cols if pre_training_ic.get(f, 0.0) >= -0.01]
+        negative_ic_features = [f for f in feature_cols if pre_training_ic.get(f, 0.0) < -0.01]
+        
+        # Always keep at least 50% of features
+        min_features = max(15, len(feature_cols) // 2)
+        if len(positive_ic_features) >= min_features:
+            logger.info(
+                "IC-based feature selection: keeping %d/%d features (dropped %d with IC < -0.01)",
+                len(positive_ic_features), len(feature_cols), len(negative_ic_features)
+            )
+            if negative_ic_features:
+                # Log features with most negative IC
+                worst_features = sorted([(f, pre_training_ic.get(f, 0)) for f in negative_ic_features], key=lambda x: x[1])[:5]
+                logger.info("Dropped features (worst IC): %s", [(f, f"{ic:.3f}") for f, ic in worst_features])
+            feature_cols = positive_ic_features
+    
     logger.info(
         "Training mixed ensemble: %d XGBoost + %d LightGBM models on %s samples, %s tickers (%s)",
         n_xgb,
@@ -996,7 +1040,14 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         logger.info("Trained XGBoost %s model %d/%d", "ranker" if use_ranking else "regressor", i+1, n_xgb)
     
     # Train LightGBM models if enabled (using selected features)
+    # Use QUANTILE TRANSFORMATION: convert continuous target to cross-sectional percentile rank
+    # This is more robust to outliers and focuses on relative ranking
     if use_lgbm and n_lgbm > 0:
+        # Transform target to cross-sectional percentile rank (0-1 scale)
+        train_target_quantile = train_df.groupby("date")[label_col].rank(pct=True).astype(float)
+        val_target_quantile = val_df.groupby("date")[label_col].rank(pct=True).astype(float) if not val_df.empty else None
+        logger.info("Using quantile-transformed target for LightGBM (more robust to outliers)")
+        
         for i in range(n_lgbm):
             seed = 42 + i * 10
             m = build_lgbm_model(random_state=seed)
@@ -1010,18 +1061,18 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 "reg_lambda": best_regressor_params.get("reg_lambda", 1.0),
             }
             m.set_params(**lgbm_params)
-            if not val_df.empty:
+            if not val_df.empty and val_target_quantile is not None:
                 m.fit(
                     train_df[selected_features],
-                    train_df[label_col].astype(float),
+                    train_target_quantile,  # Use quantile-transformed target
                     sample_weight=sample_weights,
-                    eval_set=[(val_df[selected_features], val_df[label_col].astype(float))],
+                    eval_set=[(val_df[selected_features], val_target_quantile)],
                     callbacks=[],  # Disable callbacks to reduce verbosity
                 )
             else:
                 m.fit(
                     train_df[selected_features], 
-                    train_df[label_col].astype(float),
+                    train_target_quantile,  # Use quantile-transformed target
                     sample_weight=sample_weights
                 )
             rel = f"lgbm_model_{i}.txt"
