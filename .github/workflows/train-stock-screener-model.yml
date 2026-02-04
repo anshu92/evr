@@ -2,8 +2,10 @@ name: Train Stock Screener Model (XGBoost)
 
 on:
   schedule:
-    # Run daily at 02:00 UTC
-    - cron: '0 2 * * *'
+    # Run weekly on Sunday at 02:00 UTC (Saturday 9 PM ET / Sunday 10 PM ET)
+    # Model is stable week-to-week; weekly retraining is sufficient
+    # This ensures fresh model for Monday trading
+    - cron: '0 2 * * 0'
   workflow_dispatch:
 
 jobs:
