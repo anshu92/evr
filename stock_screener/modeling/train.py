@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
@@ -8,6 +9,12 @@ import hashlib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+
+try:
+    from joblib import Parallel, delayed
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
 
 try:
     import lightgbm as lgb
@@ -136,6 +143,206 @@ def _apply_target_encoding(
     return result
 
 
+def _compute_ticker_features(
+    t: str,
+    close: pd.Series,
+    vol: pd.Series,
+    idx: pd.Index,
+    fx: pd.Series,
+    fx_ret_5d: pd.Series,
+    fx_ret_20d: pd.Series,
+    fundamentals: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """Compute features for a single ticker. Returns DataFrame or None if invalid."""
+    is_tsx = _is_tsx_ticker(t)
+    fx_series = 1.0 if is_tsx else fx
+    fx_factor = float(fx_series.iloc[-1]) if not is_tsx and hasattr(fx_series, "iloc") and len(fx_series) else 1.0
+    close_cad = close * fx_series
+
+    rets = close_cad.pct_change(fill_method=None)
+    vol_20 = rets.rolling(20).std(ddof=0) * np.sqrt(252.0)
+    vol_60 = rets.rolling(60).std(ddof=0) * np.sqrt(252.0)
+    vol_ratio_20_60 = vol_20 / vol_60.replace(0.0, np.nan)
+
+    # RSI(14)
+    delta = close_cad.diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+    roll_up = up.ewm(alpha=1 / 14, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / 14, adjust=False).mean()
+    rs = roll_up / roll_down.replace(0.0, np.nan)
+    rsi_14 = 100.0 - (100.0 / (1.0 + rs))
+
+    ma20 = close_cad.rolling(20).mean()
+    ma50 = close_cad.rolling(50).mean()
+    ma200 = close_cad.rolling(200).mean()
+
+    roll_max_60 = close_cad.rolling(60).max()
+    drawdown_60d = close_cad / roll_max_60.replace(0.0, np.nan) - 1.0
+    roll_max_252 = close_cad.rolling(252).max()
+    roll_min_252 = close_cad.rolling(252).min()
+    dist_52w_high = close_cad / roll_max_252.replace(0.0, np.nan) - 1.0
+    dist_52w_low = close_cad / roll_min_252.replace(0.0, np.nan) - 1.0
+
+    ret_5d = close_cad.pct_change(5, fill_method=None)
+    ret_20d = close_cad.pct_change(20, fill_method=None)
+    ret_60d = close_cad.pct_change(60, fill_method=None)
+    momentum_reversal = ret_5d - ret_20d
+    momentum_acceleration = ret_20d - ret_60d
+    ret_20d_lagged = ret_20d.shift(5)
+    ret_60d_lagged = ret_60d.shift(5)
+
+    # Sharpe-like signals
+    ret_5d_sharpe = ret_5d / vol_20.replace(0, np.nan)
+    ret_20d_sharpe = ret_20d / vol_20.replace(0, np.nan)
+    ret_60d_sharpe = ret_60d / vol_60.replace(0, np.nan)
+
+    # Volume features
+    vol_20d_ago = vol.shift(20)
+    vol_5d_ago = vol.shift(5)
+    volume_momentum_20d = (vol / vol_20d_ago.replace(0, np.nan)) - 1.0
+    volume_surge_5d = (vol / vol_5d_ago.replace(0, np.nan)) - 1.0
+    price_volume_div = ret_20d - volume_momentum_20d
+
+    # Mean reversion
+    ma20_std = close_cad.rolling(20).std()
+    ma20_zscore = (close_cad - ma20) / ma20_std.replace(0, np.nan)
+    mean_reversion_signal = -ret_5d * drawdown_60d
+
+    # Trend consistency
+    rolling_std_20 = rets.rolling(20).std()
+    ret_consistency_20d = 1.0 / (1.0 + rolling_std_20 * np.sqrt(252))
+    up_days_20d = (rets > 0).rolling(20).sum()
+    up_days_ratio_20d = up_days_20d / 20.0
+
+    vol_anom_30d = vol / vol.rolling(30).mean().replace(0.0, np.nan)
+    avg_dollar_vol = (close_cad * vol).rolling(30).mean()
+    n_days = close_cad.expanding().count()
+
+    # Fundamentals
+    sector_hash = np.nan
+    industry_hash = np.nan
+    log_market_cap = np.nan
+    beta = np.nan
+    trailing_pe = forward_pe = price_to_book = price_to_sales = np.nan
+    enterprise_to_revenue = enterprise_to_ebitda = profit_margins = operating_margins = np.nan
+    return_on_equity = return_on_assets = revenue_growth = earnings_growth = np.nan
+    earnings_quarterly_growth = debt_to_equity = current_ratio = quick_ratio = np.nan
+    dividend_yield = payout_ratio = target_mean_price = recommendation_mean = num_analyst_opinions = np.nan
+    sector = None
+    industry = None
+
+    if fundamentals is not None and t in fundamentals.index:
+        row = fundamentals.loc[t]
+        sector = str(row.get("sector")) if row.get("sector") else None
+        industry = str(row.get("industry")) if row.get("industry") else None
+        sector_hash = _hash_to_float(sector) if sector else np.nan
+        industry_hash = _hash_to_float(industry) if industry else np.nan
+        market_cap = row.get("marketCap")
+        market_cap_cad = None
+        if market_cap is not None:
+            market_cap_cad = float(market_cap)
+            if not is_tsx and fx_factor and not pd.isna(fx_factor):
+                market_cap_cad = market_cap_cad * float(fx_factor)
+        log_market_cap = float(np.log10(market_cap_cad)) if market_cap_cad and float(market_cap_cad) > 0 else np.nan
+        beta = float(row.get("beta")) if row.get("beta") is not None else np.nan
+        # Extract other fundamentals
+        trailing_pe = float(row.get("trailingPE")) if row.get("trailingPE") is not None else np.nan
+        forward_pe = float(row.get("forwardPE")) if row.get("forwardPE") is not None else np.nan
+        price_to_book = float(row.get("priceToBook")) if row.get("priceToBook") is not None else np.nan
+        price_to_sales = float(row.get("priceToSalesTrailing12Months")) if row.get("priceToSalesTrailing12Months") is not None else np.nan
+        enterprise_to_revenue = float(row.get("enterpriseToRevenue")) if row.get("enterpriseToRevenue") is not None else np.nan
+        enterprise_to_ebitda = float(row.get("enterpriseToEbitda")) if row.get("enterpriseToEbitda") is not None else np.nan
+        profit_margins = float(row.get("profitMargins")) if row.get("profitMargins") is not None else np.nan
+        operating_margins = float(row.get("operatingMargins")) if row.get("operatingMargins") is not None else np.nan
+        return_on_equity = float(row.get("returnOnEquity")) if row.get("returnOnEquity") is not None else np.nan
+        return_on_assets = float(row.get("returnOnAssets")) if row.get("returnOnAssets") is not None else np.nan
+        revenue_growth = float(row.get("revenueGrowth")) if row.get("revenueGrowth") is not None else np.nan
+        earnings_growth = float(row.get("earningsGrowth")) if row.get("earningsGrowth") is not None else np.nan
+        earnings_quarterly_growth = float(row.get("earningsQuarterlyGrowth")) if row.get("earningsQuarterlyGrowth") is not None else np.nan
+        debt_to_equity = float(row.get("debtToEquity")) if row.get("debtToEquity") is not None else np.nan
+        current_ratio = float(row.get("currentRatio")) if row.get("currentRatio") is not None else np.nan
+        quick_ratio = float(row.get("quickRatio")) if row.get("quickRatio") is not None else np.nan
+        dividend_yield = float(row.get("dividendYield")) if row.get("dividendYield") is not None else np.nan
+        payout_ratio = float(row.get("payoutRatio")) if row.get("payoutRatio") is not None else np.nan
+        target_mean_price = float(row.get("targetMeanPrice")) if row.get("targetMeanPrice") is not None else np.nan
+        recommendation_mean = float(row.get("recommendationMean")) if row.get("recommendationMean") is not None else np.nan
+        num_analyst_opinions = float(row.get("numberOfAnalystOpinions")) if row.get("numberOfAnalystOpinions") is not None else np.nan
+
+    fx_ret_5d_series = 0.0 if is_tsx else fx_ret_5d
+    fx_ret_20d_series = 0.0 if is_tsx else fx_ret_20d
+
+    return pd.DataFrame(
+        {
+            "date": idx,
+            "ticker": t,
+            "is_tsx": int(is_tsx),
+            "last_close_cad": close_cad.values,
+            "avg_dollar_volume_cad": avg_dollar_vol.values,
+            "ret_5d": close_cad.pct_change(5, fill_method=None).values,
+            "ret_10d": close_cad.pct_change(10, fill_method=None).values,
+            "ret_20d": close_cad.pct_change(20, fill_method=None).values,
+            "ret_60d": close_cad.pct_change(60, fill_method=None).values,
+            "ret_120d": close_cad.pct_change(120, fill_method=None).values,
+            "ret_accel_20_120": (close_cad.pct_change(20, fill_method=None) - close_cad.pct_change(120, fill_method=None)).values,
+            "vol_20d_ann": vol_20.values,
+            "vol_60d_ann": vol_60.values,
+            "vol_ratio_20_60": vol_ratio_20_60.values,
+            "rsi_14": rsi_14.values,
+            "ma20_ratio": (close_cad / ma20 - 1.0).values,
+            "ma50_ratio": (close_cad / ma50 - 1.0).values,
+            "ma200_ratio": (close_cad / ma200 - 1.0).values,
+            "drawdown_60d": drawdown_60d.values,
+            "dist_52w_high": dist_52w_high.values,
+            "dist_52w_low": dist_52w_low.values,
+            "vol_anom_30d": vol_anom_30d.values,
+            "momentum_reversal": momentum_reversal.values,
+            "momentum_acceleration": momentum_acceleration.values,
+            "ret_20d_lagged": ret_20d_lagged.values,
+            "ret_60d_lagged": ret_60d_lagged.values,
+            "ret_5d_sharpe": ret_5d_sharpe.values,
+            "ret_20d_sharpe": ret_20d_sharpe.values,
+            "ret_60d_sharpe": ret_60d_sharpe.values,
+            "volume_momentum_20d": volume_momentum_20d.values,
+            "volume_surge_5d": volume_surge_5d.values,
+            "price_volume_div": price_volume_div.values,
+            "ma20_zscore": ma20_zscore.values,
+            "mean_reversion_signal": mean_reversion_signal.values,
+            "ret_consistency_20d": ret_consistency_20d.values,
+            "up_days_ratio_20d": up_days_ratio_20d.values,
+            "log_market_cap": log_market_cap,
+            "beta": beta,
+            "sector": sector,
+            "industry": industry,
+            "sector_hash": sector_hash,
+            "industry_hash": industry_hash,
+            "fx_ret_5d": fx_ret_5d_series.values if hasattr(fx_ret_5d_series, "values") else fx_ret_5d_series,
+            "fx_ret_20d": fx_ret_20d_series.values if hasattr(fx_ret_20d_series, "values") else fx_ret_20d_series,
+            "n_days": n_days.values,
+            "trailing_pe": trailing_pe,
+            "forward_pe": forward_pe,
+            "price_to_book": price_to_book,
+            "price_to_sales": price_to_sales,
+            "enterprise_to_revenue": enterprise_to_revenue,
+            "enterprise_to_ebitda": enterprise_to_ebitda,
+            "profit_margins": profit_margins,
+            "operating_margins": operating_margins,
+            "return_on_equity": return_on_equity,
+            "return_on_assets": return_on_assets,
+            "revenue_growth": revenue_growth,
+            "earnings_growth": earnings_growth,
+            "earnings_quarterly_growth": earnings_quarterly_growth,
+            "debt_to_equity": debt_to_equity,
+            "current_ratio": current_ratio,
+            "quick_ratio": quick_ratio,
+            "dividend_yield": dividend_yield,
+            "payout_ratio": payout_ratio,
+            "target_mean_price": target_mean_price,
+            "recommendation_mean": recommendation_mean,
+            "num_analyst_opinions": num_analyst_opinions,
+        }
+    )
+
 
 def _build_panel_features(
     prices: pd.DataFrame,
@@ -150,229 +357,32 @@ def _build_panel_features(
     fx_ret_5d = fx.pct_change(5, fill_method=None)
     fx_ret_20d = fx.pct_change(20, fill_method=None)
 
-    frames: list[pd.DataFrame] = []
-    tickers = list(prices.columns.levels[0])
-    for t in tickers:
-        if (t, "Close") not in prices.columns:
-            continue
-        close = prices[(t, "Close")].astype(float)
-        vol = prices[(t, "Volume")].astype(float) if (t, "Volume") in prices.columns else pd.Series(index=idx, dtype=float)
-        is_tsx = _is_tsx_ticker(t)
-        fx_series = 1.0 if is_tsx else fx
-        fx_factor = float(fx_series.iloc[-1]) if not is_tsx and hasattr(fx_series, "iloc") and len(fx_series) else 1.0
-        close_cad = close * fx_series
-
-        rets = close_cad.pct_change(fill_method=None)
-        vol_20 = rets.rolling(20).std(ddof=0) * np.sqrt(252.0)
-        vol_60 = rets.rolling(60).std(ddof=0) * np.sqrt(252.0)
-        vol_ratio_20_60 = vol_20 / vol_60.replace(0.0, np.nan)
-
-        # RSI(14)
-        delta = close_cad.diff()
-        up = delta.clip(lower=0.0)
-        down = (-delta).clip(lower=0.0)
-        roll_up = up.ewm(alpha=1 / 14, adjust=False).mean()
-        roll_down = down.ewm(alpha=1 / 14, adjust=False).mean()
-        rs = roll_up / roll_down.replace(0.0, np.nan)
-        rsi_14 = 100.0 - (100.0 / (1.0 + rs))
-
-        ma20 = close_cad.rolling(20).mean()
-        ma50 = close_cad.rolling(50).mean()
-        ma200 = close_cad.rolling(200).mean()
-
-        roll_max_60 = close_cad.rolling(60).max()
-        drawdown_60d = close_cad / roll_max_60.replace(0.0, np.nan) - 1.0
-        roll_max_252 = close_cad.rolling(252).max()
-        roll_min_252 = close_cad.rolling(252).min()
-        dist_52w_high = close_cad / roll_max_252.replace(0.0, np.nan) - 1.0
-        dist_52w_low = close_cad / roll_min_252.replace(0.0, np.nan) - 1.0
-
-        # MOMENTUM REVERSAL: Short-term mean reversion signal
-        # High recent returns tend to revert (negative predictor)
-        ret_5d = close_cad.pct_change(5, fill_method=None)
-        ret_20d = close_cad.pct_change(20, fill_method=None)
-        ret_60d = close_cad.pct_change(60, fill_method=None)
-        momentum_reversal = ret_5d - ret_20d  # Short-term vs medium-term
-        momentum_acceleration = ret_20d - ret_60d  # Acceleration signal
+    # Prepare ticker data for parallel processing
+    tickers = [t for t in prices.columns.levels[0] if (t, "Close") in prices.columns]
+    
+    # PARALLEL FEATURE COMPUTATION: Use joblib if available for ~2-4x speedup
+    n_jobs = min(os.cpu_count() or 1, 4)  # Limit to 4 workers to manage memory
+    
+    if HAS_JOBLIB and len(tickers) > 100:
+        # Use threading backend (better for pandas which releases GIL)
+        def _process_ticker(t):
+            close = prices[(t, "Close")].astype(float)
+            vol_series = prices[(t, "Volume")].astype(float) if (t, "Volume") in prices.columns else pd.Series(index=idx, dtype=float)
+            return _compute_ticker_features(t, close, vol_series, idx, fx, fx_ret_5d, fx_ret_20d, fundamentals)
         
-        # LAGGED MOMENTUM: Use momentum from 1 week ago to reduce autocorrelation
-        # This avoids "buying recent winners" which is already priced in
-        ret_20d_lagged = ret_20d.shift(5)  # 20d return, lagged by 5 days
-        ret_60d_lagged = ret_60d.shift(5)  # 60d return, lagged by 5 days
-        
-        # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like signals)
-        ret_5d_sharpe = ret_5d / vol_20.replace(0, np.nan)
-        ret_20d_sharpe = ret_20d / vol_20.replace(0, np.nan)
-        ret_60d_sharpe = ret_60d / vol_60.replace(0, np.nan)
-        
-        # Volume momentum and price-volume divergence
-        vol_20d_ago = vol.shift(20)
-        vol_5d_ago = vol.shift(5)
-        volume_momentum_20d = (vol / vol_20d_ago.replace(0, np.nan)) - 1.0
-        volume_surge_5d = (vol / vol_5d_ago.replace(0, np.nan)) - 1.0
-        price_volume_div = ret_20d - volume_momentum_20d
-        
-        # Mean reversion signals
-        ma20_std = close_cad.rolling(20).std()
-        ma20_zscore = (close_cad - ma20) / ma20_std.replace(0, np.nan)
-        mean_reversion_signal = -ret_5d * drawdown_60d
-        
-        # Trend consistency (quality of momentum)
-        rolling_std_20 = rets.rolling(20).std()
-        ret_consistency_20d = 1.0 / (1.0 + rolling_std_20 * np.sqrt(252))
-        up_days_20d = (rets > 0).rolling(20).sum()
-        up_days_ratio_20d = up_days_20d / 20.0
-
-        vol_anom_30d = vol / vol.rolling(30).mean().replace(0.0, np.nan)
-        avg_dollar_vol = (close_cad * vol).rolling(30).mean()
-        n_days = close_cad.expanding().count()
-
-        sector_hash = np.nan
-        industry_hash = np.nan
-        log_market_cap = np.nan
-        beta = np.nan
-        # New fundamental fields
-        trailing_pe = np.nan
-        forward_pe = np.nan
-        price_to_book = np.nan
-        price_to_sales = np.nan
-        enterprise_to_revenue = np.nan
-        enterprise_to_ebitda = np.nan
-        profit_margins = np.nan
-        operating_margins = np.nan
-        return_on_equity = np.nan
-        return_on_assets = np.nan
-        revenue_growth = np.nan
-        earnings_growth = np.nan
-        earnings_quarterly_growth = np.nan
-        debt_to_equity = np.nan
-        current_ratio = np.nan
-        quick_ratio = np.nan
-        dividend_yield = np.nan
-        payout_ratio = np.nan
-        target_mean_price = np.nan
-        recommendation_mean = np.nan
-        num_analyst_opinions = np.nan
-        
-        sector = None
-        industry = None
-        if fundamentals is not None and t in fundamentals.index:
-            row = fundamentals.loc[t]
-            sector = str(row.get("sector")) if row.get("sector") else None
-            industry = str(row.get("industry")) if row.get("industry") else None
-            sector_hash = _hash_to_float(sector) if sector else np.nan
-            industry_hash = _hash_to_float(industry) if industry else np.nan
-            market_cap = row.get("marketCap")
-            market_cap_cad = None
-            if market_cap is not None:
-                market_cap_cad = float(market_cap)
-                if not is_tsx and fx_factor and not pd.isna(fx_factor):
-                    market_cap_cad = market_cap_cad * float(fx_factor)
-            log_market_cap = float(np.log10(market_cap_cad)) if market_cap_cad and float(market_cap_cad) > 0 else np.nan
-            beta = float(row.get("beta")) if row.get("beta") is not None else np.nan
-            # Extract new fundamental data
-            trailing_pe = float(row.get("trailingPE")) if row.get("trailingPE") is not None else np.nan
-            forward_pe = float(row.get("forwardPE")) if row.get("forwardPE") is not None else np.nan
-            price_to_book = float(row.get("priceToBook")) if row.get("priceToBook") is not None else np.nan
-            price_to_sales = float(row.get("priceToSalesTrailing12Months")) if row.get("priceToSalesTrailing12Months") is not None else np.nan
-            enterprise_to_revenue = float(row.get("enterpriseToRevenue")) if row.get("enterpriseToRevenue") is not None else np.nan
-            enterprise_to_ebitda = float(row.get("enterpriseToEbitda")) if row.get("enterpriseToEbitda") is not None else np.nan
-            profit_margins = float(row.get("profitMargins")) if row.get("profitMargins") is not None else np.nan
-            operating_margins = float(row.get("operatingMargins")) if row.get("operatingMargins") is not None else np.nan
-            return_on_equity = float(row.get("returnOnEquity")) if row.get("returnOnEquity") is not None else np.nan
-            return_on_assets = float(row.get("returnOnAssets")) if row.get("returnOnAssets") is not None else np.nan
-            revenue_growth = float(row.get("revenueGrowth")) if row.get("revenueGrowth") is not None else np.nan
-            earnings_growth = float(row.get("earningsGrowth")) if row.get("earningsGrowth") is not None else np.nan
-            earnings_quarterly_growth = float(row.get("earningsQuarterlyGrowth")) if row.get("earningsQuarterlyGrowth") is not None else np.nan
-            debt_to_equity = float(row.get("debtToEquity")) if row.get("debtToEquity") is not None else np.nan
-            current_ratio = float(row.get("currentRatio")) if row.get("currentRatio") is not None else np.nan
-            quick_ratio = float(row.get("quickRatio")) if row.get("quickRatio") is not None else np.nan
-            dividend_yield = float(row.get("dividendYield")) if row.get("dividendYield") is not None else np.nan
-            payout_ratio = float(row.get("payoutRatio")) if row.get("payoutRatio") is not None else np.nan
-            target_mean_price = float(row.get("targetMeanPrice")) if row.get("targetMeanPrice") is not None else np.nan
-            recommendation_mean = float(row.get("recommendationMean")) if row.get("recommendationMean") is not None else np.nan
-            num_analyst_opinions = float(row.get("numberOfAnalystOpinions")) if row.get("numberOfAnalystOpinions") is not None else np.nan
-
-        fx_ret_5d_series = 0.0 if is_tsx else fx_ret_5d
-        fx_ret_20d_series = 0.0 if is_tsx else fx_ret_20d
-
-        df = pd.DataFrame(
-            {
-                "date": idx,
-                "ticker": t,
-                "is_tsx": int(is_tsx),
-                "last_close_cad": close_cad.values,
-                "avg_dollar_volume_cad": avg_dollar_vol.values,
-                "ret_5d": close_cad.pct_change(5, fill_method=None).values,
-                "ret_10d": close_cad.pct_change(10, fill_method=None).values,
-                "ret_20d": close_cad.pct_change(20, fill_method=None).values,
-                "ret_60d": close_cad.pct_change(60, fill_method=None).values,
-                "ret_120d": close_cad.pct_change(120, fill_method=None).values,
-                "ret_accel_20_120": (close_cad.pct_change(20, fill_method=None) - close_cad.pct_change(120, fill_method=None)).values,
-                "vol_20d_ann": vol_20.values,
-                "vol_60d_ann": vol_60.values,
-                "vol_ratio_20_60": vol_ratio_20_60.values,
-                "rsi_14": rsi_14.values,
-                "ma20_ratio": (close_cad / ma20 - 1.0).values,
-                "ma50_ratio": (close_cad / ma50 - 1.0).values,
-                "ma200_ratio": (close_cad / ma200 - 1.0).values,
-                "drawdown_60d": drawdown_60d.values,
-                "dist_52w_high": dist_52w_high.values,
-                "dist_52w_low": dist_52w_low.values,
-                "vol_anom_30d": vol_anom_30d.values,
-                # New momentum features
-                "momentum_reversal": momentum_reversal.values,  # Short-term reversal signal
-                "momentum_acceleration": momentum_acceleration.values,  # Momentum change
-                "ret_20d_lagged": ret_20d_lagged.values,  # Lagged momentum (reduces autocorrelation)
-                "ret_60d_lagged": ret_60d_lagged.values,  # Lagged long-term momentum
-                # HIGH-IMPACT: Volatility-adjusted returns (Sharpe-like)
-                "ret_5d_sharpe": ret_5d_sharpe.values,
-                "ret_20d_sharpe": ret_20d_sharpe.values,
-                "ret_60d_sharpe": ret_60d_sharpe.values,
-                # HIGH-IMPACT: Volume-price signals
-                "volume_momentum_20d": volume_momentum_20d.values,
-                "volume_surge_5d": volume_surge_5d.values,
-                "price_volume_div": price_volume_div.values,
-                # HIGH-IMPACT: Mean reversion signals
-                "ma20_zscore": ma20_zscore.values,
-                "mean_reversion_signal": mean_reversion_signal.values,
-                # HIGH-IMPACT: Trend quality
-                "ret_consistency_20d": ret_consistency_20d.values,
-                "up_days_ratio_20d": up_days_ratio_20d.values,
-                "log_market_cap": log_market_cap,
-                "beta": beta,
-                "sector": sector,  # Raw sector for target encoding
-                "industry": industry,  # Raw industry for target encoding
-                "sector_hash": sector_hash,
-                "industry_hash": industry_hash,
-                "fx_ret_5d": fx_ret_5d_series.values if hasattr(fx_ret_5d_series, "values") else fx_ret_5d_series,
-                "fx_ret_20d": fx_ret_20d_series.values if hasattr(fx_ret_20d_series, "values") else fx_ret_20d_series,
-                "n_days": n_days.values,
-                # Raw fundamental features
-                "trailing_pe": trailing_pe,
-                "forward_pe": forward_pe,
-                "price_to_book": price_to_book,
-                "price_to_sales": price_to_sales,
-                "enterprise_to_revenue": enterprise_to_revenue,
-                "enterprise_to_ebitda": enterprise_to_ebitda,
-                "profit_margins": profit_margins,
-                "operating_margins": operating_margins,
-                "return_on_equity": return_on_equity,
-                "return_on_assets": return_on_assets,
-                "revenue_growth": revenue_growth,
-                "earnings_growth": earnings_growth,
-                "earnings_quarterly_growth": earnings_quarterly_growth,
-                "debt_to_equity": debt_to_equity,
-                "current_ratio": current_ratio,
-                "quick_ratio": quick_ratio,
-                "dividend_yield": dividend_yield,
-                "payout_ratio": payout_ratio,
-                "target_mean_price": target_mean_price,
-                "recommendation_mean": recommendation_mean,
-                "num_analyst_opinions": num_analyst_opinions,
-            }
+        frames = Parallel(n_jobs=n_jobs, backend="threading", verbose=0)(
+            delayed(_process_ticker)(t) for t in tickers
         )
-        frames.append(df)
+        frames = [f for f in frames if f is not None]
+    else:
+        # Sequential fallback
+        frames: list[pd.DataFrame] = []
+        for t in tickers:
+            close = prices[(t, "Close")].astype(float)
+            vol_series = prices[(t, "Volume")].astype(float) if (t, "Volume") in prices.columns else pd.Series(index=idx, dtype=float)
+            df = _compute_ticker_features(t, close, vol_series, idx, fx, fx_ret_5d, fx_ret_20d, fundamentals)
+            if df is not None:
+                frames.append(df)
 
     panel = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     del frames  # Free memory immediately
