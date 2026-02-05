@@ -203,7 +203,11 @@ def render_reports(
             pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
             px_cad_str = _fmt_money(px) if px else "N/A"
             px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
-            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px_cad_str} price_usd={px_usd_str} days_held={days} pred_ret={pred_ret_str} sell_date={sell_date or 'N/A'} reason={reason}")
+            # Calculate target sell price based on predicted return
+            sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
+            sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
+            sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
+            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px_cad_str} price_usd={px_usd_str} days_held={days} pred_ret={pred_ret_str} sell_price_cad={sell_px_cad_str} sell_price_usd={sell_px_usd_str} sell_date={sell_date or 'N/A'} reason={reason}")
         lines.append("")
 
     # Portfolio P&L history (stateful; computed from portfolio state positions)
@@ -351,6 +355,10 @@ def render_reports(
             pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
             px_cad_str = _fmt_money(px) if px else "N/A"
             px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
+            # Calculate target sell price based on predicted return
+            sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
+            sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
+            sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
             action_rows.append(
                 f"<tr><td style='padding:4px 8px;'>{_html_escape(action)}</td>"
                 f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
@@ -358,6 +366,8 @@ def render_reports(
                 f"<td style='padding:4px 8px;'>{px_cad_str}</td>"
                 f"<td style='padding:4px 8px;'>{px_usd_str}</td>"
                 f"<td style='padding:4px 8px;'>{pred_ret_str}</td>"
+                f"<td style='padding:4px 8px;color:#059669;font-weight:bold;'>{sell_px_cad_str}</td>"
+                f"<td style='padding:4px 8px;color:#059669;'>{sell_px_usd_str}</td>"
                 f"<td style='padding:4px 8px;'>{sell_date or 'N/A'}</td>"
                 f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
             )
@@ -370,6 +380,8 @@ def render_reports(
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price (CAD)</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price (USD)</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Pred Ret</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;color:#059669;">Sell @ (CAD)</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;color:#059669;">Sell @ (USD)</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Sell Date</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Reason</th>
             </tr></thead>
@@ -481,15 +493,19 @@ def render_reports(
                 if isinstance(a, dict):
                     payload.append(a)
                 else:
+                    px = getattr(a, "price_cad", None)
+                    pred_ret = getattr(a, "pred_return", None)
+                    sell_px = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
                     payload.append(
                         {
                             "ticker": getattr(a, "ticker", None),
                             "action": getattr(a, "action", None),
                             "reason": getattr(a, "reason", None),
                             "shares": getattr(a, "shares", None),
-                            "price_cad": getattr(a, "price_cad", None),
+                            "price_cad": px,
                             "days_held": getattr(a, "days_held", None),
-                            "pred_return": getattr(a, "pred_return", None),
+                            "pred_return": pred_ret,
+                            "sell_price_cad": sell_px,
                             "expected_sell_date": getattr(a, "expected_sell_date", None),
                         }
                     )
