@@ -23,6 +23,9 @@ class TradeAction:
     days_held: int | None = None
     pred_return: float | None = None  # Predicted return for this position
     expected_sell_date: str | None = None  # Expected sell date (based on max hold days)
+    # For SELL actions: realized gain/loss info
+    entry_price: float | None = None  # Entry price (for sells)
+    realized_gain_pct: float | None = None  # Realized % gain/loss (for sells)
 
 
 @dataclass(frozen=True)
@@ -129,6 +132,9 @@ class PortfolioManager:
         self._close_position(p, price_cad=price_cad, reason=reason)
         proceeds = float(price_cad) * float(p.shares)
         state.cash_cad = float(state.cash_cad) + float(proceeds)
+        # Calculate realized gain/loss
+        entry_px = float(p.entry_price) if p.entry_price else None
+        realized_gain = ((price_cad / entry_px) - 1.0) if entry_px and entry_px > 0 else None
         return TradeAction(
             ticker=p.ticker,
             action="SELL",
@@ -136,6 +142,8 @@ class PortfolioManager:
             shares=p.shares,
             price_cad=float(price_cad),
             days_held=days_held,
+            entry_price=entry_px,
+            realized_gain_pct=realized_gain,
         )
 
     def _detect_peak(
@@ -636,15 +644,50 @@ class PortfolioManager:
         target_tickers = list(weights.index.astype(str))
         target_set = set(target_tickers)
 
-        # SELL anything not in target (rotation), after exits have already been applied.
+        # SELL positions not in target - but only if they meet rotation criteria
+        # Avoid excessive turnover by requiring deteriorating fundamentals to rotate out
         for t, p in list(open_by_ticker.items()):
             if t not in target_set:
                 px = float(prices_cad.get(t, float("nan")))
                 if pd.isna(px) or px <= 0:
                     continue
                 days = p.days_held(now)
-                actions.append(self._sell_position(state, p, price_cad=px, reason="ROTATION", days_held=days))
-                open_tickers.discard(t)
+                
+                # Get current predictions for this ticker (if available in screened)
+                ticker_data = screened[screened.index == t] if t in screened.index else None
+                pred_ret = None
+                score_pct = None
+                if ticker_data is not None and len(ticker_data) > 0:
+                    pred_ret = ticker_data.get("pred_return", pd.Series([None])).iloc[0]
+                    if "score" in ticker_data.columns:
+                        ticker_score = ticker_data["score"].iloc[0]
+                        score_pct = (screened["score"] < ticker_score).mean() if "score" in screened.columns else None
+                
+                # Decide whether to rotate: only sell if one of these conditions is met
+                should_rotate = False
+                rotation_reason = "ROTATION"
+                
+                # 1. Predicted return is now negative (bearish signal)
+                if pred_ret is not None and pred_ret < 0:
+                    should_rotate = True
+                    rotation_reason = "ROTATION:NEG_PRED"
+                # 2. Stock dropped to bottom 30% of screened universe
+                elif score_pct is not None and score_pct < 0.30:
+                    should_rotate = True
+                    rotation_reason = "ROTATION:LOW_RANK"
+                # 3. Position has been held past max holding days (forced exit)
+                elif days >= self.max_holding_days_hard:
+                    should_rotate = True
+                    rotation_reason = "ROTATION:MAX_DAYS"
+                # 4. If we have no prediction data and stock is not in target, still rotate
+                # (but only if held for minimum period to avoid same-day churn)
+                elif pred_ret is None and days >= 2:
+                    should_rotate = True
+                    rotation_reason = "ROTATION:NO_DATA"
+                
+                if should_rotate:
+                    actions.append(self._sell_position(state, p, price_cad=px, reason=rotation_reason, days_held=days))
+                    open_tickers.discard(t)
 
         # Update state positions after rotation sells.
         keep_open = [p for p in state.positions if p.status == "OPEN"]

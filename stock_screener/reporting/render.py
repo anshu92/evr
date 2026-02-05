@@ -200,14 +200,25 @@ def render_reports(
             days = getattr(a, "days_held", None) or (a.get("days_held") if isinstance(a, dict) else "")
             pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
             sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
-            pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+            
             px_cad_str = _fmt_money(px) if px else "N/A"
             px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
-            # Calculate target sell price based on predicted return
-            sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
-            sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
-            sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
-            lines.append(f"{action:>4} {ticker:<12} shares={shares} price_cad={px_cad_str} price_usd={px_usd_str} days_held={days} pred_ret={pred_ret_str} sell_price_cad={sell_px_cad_str} sell_price_usd={sell_px_usd_str} sell_date={sell_date or 'N/A'} reason={reason}")
+            
+            # For SELL actions, show realized gain/loss; for BUY/HOLD show predicted return and target sell price
+            if action in ("SELL", "SELL_PARTIAL"):
+                entry_px = getattr(a, "entry_price", None) or (a.get("entry_price") if isinstance(a, dict) else None)
+                realized_gain = getattr(a, "realized_gain_pct", None) or (a.get("realized_gain_pct") if isinstance(a, dict) else None)
+                entry_px_str = _fmt_money(entry_px) if entry_px else "N/A"
+                entry_px_usd_str = _fmt_money(float(entry_px) / fx_rate) if entry_px and fx_rate and fx_rate > 0 else "N/A"
+                realized_str = _fmt_pct(realized_gain) if realized_gain is not None else "N/A"
+                lines.append(f"{action:>4} {ticker:<12} shares={shares} sell@={px_cad_str}/{px_usd_str} entry@={entry_px_str}/{entry_px_usd_str} gain={realized_str} days_held={days} reason={reason}")
+            else:
+                pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+                # Calculate target sell price based on predicted return
+                sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
+                sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
+                sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
+                lines.append(f"{action:>4} {ticker:<12} shares={shares} price={px_cad_str}/{px_usd_str} pred_ret={pred_ret_str} sell@={sell_px_cad_str}/{sell_px_usd_str} sell_date={sell_date or 'N/A'} reason={reason}")
         lines.append("")
 
     # Portfolio P&L history (stateful; computed from portfolio state positions)
@@ -342,51 +353,105 @@ def render_reports(
     # Build actions block outside the f-string to avoid complex nested expressions.
     fx_rate = _to_float(fx_usdcad_rate)
     if trade_actions:
-        # Build actions as a table for better readability
-        action_rows: list[str] = []
-        for a in trade_actions:
-            ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
-            action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
-            reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
-            shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
-            px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
-            pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
-            sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
-            pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
-            px_cad_str = _fmt_money(px) if px else "N/A"
-            px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
-            # Calculate target sell price based on predicted return
-            sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
-            sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
-            sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
-            action_rows.append(
-                f"<tr><td style='padding:4px 8px;'>{_html_escape(action)}</td>"
-                f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
-                f"<td style='padding:4px 8px;'>{shares}</td>"
-                f"<td style='padding:4px 8px;'>{px_cad_str}</td>"
-                f"<td style='padding:4px 8px;'>{px_usd_str}</td>"
-                f"<td style='padding:4px 8px;'>{pred_ret_str}</td>"
-                f"<td style='padding:4px 8px;color:#059669;font-weight:bold;'>{sell_px_cad_str}</td>"
-                f"<td style='padding:4px 8px;color:#059669;'>{sell_px_usd_str}</td>"
-                f"<td style='padding:4px 8px;'>{sell_date or 'N/A'}</td>"
-                f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
-            )
-        if action_rows:
-            actions_html = f"""<table style="border-collapse:collapse;width:100%;font-size:13px;">
+        # Separate SELL and BUY/HOLD actions for different table formats
+        sell_actions = [a for a in trade_actions if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) in ("SELL", "SELL_PARTIAL")]
+        buy_hold_actions = [a for a in trade_actions if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) not in ("SELL", "SELL_PARTIAL")]
+        
+        actions_html_parts = []
+        
+        # SELL actions table (with entry price and realized gain)
+        if sell_actions:
+            sell_rows: list[str] = []
+            for a in sell_actions:
+                ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
+                action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
+                reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
+                shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
+                px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
+                days = getattr(a, "days_held", None) or (a.get("days_held") if isinstance(a, dict) else "")
+                entry_px = getattr(a, "entry_price", None) or (a.get("entry_price") if isinstance(a, dict) else None)
+                realized_gain = getattr(a, "realized_gain_pct", None) or (a.get("realized_gain_pct") if isinstance(a, dict) else None)
+                
+                px_cad_str = _fmt_money(px) if px else "N/A"
+                px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
+                entry_px_str = _fmt_money(entry_px) if entry_px else "N/A"
+                entry_px_usd_str = _fmt_money(float(entry_px) / fx_rate) if entry_px and fx_rate and fx_rate > 0 else "N/A"
+                realized_str = _fmt_pct(realized_gain) if realized_gain is not None else "N/A"
+                gain_color = "#059669" if realized_gain and realized_gain > 0 else "#dc2626" if realized_gain and realized_gain < 0 else "#666"
+                
+                sell_rows.append(
+                    f"<tr><td style='padding:4px 8px;color:#dc2626;font-weight:bold;'>{_html_escape(action)}</td>"
+                    f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
+                    f"<td style='padding:4px 8px;'>{shares}</td>"
+                    f"<td style='padding:4px 8px;'>{entry_px_str}/{entry_px_usd_str}</td>"
+                    f"<td style='padding:4px 8px;'>{px_cad_str}/{px_usd_str}</td>"
+                    f"<td style='padding:4px 8px;color:{gain_color};font-weight:bold;'>{realized_str}</td>"
+                    f"<td style='padding:4px 8px;'>{days or 'N/A'}</td>"
+                    f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
+                )
+            actions_html_parts.append(f"""<h4 style="color:#dc2626;margin:10px 0 5px 0;">SELL Actions</h4>
+            <table style="border-collapse:collapse;width:100%;font-size:13px;">
             <thead><tr>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Action</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Ticker</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Shares</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price (CAD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Price (USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Pred Ret</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;color:#059669;">Sell @ (CAD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;color:#059669;">Sell @ (USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Sell Date</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #d97706;">Reason</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Action</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Ticker</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Shares</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Entry (CAD/USD)</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Sell @ (CAD/USD)</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Gain/Loss</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Days Held</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Reason</th>
             </tr></thead>
-            <tbody>{"".join(action_rows)}</tbody>
-            </table>"""
+            <tbody>{"".join(sell_rows)}</tbody>
+            </table>""")
+        
+        # BUY/HOLD actions table (with pred return and target sell price)
+        if buy_hold_actions:
+            buy_rows: list[str] = []
+            for a in buy_hold_actions:
+                ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
+                action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
+                reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
+                shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
+                px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
+                pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
+                sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
+                
+                pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+                px_cad_str = _fmt_money(px) if px else "N/A"
+                px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
+                # Calculate target sell price based on predicted return
+                sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
+                sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
+                sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
+                action_color = "#059669" if action == "BUY" else "#2563eb"
+                
+                buy_rows.append(
+                    f"<tr><td style='padding:4px 8px;color:{action_color};font-weight:bold;'>{_html_escape(action)}</td>"
+                    f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
+                    f"<td style='padding:4px 8px;'>{shares}</td>"
+                    f"<td style='padding:4px 8px;'>{px_cad_str}/{px_usd_str}</td>"
+                    f"<td style='padding:4px 8px;'>{pred_ret_str}</td>"
+                    f"<td style='padding:4px 8px;color:#059669;font-weight:bold;'>{sell_px_cad_str}/{sell_px_usd_str}</td>"
+                    f"<td style='padding:4px 8px;'>{sell_date or 'N/A'}</td>"
+                    f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
+                )
+            actions_html_parts.append(f"""<h4 style="color:#059669;margin:10px 0 5px 0;">BUY/HOLD Actions</h4>
+            <table style="border-collapse:collapse;width:100%;font-size:13px;">
+            <thead><tr>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Action</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Ticker</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Shares</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Price (CAD/USD)</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Pred Ret</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Sell @ (CAD/USD)</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Sell Date</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Reason</th>
+            </tr></thead>
+            <tbody>{"".join(buy_rows)}</tbody>
+            </table>""")
+        
+        if actions_html_parts:
+            actions_html = "".join(actions_html_parts)
         else:
             actions_html = _html_escape("No actions (portfolio already aligned).")
     else:
