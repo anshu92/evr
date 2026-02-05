@@ -27,6 +27,98 @@ from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
 
 
+def compute_dynamic_portfolio_size(
+    screened: pd.DataFrame,
+    min_confidence: float,
+    min_pred_return: float,
+    max_positions: int,
+    model_ic: float | None,
+    logger,
+) -> int:
+    """Compute fully dynamic portfolio size based on model metrics and predicted returns.
+    
+    No base size - portfolio can be 1 to max_positions based entirely on:
+    - Number of stocks meeting confidence and return thresholds
+    - Model IC (if available) to scale aggressiveness
+    - Quality score combining confidence and predicted return
+    """
+    if screened.empty:
+        logger.warning("Dynamic sizing: No stocks to evaluate, defaulting to 1")
+        return 1
+    
+    has_confidence = "pred_confidence" in screened.columns
+    has_return = "pred_return" in screened.columns
+    
+    if not has_confidence and not has_return:
+        # Fallback: use score percentile to pick top performers
+        if "score" in screened.columns:
+            # Take stocks with score > 75th percentile, at least 1
+            threshold = screened["score"].quantile(0.75)
+            count = max(1, min(max_positions, (screened["score"] >= threshold).sum()))
+            logger.info("Dynamic sizing: No ML metrics, using score threshold, selecting %d positions", count)
+            return count
+        logger.info("Dynamic sizing: No confidence/return/score data, defaulting to 5")
+        return 5
+    
+    # Calculate quality score for each stock
+    # Quality = weighted combination of confidence and predicted return percentile
+    quality_scores = pd.Series(0.0, index=screened.index)
+    
+    if has_confidence:
+        # Normalize confidence to 0-1 range (it's typically already 0-1)
+        conf_normalized = screened["pred_confidence"].clip(0, 1)
+        quality_scores += conf_normalized * 0.4  # 40% weight to confidence
+    
+    if has_return:
+        # Normalize predicted return using percentile rank within screened set
+        ret_pct = screened["pred_return"].rank(pct=True)
+        quality_scores += ret_pct * 0.6  # 60% weight to return (more important)
+    
+    # Determine quality threshold based on model IC
+    # High IC → lower threshold (be more aggressive)
+    # Low/negative IC → higher threshold (be conservative)
+    if model_ic is not None and model_ic > 0:
+        # IC typically ranges 0.01-0.10 for good models
+        # Scale threshold: IC=0.10 → threshold=0.4, IC=0.01 → threshold=0.7
+        ic_factor = min(1.0, max(0.0, model_ic * 10))  # 0-1 based on IC
+        quality_threshold = 0.7 - (ic_factor * 0.3)  # Range: 0.4-0.7
+        logger.info("Dynamic sizing: Model IC=%.3f, quality threshold=%.2f", model_ic, quality_threshold)
+    else:
+        # Conservative default when no IC available
+        quality_threshold = 0.6
+        logger.info("Dynamic sizing: No model IC, using default threshold=%.2f", quality_threshold)
+    
+    # Apply hard thresholds first
+    qualifying_mask = pd.Series(True, index=screened.index)
+    
+    if has_confidence:
+        qualifying_mask &= (screened["pred_confidence"] >= min_confidence)
+    
+    if has_return:
+        qualifying_mask &= (screened["pred_return"] >= min_pred_return)
+    
+    # Then apply quality score threshold
+    qualifying_mask &= (quality_scores >= quality_threshold)
+    
+    qualifying_count = int(qualifying_mask.sum())
+    
+    # Portfolio size: at least 1 (always recommend something), at most max_positions
+    dynamic_size = max(1, min(max_positions, qualifying_count))
+    
+    # Log details
+    hard_threshold_count = ((screened.get("pred_confidence", pd.Series(1.0)) >= min_confidence) & 
+                            (screened.get("pred_return", pd.Series(1.0)) >= min_pred_return)).sum()
+    
+    logger.info(
+        "Dynamic sizing: %d stocks pass hard thresholds (conf>=%.2f, ret>=%.1f%%), "
+        "%d pass quality threshold (>=%.2f), final portfolio size: %d",
+        hard_threshold_count, min_confidence, min_pred_return * 100,
+        qualifying_count, quality_threshold, dynamic_size
+    )
+    
+    return dynamic_size
+
+
 def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
@@ -216,20 +308,44 @@ def run_daily(cfg: Config, logger) -> None:
 
     alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
     
+    # Compute fully dynamic portfolio size based on model metrics and predicted returns
+    # No base size - portfolio can range from 1 to max based on opportunity quality
+    if getattr(cfg, "dynamic_portfolio_sizing", True):
+        # Extract model IC from metadata (used to calibrate aggressiveness)
+        model_ic = None
+        if run_meta.get("model", {}).get("metadata"):
+            holdout_metrics = run_meta["model"]["metadata"].get("holdout", {})
+            model_ic = holdout_metrics.get("mean_ic")
+            if model_ic is not None:
+                logger.info("Model holdout IC: %.4f (used for dynamic sizing)", model_ic)
+        
+        effective_portfolio_size = compute_dynamic_portfolio_size(
+            screened=screened,
+            min_confidence=getattr(cfg, "dynamic_size_min_confidence", 0.5),
+            min_pred_return=getattr(cfg, "dynamic_size_min_pred_return", 0.03),
+            max_positions=getattr(cfg, "dynamic_size_max_positions", 50),
+            model_ic=model_ic,
+            logger=logger,
+        )
+        run_meta["dynamic_portfolio_size"] = effective_portfolio_size
+    else:
+        # Fallback to static portfolio_size when dynamic sizing disabled
+        effective_portfolio_size = cfg.portfolio_size
+    
     # Compute portfolio weights with optional correlation awareness
     if cfg.use_correlation_weights:
         logger.info("Using correlation-aware risk parity weights")
         target_weights = compute_correlation_aware_weights(
             features=screened,
             prices=prices,  # Need historical prices for covariance
-            portfolio_size=cfg.portfolio_size,
+            portfolio_size=effective_portfolio_size,
             weight_cap=cfg.weight_cap,
             logger=logger,
         )
     else:
         target_weights = compute_inverse_vol_weights(
             features=screened,
-            portfolio_size=cfg.portfolio_size,
+            portfolio_size=effective_portfolio_size,
             weight_cap=cfg.weight_cap,
             logger=logger,
             alpha_col=alpha_col,
@@ -429,7 +545,7 @@ def run_daily(cfg: Config, logger) -> None:
         max_holding_days_hard=cfg.max_holding_days_hard,
         extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
         extend_hold_min_score=cfg.extend_hold_min_score,
-        max_positions=cfg.portfolio_size,
+        max_positions=effective_portfolio_size,
         stop_loss_pct=cfg.stop_loss_pct,
         take_profit_pct=cfg.take_profit_pct,
         trailing_stop_enabled=getattr(cfg, "trailing_stop_enabled", True),

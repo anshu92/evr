@@ -18,7 +18,7 @@ class TradeAction:
     ticker: str
     action: str  # BUY | SELL | SELL_PARTIAL | HOLD
     reason: str
-    shares: int
+    shares: float  # Fractional shares supported for expensive stocks
     price_cad: float
     days_held: int | None = None
     pred_return: float | None = None  # Predicted return for this position
@@ -211,8 +211,8 @@ class PortfolioManager:
         sell_portion: float,
     ) -> tuple[TradeAction, Position]:
         """Sell a portion of position, keeping the rest open."""
-        shares_to_sell = max(1, int(p.shares * sell_portion))
-        shares_remaining = p.shares - shares_to_sell
+        shares_to_sell = max(0.01, round(p.shares * sell_portion, 4))  # Fractional shares
+        shares_remaining = round(p.shares - shares_to_sell, 4)
         
         # Don't do partial sell if it would leave us with 0 shares
         if shares_remaining <= 0:
@@ -685,11 +685,16 @@ class PortfolioManager:
                     w = 0.0
 
                 target_value = float(equity_cad) * float(w) if w > 0 else float(state.cash_cad) / max(slots, 1)
-                target_shares = int(max(0.0, target_value) // float(px))
-                affordable_shares = int(float(state.cash_cad) // float(px))
-                shares = min(affordable_shares, max(1, target_shares))
-                if shares <= 0:
+                # FRACTIONAL SHARES: Allow buying partial shares for expensive stocks
+                # This ensures we can invest in high-priced stocks within budget
+                target_shares = max(0.0, target_value) / float(px)
+                affordable_shares = float(state.cash_cad) / float(px)
+                # Minimum 0.01 shares (most brokers support fractional to 0.001)
+                shares = min(affordable_shares, max(0.01, target_shares))
+                if shares < 0.01 or (shares * px) < 1.0:  # Skip if less than $1 investment
                     continue
+                # Round to 4 decimal places for practical fractional share trading
+                shares = round(shares, 4)
                 
                 # Get pred_return and pred_peak_days from weights BEFORE creating position
                 pred_ret = None
@@ -708,7 +713,7 @@ class PortfolioManager:
                     ticker=t,
                     entry_price=px,
                     entry_date=now,
-                    shares=int(shares),
+                    shares=float(shares),  # Fractional shares
                     stop_loss_pct=self.stop_loss_pct,
                     take_profit_pct=self.take_profit_pct,
                     entry_pred_peak_days=pred_peak_days,  # Store prediction at entry
@@ -727,7 +732,7 @@ class PortfolioManager:
                 
                 actions.append(
                     TradeAction(
-                        ticker=t, action="BUY", reason="TOP_RANKED", shares=int(shares), 
+                        ticker=t, action="BUY", reason="TOP_RANKED", shares=float(shares), 
                         price_cad=px, days_held=0, pred_return=pred_ret, expected_sell_date=expected_sell
                     )
                 )

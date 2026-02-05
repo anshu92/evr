@@ -23,7 +23,7 @@ class Position:
     ticker: str
     entry_price: float
     entry_date: datetime
-    shares: int
+    shares: float  # Fractional shares supported for expensive stocks
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     status: str = "OPEN"  # OPEN | CLOSED:<reason>
@@ -71,7 +71,7 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
             ticker=str(raw.get("ticker", "")).upper(),
             entry_price=float(raw.get("entry_price", 0.0)),
             entry_date=_dt_from_iso(entry_date) or _utcnow(),
-            shares=int(raw.get("shares", 0)),
+            shares=float(raw.get("shares", 0)),  # Fractional shares supported
             stop_loss_pct=raw.get("stop_loss_pct"),
             take_profit_pct=raw.get("take_profit_pct"),
             status=str(raw.get("status", "OPEN")),
