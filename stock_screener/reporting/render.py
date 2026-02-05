@@ -165,7 +165,14 @@ def render_reports(
     weights_view["last_close_cad"] = weights_view["last_close_cad"].map(_fmt_money)
     weights_view["last_close_usd"] = weights_view["last_close_usd"].map(_fmt_money)
     if "shares" in weights_view.columns:
-        weights_view["shares"] = weights_view["shares"].map(lambda x: str(int(x)) if _to_float(x) is not None else "N/A")
+        def _fmt_shares(x):
+            v = _to_float(x)
+            if v is None or (v != v):  # NaN
+                return "N/A"
+            if v >= 1:
+                return str(int(round(v, 0))) if v == round(v, 0) else f"{v:.4f}".rstrip("0").rstrip(".")
+            return f"{v:.4f}".rstrip("0").rstrip(".")
+        weights_view["shares"] = weights_view["shares"].map(_fmt_shares)
     else:
         weights_view["shares"] = pd.NA
     weights_view["position_value_cad"] = weights_view["position_value_cad"].map(_fmt_money)
@@ -322,7 +329,14 @@ def render_reports(
     weights_table["weight"] = weights_table["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_table["last_close_cad"] = weights_table["last_close_cad"].map(_fmt_money)
     weights_table["last_close_usd"] = weights_table["last_close_usd"].map(_fmt_money)
-    weights_table["shares"] = weights_table["shares"].map(lambda x: str(int(x)) if _to_float(x) is not None else "N/A")
+    def _fmt_shares(x):
+        v = _to_float(x)
+        if v is None or (v != v):  # NaN
+            return "N/A"
+        if v >= 1:
+            return str(int(round(v, 0))) if v == round(v, 0) else f"{v:.4f}".rstrip("0").rstrip(".")
+        return f"{v:.4f}".rstrip("0").rstrip(".")
+    weights_table["shares"] = weights_table["shares"].map(_fmt_shares)
     weights_table["position_value_cad"] = weights_table["position_value_cad"].map(_fmt_money)
     weights_table["position_value_usd"] = weights_table["position_value_usd"].map(_fmt_money)
     weights_table["ret_60d"] = weights_table["ret_60d"].map(_fmt_pct)

@@ -628,8 +628,8 @@ def run_daily(cfg: Config, logger) -> None:
             logger=logger,
             alpha_col=alpha_col,
         )
-    # Attach current holdings sizing for reporting (shares + position value).
-    shares_by_ticker = {p.ticker: int(p.shares) for p in state.positions if p.status == "OPEN"}
+    # Attach current holdings sizing for reporting (shares + position value). Keep fractional shares.
+    shares_by_ticker = {p.ticker: float(p.shares) for p in state.positions if p.status == "OPEN"}
     holdings_weights = holdings_weights.copy()
     holdings_weights["shares"] = [shares_by_ticker.get(str(t), pd.NA) for t in holdings_weights.index.astype(str)]
 
