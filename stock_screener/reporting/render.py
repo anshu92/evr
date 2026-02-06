@@ -46,6 +46,7 @@ def render_reports(
     trade_actions: list[Any] | None,
     logger,
     *,
+    target_weights: pd.DataFrame | None = None,
     portfolio_pnl_history: list[dict[str, Any]] | None = None,
     fx_usdcad_rate: float | None = None,
     total_processed: int | None = None,
@@ -193,6 +194,26 @@ def render_reports(
     ]
     lines.extend(weights_view[weights_cols].to_string().splitlines())
     lines.append("")
+
+    # Show target portfolio weights when holdings are empty (so the user
+    # always sees what the model recommends even with no open positions).
+    if weights.empty and target_weights is not None and not target_weights.empty:
+        lines.append("TARGET PORTFOLIO WEIGHTS (recommended)")
+        lines.append("-" * 78)
+        tw_view = target_weights.copy()
+        if fx_rate is not None and fx_rate > 0 and "last_close_cad" in tw_view.columns:
+            tw_view["last_close_usd"] = pd.to_numeric(tw_view["last_close_cad"], errors="coerce") / float(fx_rate)
+        else:
+            tw_view["last_close_usd"] = pd.NA
+        tw_view["weight"] = tw_view["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
+        tw_view["last_close_cad"] = tw_view["last_close_cad"].map(_fmt_money) if "last_close_cad" in tw_view.columns else pd.NA
+        tw_view["last_close_usd"] = tw_view["last_close_usd"].map(_fmt_money) if "last_close_usd" in tw_view.columns else pd.NA
+        tw_view["ret_60d"] = tw_view["ret_60d"].map(_fmt_pct) if "ret_60d" in tw_view.columns else pd.NA
+        tw_view["vol_60d_ann"] = tw_view["vol_60d_ann"].map(_fmt_pct) if "vol_60d_ann" in tw_view.columns else pd.NA
+        target_cols = ["weight", "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann"]
+        target_cols = [c for c in target_cols if c in tw_view.columns]
+        lines.extend(tw_view[target_cols].to_string().splitlines())
+        lines.append("")
 
     if trade_actions:
         lines.append("RECOMMENDED ACTIONS (max hold)")
@@ -510,7 +531,49 @@ def render_reports(
   </div>
 """
 
+    # Build target weights HTML table (shown when current holdings are empty)
+    target_weights_html_block = ""
+    if weights.empty and target_weights is not None and not target_weights.empty:
+        tw_table = target_weights.reset_index().copy()
+        tw_table = tw_table.rename(columns={tw_table.columns[0]: "ticker"})
+        tw_cols = ["ticker", "weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]
+        tw_cols = [c for c in tw_cols if c in tw_table.columns]
+        tw_display = tw_table[tw_cols].copy()
+        if "weight" in tw_display.columns:
+            tw_display["weight"] = tw_display["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
+        if "last_close_cad" in tw_display.columns:
+            if fx_rate is not None and fx_rate > 0:
+                tw_display["last_close_usd"] = pd.to_numeric(tw_table["last_close_cad"], errors="coerce") / float(fx_rate)
+                tw_display["last_close_usd"] = tw_display["last_close_usd"].map(_fmt_money)
+            tw_display["last_close_cad"] = tw_display["last_close_cad"].map(_fmt_money)
+        if "score" in tw_display.columns:
+            tw_display["score"] = tw_display["score"].map(_fmt_num)
+        if "ret_60d" in tw_display.columns:
+            tw_display["ret_60d"] = tw_display["ret_60d"].map(_fmt_pct)
+        if "vol_60d_ann" in tw_display.columns:
+            tw_display["vol_60d_ann"] = tw_display["vol_60d_ann"].map(_fmt_pct)
+
+        tw_headers = "".join(
+            f"<th style='text-align:left;padding:6px 8px;border-bottom:2px solid #0ea5e9;'>{_html_escape(c)}</th>"
+            for c in tw_display.columns
+        )
+        tw_rows = "\n".join(
+            "<tr>" + "".join(
+                f"<td style='padding:6px 8px;border-bottom:1px solid #e5e7eb;'>{_html_escape(str(v))}</td>" for v in row
+            ) + "</tr>"
+            for row in tw_display.itertuples(index=False, name=None)
+        )
+        target_weights_html_block = f"""
+  <h3 style="margin: 0 0 10px 0; color: #0ea5e9;">Target Portfolio Weights (recommended)</h3>
+  <p style="margin:0 0 8px 0;color:#6b7280;font-size:13px;">No current holdings. The model recommends the following positions:</p>
+  <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
+    <thead><tr>{tw_headers}</tr></thead>
+    <tbody>{tw_rows}</tbody>
+  </table>
+"""
+
     total_scanned = total_processed if total_processed is not None else len(screened)
+    portfolio_label = f"{len(weights):,} tickers (current holdings)" if not weights.empty else "No current holdings"
     html = f"""<html>
 <body style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827; max-width: 900px; margin: 0 auto; padding: 20px;">
   <h2 style="margin: 0 0 10px 0;">Daily Screener + Risk Parity Portfolio (CAD)</h2>
@@ -527,12 +590,14 @@ def render_reports(
     <div><strong>Universe:</strong> US + TSX</div>
     <div><strong>Number of tickers scanned:</strong> {total_scanned:,}</div>
     <div><strong>Top screened:</strong> {len(screened):,} tickers</div>
-    <div><strong>Portfolio:</strong> {len(weights):,} tickers (inverse-vol weights)</div>
+    <div><strong>Portfolio:</strong> {portfolio_label}</div>
   </div>
 
   {model_block}
 
   {pnl_block}
+
+  {target_weights_html_block}
 
   <h3 style="margin: 0 0 10px 0;">Recommended Portfolio Weights</h3>
   <table style="border-collapse: collapse; width: 100%; font-size: 13px;">

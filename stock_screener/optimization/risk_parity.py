@@ -842,42 +842,55 @@ def apply_min_position_filter(
     weights_df: pd.DataFrame,
     *,
     min_position_pct: float = 0.02,
+    min_keep: int = 1,
     logger=None,
 ) -> pd.DataFrame:
     """Remove positions below minimum weight threshold.
     
     Avoids "dust" positions that are too small to be meaningful
-    but still incur transaction costs.
-    
-    Args:
-        weights_df: DataFrame with 'weight' column
-        min_position_pct: Minimum weight to keep (e.g., 0.02 = 2%)
+    but still incur transaction costs.  Always keeps at least
+    *min_keep* positions (sorted by weight) so the portfolio is
+    never completely empty.
     """
     result = weights_df.copy()
     
     if result.empty or "weight" not in result.columns:
         return result
     
+    # Sort descending so the "best" positions are first
+    result = result.sort_values("weight", ascending=False)
+    
     # Identify positions below minimum
     below_min_mask = result["weight"] < min_position_pct
-    removed_count = below_min_mask.sum()
+    removed_count = int(below_min_mask.sum())
     
     if removed_count > 0:
-        removed_tickers = result[below_min_mask].index.tolist()
+        # Never remove ALL positions – keep at least min_keep
+        surviving = result[~below_min_mask]
+        if len(surviving) < min_keep:
+            # Keep the top-weighted positions even if they are below threshold
+            keep_count = max(min_keep, min_keep - len(surviving))
+            forced_keep = result[below_min_mask].head(keep_count)
+            surviving = pd.concat([surviving, forced_keep])
+            if logger:
+                logger.info(
+                    "Min position filter: kept %d below-threshold position(s) to maintain minimum portfolio size",
+                    len(forced_keep),
+                )
         
-        # Remove small positions
-        result = result[~below_min_mask].copy()
+        removed_tickers = [t for t in result.index if t not in surviving.index]
+        result = surviving.copy()
         
         # Renormalize
         weight_sum = result["weight"].sum()
         if weight_sum > 0:
             result["weight"] = result["weight"] / weight_sum
         
-        if logger:
+        if logger and removed_tickers:
             logger.info(
                 "Min position filter: removed %d positions below %.1f%% (%s)",
-                removed_count, min_position_pct * 100,
-                ", ".join(removed_tickers[:3]) + ("..." if removed_count > 3 else "")
+                len(removed_tickers), min_position_pct * 100,
+                ", ".join(str(t) for t in removed_tickers[:3]) + ("..." if len(removed_tickers) > 3 else "")
             )
     
     return result.sort_values("weight", ascending=False)

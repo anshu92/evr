@@ -539,6 +539,26 @@ def run_daily(cfg: Config, logger) -> None:
             "current_equity": dd_info.get("current_equity", 0),
         }
     
+    # Safeguard: if all weights were eliminated by the scaling chain
+    # (regime + vol targeting + drawdown can compound to push every position
+    # below the min-position threshold), rebuild weights for the top picks
+    # so the portfolio always has recommendations when screened stocks exist.
+    if (target_weights.empty or target_weights["weight"].sum() <= 0) and not screened.empty:
+        fallback_n = min(3, len(screened))
+        logger.warning(
+            "All target weights eliminated after scaling chain; "
+            "rebuilding for top %d screened stocks",
+            fallback_n,
+        )
+        target_weights = compute_inverse_vol_weights(
+            features=screened,
+            portfolio_size=fallback_n,
+            weight_cap=cfg.weight_cap,
+            logger=logger,
+            alpha_col=alpha_col,
+        )
+        run_meta["target_weights_fallback"] = True
+    
     pm = PortfolioManager(
         state_path=cfg.portfolio_state_path,
         max_holding_days=cfg.max_holding_days,
@@ -639,6 +659,7 @@ def run_daily(cfg: Config, logger) -> None:
         universe_meta=universe.meta,
         screened=screened,
         weights=holdings_weights,
+        target_weights=target_weights,
         trade_actions=trade_plan.actions,
         logger=logger,
         portfolio_pnl_history=state.pnl_history,
