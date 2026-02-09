@@ -25,6 +25,11 @@ from stock_screener.modeling.model import load_ensemble, load_model, predict, pr
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
+from stock_screener.reward.tracker import RewardEntry, RewardLog
+from stock_screener.reward.feedback import compute_online_ic, compute_ensemble_reward_weights, compute_prediction_bias
+from stock_screener.reward.policy import (
+    RewardPolicy, build_state_vector, compute_equity_slope, compute_recent_sharpe,
+)
 
 
 def compute_dynamic_portfolio_size(
@@ -539,6 +544,94 @@ def run_daily(cfg: Config, logger) -> None:
             "current_equity": dd_info.get("current_equity", 0),
         }
     
+    # ---- Reward model: load log + policy, apply adaptive scaling ----
+    reward_log: RewardLog | None = None
+    reward_policy: RewardPolicy | None = None
+    reward_action: dict[str, float] = {"exposure_scalar": 1.0, "conviction_scalar": 1.0}
+    if cfg.reward_model_enabled:
+        try:
+            rlog_path = Path(cfg.cache_dir) / cfg.reward_log_path
+            rpol_path = Path(cfg.cache_dir) / cfg.reward_policy_path
+            reward_log = RewardLog.load(rlog_path)
+            reward_policy = RewardPolicy.load(
+                rpol_path,
+                warmup_days=cfg.reward_warmup_days,
+                exposure_min=cfg.reward_exposure_min,
+                exposure_max=cfg.reward_exposure_max,
+                conviction_min=cfg.reward_conviction_min,
+                conviction_max=cfg.reward_conviction_max,
+                drawdown_penalty=cfg.reward_drawdown_penalty,
+            )
+
+            # Back-fill realized returns from yesterday using today's prices
+            today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+            n_updated = reward_log.update_realized_returns(prices_cad, date_str=today_str)
+            if n_updated:
+                logger.info("Reward tracker: back-filled %d realized returns", n_updated)
+
+            # Compute online IC and update policy with yesterday's portfolio return
+            online_ic = compute_online_ic(reward_log, window=cfg.reward_ic_window)
+            recent_ic = online_ic.get("ensemble_ic") or 0.0
+            run_meta["reward_online_ic"] = online_ic
+
+            # Compute portfolio daily return from last two pnl_history entries
+            prev_daily_return = 0.0
+            if len(state.pnl_history) >= 2:
+                eq_prev = float(state.pnl_history[-2].get("equity_cad", 0))
+                eq_cur = float(state.pnl_history[-1].get("equity_cad", 0))
+                if eq_prev > 0:
+                    prev_daily_return = (eq_cur - eq_prev) / eq_prev
+
+            # Build state vector for the policy
+            regime_composite = 0.0
+            if "market_trend_20d" in features.columns and len(features) > 0:
+                regime_composite = float(features["market_trend_20d"].iloc[0])
+            avg_confidence = float(screened["pred_confidence"].mean()) if "pred_confidence" in screened.columns and not screened.empty else 0.5
+            pred_spread = float(screened["pred_return"].std()) if "pred_return" in screened.columns and not screened.empty else 0.0
+
+            state_vec = build_state_vector(
+                portfolio_drawdown=dd_info.get("current_drawdown", 0.0),
+                equity_slope_5d=compute_equity_slope(state.pnl_history),
+                regime_composite=regime_composite,
+                model_avg_confidence=avg_confidence,
+                prediction_spread=pred_spread,
+                n_positions=len([p for p in state.positions if p.status == "OPEN"]),
+                recent_sharpe_5d=compute_recent_sharpe(state.pnl_history),
+                reward_ic_recent=recent_ic,
+            )
+
+            # Update policy with yesterday's reward (if we have data)
+            if reward_policy.state.n_updates > 0 or prev_daily_return != 0.0:
+                # Use the last action stored in policy history, or default
+                last_action = reward_action
+                if reward_policy.state.history:
+                    h = reward_policy.state.history[-1]
+                    last_action = {
+                        "exposure_scalar": h.get("exposure", 1.0),
+                        "conviction_scalar": h.get("conviction", 1.0),
+                    }
+                reward_policy.update(state_vec, last_action, prev_daily_return)
+
+            # Select today's action
+            reward_action = reward_policy.select_action(state_vec)
+
+            # Apply exposure scalar to target weights
+            exp_s = reward_action["exposure_scalar"]
+            if abs(exp_s - 1.0) > 0.01 and not target_weights.empty:
+                target_weights["weight"] = target_weights["weight"] * exp_s
+                logger.info(
+                    "Reward policy: exposure_scalar=%.2f, conviction_scalar=%.2f (updates=%d)",
+                    exp_s, reward_action["conviction_scalar"], reward_policy.state.n_updates,
+                )
+
+            # Compute prediction bias and log it
+            bias_info = compute_prediction_bias(reward_log, window=cfg.reward_ic_window)
+            run_meta["reward_prediction_bias"] = bias_info
+            run_meta["reward_policy"] = reward_policy.summary()
+            run_meta["reward_action"] = reward_action
+        except Exception as e:
+            logger.warning("Reward model error (non-fatal): %s", e)
+
     # Safeguard: if all weights were eliminated by the scaling chain
     # (regime + vol targeting + drawdown can compound to push every position
     # below the min-position threshold), rebuild weights for the top picks
@@ -673,6 +766,69 @@ def run_daily(cfg: Config, logger) -> None:
         fx_usdcad_rate=float(fx.dropna().iloc[-1]) if fx is not None and not fx.dropna().empty else None,
         total_processed=len(features),
     )
+
+    # ---- Reward model: record today's predictions and save ----
+    if cfg.reward_model_enabled and reward_log is not None:
+        try:
+            today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+            new_entries: list[RewardEntry] = []
+
+            # Record predictions for all screened tickers
+            for t in screened.index:
+                pred_ret = float(screened.loc[t, "pred_return"]) if "pred_return" in screened.columns else 0.0
+                pred_alpha = float(screened.loc[t, "pred_return_raw"]) if "pred_return_raw" in screened.columns else None
+                conf = float(screened.loc[t, "pred_confidence"]) if "pred_confidence" in screened.columns else None
+                sc = float(scored.loc[t, "score"]) if t in scored.index and "score" in scored.columns else None
+                tw = float(target_weights.loc[t, "weight"]) if t in target_weights.index else None
+                px = float(prices_cad.get(t, float("nan")))
+                if pd.isna(px) or px <= 0:
+                    continue
+                new_entries.append(RewardEntry(
+                    date=today_str,
+                    ticker=str(t),
+                    predicted_return=pred_ret,
+                    predicted_alpha=pred_alpha,
+                    model_score=sc,
+                    confidence=conf,
+                    weight_assigned=tw,
+                    price_at_prediction=px,
+                ))
+
+            # Record closed positions from today's exits
+            for action in trade_plan.actions:
+                if action.action in ("SELL", "SELL_PARTIAL"):
+                    pos = next(
+                        (p for p in state.positions if p.ticker == action.ticker and p.status != "OPEN"),
+                        None,
+                    )
+                    if pos and pos.entry_price and pos.entry_price > 0 and action.price_cad:
+                        cum_ret = (action.price_cad - pos.entry_price) / pos.entry_price
+                        # Update or create an entry for the closed trade
+                        new_entries.append(RewardEntry(
+                            date=today_str,
+                            ticker=action.ticker,
+                            predicted_return=float(screened.loc[action.ticker, "pred_return"]) if action.ticker in screened.index and "pred_return" in screened.columns else 0.0,
+                            realized_cumulative_return=cum_ret,
+                            days_held=action.days_held,
+                            exit_reason=action.reason,
+                            price_at_prediction=pos.entry_price,
+                        ))
+
+            if new_entries:
+                reward_log.append_batch(new_entries)
+
+            rlog_path = Path(cfg.cache_dir) / cfg.reward_log_path
+            reward_log.save(rlog_path)
+            logger.info("Reward tracker: logged %d entries (%d total)", len(new_entries), len(reward_log.entries))
+        except Exception as e:
+            logger.warning("Reward tracker save error (non-fatal): %s", e)
+
+    if cfg.reward_model_enabled and reward_policy is not None:
+        try:
+            rpol_path = Path(cfg.cache_dir) / cfg.reward_policy_path
+            reward_policy.save(rpol_path)
+        except Exception as e:
+            logger.warning("Reward policy save error (non-fatal): %s", e)
 
     # Persist metadata for debugging/auditing
     write_json(cache_dir / "last_run_meta.json", run_meta)

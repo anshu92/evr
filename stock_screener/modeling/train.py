@@ -59,6 +59,8 @@ from stock_screener.modeling.transform import normalize_features_cross_section, 
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json, suppress_external_warnings
+from stock_screener.reward.tracker import RewardLog
+from stock_screener.reward.feedback import build_verified_labels, compute_online_ic, compute_ensemble_reward_weights
 
 # Suppress known external library warnings
 suppress_external_warnings()
@@ -866,6 +868,32 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     sample_weights = train_df["_sample_weight"].values
     logger.info("Added recency sample weights: oldest=%.2f, newest=%.2f", sample_weights.min(), sample_weights.max())
 
+    # Boost sample weights for verified labels from the reward log
+    verified_label_weight = getattr(cfg, "reward_verified_label_weight", 2.0)
+    reward_log_path = Path(getattr(cfg, "cache_dir", "cache")) / getattr(cfg, "reward_log_path", "reward_log.json")
+    try:
+        reward_log = RewardLog.load(reward_log_path)
+        verified = build_verified_labels(reward_log)
+        if not verified.empty:
+            # Match verified trades to training samples by (date, ticker) and boost their weight
+            verified_keys = set(zip(verified["date"].astype(str), verified["ticker"].astype(str)))
+            n_boosted = 0
+            for idx in range(len(train_df)):
+                row_date = str(train_df.iloc[idx]["date"])[:10]  # YYYY-MM-DD
+                row_ticker = str(train_df.iloc[idx].get("ticker", ""))
+                if (row_date, row_ticker) in verified_keys:
+                    sample_weights[idx] *= verified_label_weight
+                    n_boosted += 1
+            if n_boosted:
+                # Re-normalize to mean=1
+                sample_weights = sample_weights / sample_weights.mean()
+                logger.info(
+                    "Reward feedback: boosted %d verified-label samples by %.1fx (from %d closed trades)",
+                    n_boosted, verified_label_weight, len(verified),
+                )
+    except Exception as e:
+        logger.debug("Could not load reward log for verified labels: %s", e)
+
     # Use configured ensemble composition or default
     n_xgb = getattr(cfg, 'ensemble_xgb_count', 3)
     n_lgbm = getattr(cfg, 'ensemble_lgbm_count', 3)
@@ -1133,7 +1161,26 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         else:
             weights = np.ones(len(model_ics)) / len(model_ics)
             logger.warning("All model ICs <= 0, using equal weighting")
-        
+
+        # Blend with reward-based online IC weights (if reward log has per-model data)
+        blend_alpha = getattr(cfg, "reward_ic_blend_alpha", 0.5)
+        try:
+            online_ic_result = compute_online_ic(reward_log, window=getattr(cfg, "reward_ic_window", 20))
+            per_model_ics_online = online_ic_result.get("per_model_ics")
+            if per_model_ics_online and len(per_model_ics_online) == len(model_ics):
+                weights_list = compute_ensemble_reward_weights(
+                    per_model_ics_online,
+                    holdout_weights=weights.tolist(),
+                    blend_alpha=blend_alpha,
+                )
+                weights = np.array(weights_list)
+                logger.info(
+                    "Blended ensemble weights with reward IC (alpha=%.2f): %s",
+                    blend_alpha, [f"{w:.3f}" for w in weights],
+                )
+        except Exception as e:
+            logger.debug("Could not blend reward IC weights: %s", e)
+
         # Second pass: compute weighted predictions (memory efficient)
         # IMPORTANT: Standardize predictions before combining to handle scale mismatch
         # XGBRanker outputs ranking scores (~0-10) while LightGBM outputs alpha (~-0.5 to +0.5)

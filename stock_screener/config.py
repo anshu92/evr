@@ -171,6 +171,20 @@ class Config:
     entry_min_momentum_5d: float | None = -0.05  # Reject stocks with recent sharp drops
     entry_momentum_alignment: bool = True  # Reject bullish signals with bearish price action
 
+    # Reward model (realized-return feedback loop + adaptive policy)
+    reward_model_enabled: bool = True
+    reward_log_path: str = "reward_log.json"
+    reward_policy_path: str = "reward_policy.json"
+    reward_warmup_days: int = 20  # Days before policy starts influencing weights
+    reward_ic_window: int = 20  # Rolling window for online IC computation
+    reward_ic_blend_alpha: float = 0.5  # Blend: alpha*realized_ic + (1-alpha)*holdout_ic
+    reward_drawdown_penalty: float = 2.0  # Lambda for asymmetric reward
+    reward_exposure_min: float = 0.3
+    reward_exposure_max: float = 1.5
+    reward_conviction_min: float = 0.5
+    reward_conviction_max: float = 2.0
+    reward_verified_label_weight: float = 2.0  # Sample weight boost for verified labels
+
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
     base_currency: str = "CAD"
@@ -370,6 +384,18 @@ class Config:
                 else None
             ),
             entry_momentum_alignment=os.getenv("ENTRY_MOMENTUM_ALIGNMENT", "1").strip() in {"1", "true", "True"},
+            reward_model_enabled=_get_bool("REWARD_MODEL_ENABLED", True),
+            reward_log_path=_get_str("REWARD_LOG_PATH", "reward_log.json"),
+            reward_policy_path=_get_str("REWARD_POLICY_PATH", "reward_policy.json"),
+            reward_warmup_days=_get_int("REWARD_WARMUP_DAYS", 20) or 20,
+            reward_ic_window=_get_int("REWARD_IC_WINDOW", 20) or 20,
+            reward_ic_blend_alpha=_get_float("REWARD_IC_BLEND_ALPHA", 0.5),
+            reward_drawdown_penalty=_get_float("REWARD_DRAWDOWN_PENALTY", 2.0),
+            reward_exposure_min=_get_float("REWARD_EXPOSURE_MIN", 0.3),
+            reward_exposure_max=_get_float("REWARD_EXPOSURE_MAX", 1.5),
+            reward_conviction_min=_get_float("REWARD_CONVICTION_MIN", 0.5),
+            reward_conviction_max=_get_float("REWARD_CONVICTION_MAX", 2.0),
+            reward_verified_label_weight=_get_float("REWARD_VERIFIED_LABEL_WEIGHT", 2.0),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(
