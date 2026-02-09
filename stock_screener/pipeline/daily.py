@@ -25,8 +25,11 @@ from stock_screener.modeling.model import load_ensemble, load_model, predict, pr
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
 from stock_screener.portfolio.manager import PortfolioManager
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
-from stock_screener.reward.tracker import RewardEntry, RewardLog
-from stock_screener.reward.feedback import compute_online_ic, compute_ensemble_reward_weights, compute_prediction_bias
+from stock_screener.reward.tracker import RewardEntry, RewardLog, ActionRewardEntry, ActionRewardLog
+from stock_screener.reward.feedback import (
+    compute_online_ic, compute_ensemble_reward_weights, compute_prediction_bias,
+    score_actions, compute_action_quality_summary,
+)
 from stock_screener.reward.policy import (
     RewardPolicy, build_state_vector, compute_equity_slope, compute_recent_sharpe,
 )
@@ -547,12 +550,15 @@ def run_daily(cfg: Config, logger) -> None:
     # ---- Reward model: load log + policy, apply adaptive scaling ----
     reward_log: RewardLog | None = None
     reward_policy: RewardPolicy | None = None
+    action_reward_log: ActionRewardLog | None = None
     reward_action: dict[str, float] = {"exposure_scalar": 1.0, "conviction_scalar": 1.0}
     if cfg.reward_model_enabled:
         try:
             rlog_path = Path(cfg.cache_dir) / cfg.reward_log_path
             rpol_path = Path(cfg.cache_dir) / cfg.reward_policy_path
+            alog_path = Path(cfg.cache_dir) / "action_reward_log.json"
             reward_log = RewardLog.load(rlog_path)
+            action_reward_log = ActionRewardLog.load(alog_path)
             reward_policy = RewardPolicy.load(
                 rpol_path,
                 warmup_days=cfg.reward_warmup_days,
@@ -563,8 +569,28 @@ def run_daily(cfg: Config, logger) -> None:
                 drawdown_penalty=cfg.reward_drawdown_penalty,
             )
 
-            # Back-fill realized returns from yesterday using today's prices
+            # Back-fill post-action prices and score completed actions
             today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+            n_action_bf = action_reward_log.backfill_prices(prices_cad, today_str)
+            n_action_scored = score_actions(action_reward_log, window=60)
+            if n_action_bf or n_action_scored:
+                logger.info(
+                    "Action rewards: back-filled %d price fields, scored %d actions",
+                    n_action_bf, n_action_scored,
+                )
+            # Compute and log action quality summary
+            action_summary = compute_action_quality_summary(action_reward_log, window=30)
+            if action_summary:
+                run_meta["action_quality"] = action_summary
+                overall = action_summary.get("overall", {})
+                logger.info(
+                    "Action quality (30d): %d scored, avg_reward=%.4f, positive=%.0f%%",
+                    overall.get("total_actions_scored", 0),
+                    overall.get("avg_reward", 0),
+                    overall.get("positive_action_pct", 0) * 100,
+                )
+
+            # Back-fill realized returns from yesterday using today's prices
             n_updated = reward_log.update_realized_returns(prices_cad, date_str=today_str)
             if n_updated:
                 logger.info("Reward tracker: back-filled %d realized returns", n_updated)
@@ -614,6 +640,21 @@ def run_daily(cfg: Config, logger) -> None:
 
             # Select today's action
             reward_action = reward_policy.select_action(state_vec)
+
+            # Modulate conviction based on recent action quality
+            # If many recent actions were bad, dampen conviction
+            if action_reward_log is not None:
+                aq = compute_action_quality_summary(action_reward_log, window=30)
+                overall_aq = aq.get("overall", {})
+                positive_pct = overall_aq.get("positive_action_pct", 0.5)
+                if overall_aq.get("total_actions_scored", 0) >= 10:
+                    # Scale conviction: 0.5 at 0% positive, 1.0 at 50%, up to policy max
+                    aq_scalar = max(0.5, min(1.5, positive_pct * 2.0))
+                    reward_action["conviction_scalar"] = float(
+                        max(cfg.reward_conviction_min,
+                            min(cfg.reward_conviction_max,
+                                reward_action["conviction_scalar"] * aq_scalar))
+                    )
 
             # Apply exposure scalar to target weights
             exp_s = reward_action["exposure_scalar"]
@@ -822,6 +863,114 @@ def run_daily(cfg: Config, logger) -> None:
             logger.info("Reward tracker: logged %d entries (%d total)", len(new_entries), len(reward_log.entries))
         except Exception as e:
             logger.warning("Reward tracker save error (non-fatal): %s", e)
+
+    # ---- Action-level reward logging (with rotation pairs + context) ----
+    if cfg.reward_model_enabled and action_reward_log is not None:
+        try:
+            today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+            # Pre-compute screened context for selection quality
+            screened_avg_pred = None
+            screened_top_pred = None
+            if "pred_return" in screened.columns:
+                preds = screened["pred_return"].dropna()
+                if len(preds):
+                    screened_avg_pred = float(preds.mean())
+                    screened_top_pred = float(preds.max())
+
+            # Identify rotation pairs: SELLs and BUYs on the same day
+            sells_today = [
+                a for a in trade_plan.actions
+                if a.action in ("SELL", "SELL_PARTIAL")
+                and a.price_cad and not pd.isna(a.price_cad) and float(a.price_cad) > 0
+            ]
+            buys_today = [
+                a for a in trade_plan.actions
+                if a.action == "BUY"
+                and a.price_cad and not pd.isna(a.price_cad) and float(a.price_cad) > 0
+            ]
+            # Build rotation linkage: pair sells to buys (order-matched)
+            sell_to_buy: dict[str, str] = {}  # sold_ticker -> bought_ticker
+            buy_to_sell: dict[str, str] = {}  # bought_ticker -> sold_ticker
+            for i, sell_a in enumerate(sells_today):
+                if i < len(buys_today):
+                    sell_to_buy[sell_a.ticker] = buys_today[i].ticker
+                    buy_to_sell[buys_today[i].ticker] = sell_a.ticker
+
+            action_entries: list[ActionRewardEntry] = []
+
+            for action in trade_plan.actions:
+                if action.action not in ("BUY", "SELL", "SELL_PARTIAL", "HOLD"):
+                    continue
+                px = action.price_cad
+                if not px or pd.isna(px) or float(px) <= 0:
+                    continue
+                pred_ret = float(action.pred_return) if action.pred_return is not None else 0.0
+                conf = float(screened.loc[action.ticker, "pred_confidence"]) if action.ticker in screened.index and "pred_confidence" in screened.columns else 0.0
+                entry_px = float(action.entry_price) if action.entry_price else None
+
+                # Look up stock volatility from features
+                stock_vol = None
+                if action.ticker in features.index and "vol_20d_ann" in features.columns:
+                    v = features.loc[action.ticker, "vol_20d_ann"]
+                    if not pd.isna(v):
+                        stock_vol = float(v)
+
+                # Rotation pair tracking
+                replaced_by = None
+                replaced_by_px = None
+                replaced = None
+                replaced_px = None
+
+                if action.action in ("SELL", "SELL_PARTIAL") and action.ticker in sell_to_buy:
+                    rpl_ticker = sell_to_buy[action.ticker]
+                    replaced_by = rpl_ticker
+                    rpl_px = prices_cad.get(rpl_ticker)
+                    if rpl_px and not pd.isna(rpl_px) and float(rpl_px) > 0:
+                        replaced_by_px = float(rpl_px)
+
+                if action.action == "BUY" and action.ticker in buy_to_sell:
+                    sold_ticker = buy_to_sell[action.ticker]
+                    replaced = sold_ticker
+                    rpl_px = prices_cad.get(sold_ticker)
+                    if rpl_px and not pd.isna(rpl_px) and float(rpl_px) > 0:
+                        replaced_px = float(rpl_px)
+
+                action_entries.append(ActionRewardEntry(
+                    date=today_str,
+                    ticker=action.ticker,
+                    action=action.action,
+                    reason=action.reason,
+                    price_at_action=float(px),
+                    shares=float(action.shares),
+                    predicted_return=pred_ret,
+                    confidence=conf,
+                    entry_price=entry_px,
+                    replaced_by_ticker=replaced_by,
+                    replaced_by_price=replaced_by_px,
+                    replaced_ticker=replaced,
+                    replaced_price=replaced_px,
+                    screened_avg_pred_return=screened_avg_pred,
+                    screened_top_pred_return=screened_top_pred,
+                    stock_volatility=stock_vol,
+                ))
+
+            if action_entries:
+                action_reward_log.append_batch(action_entries)
+
+            alog_path = Path(cfg.cache_dir) / "action_reward_log.json"
+            action_reward_log.save(alog_path)
+            n_by_type: dict[str, int] = {}
+            for ae in action_entries:
+                n_by_type[ae.action] = n_by_type.get(ae.action, 0) + 1
+            n_rotations = len(sell_to_buy)
+            logger.info(
+                "Action reward tracker: logged %d actions %s, %d rotation pairs (%d total)",
+                len(action_entries), dict(n_by_type), n_rotations,
+                len(action_reward_log.entries),
+            )
+        except Exception as e:
+            logger.warning("Action reward tracker save error (non-fatal): %s", e)
 
     if cfg.reward_model_enabled and reward_policy is not None:
         try:
