@@ -644,12 +644,15 @@ class PortfolioManager:
         target_tickers = list(weights.index.astype(str))
         target_set = set(target_tickers)
 
-        # SELL positions not in target - but only if they meet rotation criteria
-        # Avoid excessive turnover by requiring deteriorating fundamentals to rotate out
+        # SELL positions not in target - but only if they meet rotation criteria.
+        # Avoid excessive turnover by requiring deteriorating fundamentals to rotate out.
+        # Positions that survive rotation will get a HOLD action in the loop below
+        # so they are always visible in the report.
         for t, p in list(open_by_ticker.items()):
             if t not in target_set:
                 px = float(prices_cad.get(t, float("nan")))
                 if pd.isna(px) or px <= 0:
+                    # No price data – keep position; HOLD action emitted later.
                     continue
                 days = p.days_held(now)
                 
@@ -782,25 +785,30 @@ class PortfolioManager:
                 open_tickers.add(t)
                 slots -= 1
 
-        # Track tickers we just bought (so we don't also generate HOLD for them)
-        just_bought = {a.ticker for a in actions if a.action == "BUY"}
+        # Track tickers that already have an action (BUY or SELL) so we don't double-report.
+        actioned_tickers = {a.ticker for a in actions if a.action in ("BUY", "SELL", "SELL_PARTIAL")}
         
-        # HOLD: open tickers in target (but skip just-bought ones).
+        # HOLD: emit an action for every open position so the report always
+        # accounts for each held ticker.  Positions still in the target set
+        # are labelled IN_TARGET; those kept despite leaving the target are
+        # labelled HOLDING (pending rotation).
         for t in sorted(open_tickers):
-            if t not in target_set:
-                continue
-            if t in just_bought:
-                continue  # Already have a BUY action for this ticker
+            if t in actioned_tickers:
+                continue  # Already have a BUY/SELL action for this ticker
             p = open_by_ticker.get(t)
             px = float(prices_cad.get(t, float("nan")))
             days = p.days_held(now) if p else None
+
+            in_target = t in target_set
+            hold_reason = "IN_TARGET" if in_target else "HOLDING"
+
             # Get pred_return and pred_peak_days from weights if available
             pred_ret = None
             pred_peak_days = None
             try:
-                if "pred_return" in weights.columns:
+                if in_target and "pred_return" in weights.columns:
                     pred_ret = float(weights.loc[t, "pred_return"])
-                if "pred_peak_days" in weights.columns:
+                if in_target and "pred_peak_days" in weights.columns:
                     pred_peak_days = float(weights.loc[t, "pred_peak_days"])
             except Exception:
                 pass
@@ -821,7 +829,7 @@ class PortfolioManager:
             
             actions.append(
                 TradeAction(
-                    ticker=t, action="HOLD", reason="IN_TARGET", shares=p.shares if p else 0, 
+                    ticker=t, action="HOLD", reason=hold_reason, shares=p.shares if p else 0, 
                     price_cad=px, days_held=days, pred_return=pred_ret, expected_sell_date=expected_sell
                 )
             )

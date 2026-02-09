@@ -632,9 +632,12 @@ def run_daily(cfg: Config, logger) -> None:
         prices_cad=prices_cad,
     )
 
+    # Build holdings weights from ALL open positions using the full features
+    # DataFrame (not just 'screened'), so positions that have fallen out of
+    # today's top-N screening still appear in the portfolio report.
     open_tickers = [p.ticker for p in state.positions if p.status == "OPEN"]
-    holdings_features = screened.loc[screened.index.intersection(open_tickers)].copy()
-    holdings_features = holdings_features.sort_values("score", ascending=False)
+    holdings_features = features.loc[features.index.intersection(open_tickers)].copy()
+    holdings_features = holdings_features.sort_values("score" if "score" in holdings_features.columns else "last_close_cad", ascending=False)
     if holdings_features.empty:
         holdings_weights = holdings_features.copy()
         for col in ["weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]:
