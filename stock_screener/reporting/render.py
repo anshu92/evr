@@ -192,6 +192,8 @@ def render_reports(
         "vol_60d_ann",
         "avg_dollar_volume_cad",
     ]
+    # Only include columns that exist to avoid KeyError
+    weights_cols = [c for c in weights_cols if c in weights_view.columns]
     lines.extend(weights_view[weights_cols].to_string().splitlines())
     lines.append("")
 
@@ -328,9 +330,16 @@ def render_reports(
             .replace("'", "&#39;")
         )
 
-    weights_table = weights.reset_index()[["ticker", "weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]].copy()
+    _base_cols = ["ticker", "weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]
+    _reset = weights.reset_index()
+    _base_cols = [c for c in _base_cols if c in _reset.columns]
+    weights_table = _reset[_base_cols].copy()
+    # Ensure columns exist (may be missing for holdings built from raw features)
+    for _c in ["score", "ret_60d", "vol_60d_ann", "last_close_cad"]:
+        if _c not in weights_table.columns:
+            weights_table[_c] = pd.NA
     fx_rate = _to_float(fx_usdcad_rate)
-    if fx_rate is not None and fx_rate > 0:
+    if fx_rate is not None and fx_rate > 0 and "last_close_cad" in weights_table.columns:
         weights_table["last_close_usd"] = pd.to_numeric(weights_table["last_close_cad"], errors="coerce") / float(fx_rate)
     else:
         weights_table["last_close_usd"] = pd.NA
@@ -363,20 +372,12 @@ def render_reports(
     weights_table["ret_60d"] = weights_table["ret_60d"].map(_fmt_pct)
     weights_table["vol_60d_ann"] = weights_table["vol_60d_ann"].map(_fmt_pct)
     weights_table["score"] = weights_table["score"].map(_fmt_num)
-    weights_table = weights_table[
-        [
-            "ticker",
-            "weight",
-            "shares",
-            "position_value_cad",
-            "position_value_usd",
-            "score",
-            "last_close_cad",
-            "last_close_usd",
-            "ret_60d",
-            "vol_60d_ann",
-        ]
-    ].copy()
+    _html_cols = [
+        "ticker", "weight", "shares", "position_value_cad", "position_value_usd",
+        "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann",
+    ]
+    _html_cols = [c for c in _html_cols if c in weights_table.columns]
+    weights_table = weights_table[_html_cols].copy()
 
     rows_html = "\n".join(
         "<tr>"

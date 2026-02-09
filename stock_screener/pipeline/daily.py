@@ -637,6 +637,10 @@ def run_daily(cfg: Config, logger) -> None:
     # today's top-N screening still appear in the portfolio report.
     open_tickers = [p.ticker for p in state.positions if p.status == "OPEN"]
     holdings_features = features.loc[features.index.intersection(open_tickers)].copy()
+    # Merge in the score column from scored so all holdings have scores for
+    # the report, even tickers that dropped out of the screened top-N.
+    if "score" not in holdings_features.columns and "score" in scored.columns:
+        holdings_features["score"] = scored["score"].reindex(holdings_features.index)
     holdings_features = holdings_features.sort_values("score" if "score" in holdings_features.columns else "last_close_cad", ascending=False)
     if holdings_features.empty:
         holdings_weights = holdings_features.copy()
