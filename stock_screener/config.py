@@ -183,6 +183,10 @@ class Config:
     reward_exposure_max: float = 1.5
     reward_conviction_min: float = 0.5
     reward_conviction_max: float = 2.0
+    reward_exit_tightness_min: float = 0.5   # Loose stops (patient)
+    reward_exit_tightness_max: float = 2.0   # Tight stops (protective)
+    reward_hold_patience_min: float = 0.5    # Short holding (impatient)
+    reward_hold_patience_max: float = 2.0    # Long holding (patient)
     reward_verified_label_weight: float = 2.0  # Sample weight boost for verified labels
 
     # FX
@@ -395,6 +399,10 @@ class Config:
             reward_exposure_max=_get_float("REWARD_EXPOSURE_MAX", 1.5),
             reward_conviction_min=_get_float("REWARD_CONVICTION_MIN", 0.5),
             reward_conviction_max=_get_float("REWARD_CONVICTION_MAX", 2.0),
+            reward_exit_tightness_min=_get_float("REWARD_EXIT_TIGHTNESS_MIN", 0.5),
+            reward_exit_tightness_max=_get_float("REWARD_EXIT_TIGHTNESS_MAX", 2.0),
+            reward_hold_patience_min=_get_float("REWARD_HOLD_PATIENCE_MIN", 0.5),
+            reward_hold_patience_max=_get_float("REWARD_HOLD_PATIENCE_MAX", 2.0),
             reward_verified_label_weight=_get_float("REWARD_VERIFIED_LABEL_WEIGHT", 2.0),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),

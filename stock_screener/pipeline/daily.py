@@ -551,7 +551,10 @@ def run_daily(cfg: Config, logger) -> None:
     reward_log: RewardLog | None = None
     reward_policy: RewardPolicy | None = None
     action_reward_log: ActionRewardLog | None = None
-    reward_action: dict[str, float] = {"exposure_scalar": 1.0, "conviction_scalar": 1.0}
+    reward_action: dict[str, float] = {
+        "exposure_scalar": 1.0, "conviction_scalar": 1.0,
+        "exit_tightness": 1.0, "hold_patience": 1.0,
+    }
     if cfg.reward_model_enabled:
         try:
             rlog_path = Path(cfg.cache_dir) / cfg.reward_log_path
@@ -566,6 +569,10 @@ def run_daily(cfg: Config, logger) -> None:
                 exposure_max=cfg.reward_exposure_max,
                 conviction_min=cfg.reward_conviction_min,
                 conviction_max=cfg.reward_conviction_max,
+                exit_tightness_min=cfg.reward_exit_tightness_min,
+                exit_tightness_max=cfg.reward_exit_tightness_max,
+                hold_patience_min=cfg.reward_hold_patience_min,
+                hold_patience_max=cfg.reward_hold_patience_max,
                 drawdown_penalty=cfg.reward_drawdown_penalty,
             )
 
@@ -633,8 +640,10 @@ def run_daily(cfg: Config, logger) -> None:
                 if reward_policy.state.history:
                     h = reward_policy.state.history[-1]
                     last_action = {
-                        "exposure_scalar": h.get("exposure", 1.0),
-                        "conviction_scalar": h.get("conviction", 1.0),
+                        "exposure_scalar": h.get("exposure_scalar", h.get("exposure", 1.0)),
+                        "conviction_scalar": h.get("conviction_scalar", h.get("conviction", 1.0)),
+                        "exit_tightness": h.get("exit_tightness", 1.0),
+                        "hold_patience": h.get("hold_patience", 1.0),
                     }
                 reward_policy.update(state_vec, last_action, prev_daily_return)
 
@@ -660,10 +669,22 @@ def run_daily(cfg: Config, logger) -> None:
             exp_s = reward_action["exposure_scalar"]
             if abs(exp_s - 1.0) > 0.01 and not target_weights.empty:
                 target_weights["weight"] = target_weights["weight"] * exp_s
-                logger.info(
-                    "Reward policy: exposure_scalar=%.2f, conviction_scalar=%.2f (updates=%d)",
-                    exp_s, reward_action["conviction_scalar"], reward_policy.state.n_updates,
-                )
+
+            # Apply conviction scalar: amplify/dampen spread between positions
+            conv_s = reward_action["conviction_scalar"]
+            if abs(conv_s - 1.0) > 0.01 and not target_weights.empty and len(target_weights) > 1:
+                mean_w = float(target_weights["weight"].mean())
+                target_weights["weight"] = mean_w + (target_weights["weight"] - mean_w) * conv_s
+                target_weights["weight"] = target_weights["weight"].clip(lower=1e-4)
+                total_w = target_weights["weight"].sum()
+                if total_w > 0:
+                    target_weights["weight"] = target_weights["weight"] / total_w
+
+            logger.info(
+                "Reward policy: exposure=%.2f conviction=%.2f exit_tight=%.2f hold_pat=%.2f (updates=%d)",
+                exp_s, conv_s, reward_action["exit_tightness"],
+                reward_action["hold_patience"], reward_policy.state.n_updates,
+            )
 
             # Compute prediction bias and log it
             bias_info = compute_prediction_bias(reward_log, window=cfg.reward_ic_window)
@@ -693,10 +714,30 @@ def run_daily(cfg: Config, logger) -> None:
         )
         run_meta["target_weights_fallback"] = True
     
+    # Scale exit/holding parameters by the bandit's adaptive scalars.
+    # exit_tightness > 1 → tighter stops (protective), < 1 → looser stops (patient)
+    # hold_patience > 1 → hold longer, < 1 → exit sooner
+    exit_t = reward_action.get("exit_tightness", 1.0)
+    hold_p = reward_action.get("hold_patience", 1.0)
+    adaptive_trailing_dist = getattr(cfg, "trailing_stop_distance_pct", 0.08) / max(exit_t, 0.1)
+    adaptive_vol_stop_base = getattr(cfg, "vol_adjusted_stop_base", 0.08) / max(exit_t, 0.1)
+    adaptive_vol_stop_min = getattr(cfg, "vol_adjusted_stop_min", 0.04) / max(exit_t, 0.1)
+    adaptive_vol_stop_max = getattr(cfg, "vol_adjusted_stop_max", 0.15) / max(exit_t, 0.1)
+    adaptive_max_hold = max(1, round(cfg.max_holding_days * hold_p))
+    adaptive_max_hold_hard = max(adaptive_max_hold, round(cfg.max_holding_days_hard * hold_p))
+    adaptive_quick_profit_pct = getattr(cfg, "quick_profit_pct", 0.05) / max(hold_p, 0.1)
+    adaptive_min_daily_return = getattr(cfg, "min_daily_return", 0.005) / max(hold_p, 0.1)
+    if abs(exit_t - 1.0) > 0.05 or abs(hold_p - 1.0) > 0.05:
+        logger.info(
+            "Adaptive PM params: trailing_dist=%.3f vol_stop=%.3f max_hold=%d quick_profit=%.3f",
+            adaptive_trailing_dist, adaptive_vol_stop_base,
+            adaptive_max_hold, adaptive_quick_profit_pct,
+        )
+
     pm = PortfolioManager(
         state_path=cfg.portfolio_state_path,
-        max_holding_days=cfg.max_holding_days,
-        max_holding_days_hard=cfg.max_holding_days_hard,
+        max_holding_days=adaptive_max_hold,
+        max_holding_days_hard=adaptive_max_hold_hard,
         extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
         extend_hold_min_score=cfg.extend_hold_min_score,
         max_positions=effective_portfolio_size,
@@ -704,21 +745,21 @@ def run_daily(cfg: Config, logger) -> None:
         take_profit_pct=cfg.take_profit_pct,
         trailing_stop_enabled=getattr(cfg, "trailing_stop_enabled", True),
         trailing_stop_activation_pct=getattr(cfg, "trailing_stop_activation_pct", 0.05),
-        trailing_stop_distance_pct=getattr(cfg, "trailing_stop_distance_pct", 0.08),
+        trailing_stop_distance_pct=adaptive_trailing_dist,
         peak_based_exit=getattr(cfg, "peak_based_exit", True),
         twr_optimization=getattr(cfg, "twr_optimization", True),
-        quick_profit_pct=getattr(cfg, "quick_profit_pct", 0.05),
+        quick_profit_pct=adaptive_quick_profit_pct,
         quick_profit_days=getattr(cfg, "quick_profit_days", 3),
-        min_daily_return=getattr(cfg, "min_daily_return", 0.005),
+        min_daily_return=adaptive_min_daily_return,
         momentum_decay_exit=getattr(cfg, "momentum_decay_exit", True),
         signal_decay_exit_enabled=getattr(cfg, "signal_decay_exit_enabled", True),
         signal_decay_threshold=getattr(cfg, "signal_decay_threshold", -0.02),
         dynamic_holding_enabled=getattr(cfg, "dynamic_holding_enabled", True),
         dynamic_holding_vol_scale=getattr(cfg, "dynamic_holding_vol_scale", 0.5),
         vol_adjusted_stop_enabled=getattr(cfg, "vol_adjusted_stop_enabled", True),
-        vol_adjusted_stop_base=getattr(cfg, "vol_adjusted_stop_base", 0.08),
-        vol_adjusted_stop_min=getattr(cfg, "vol_adjusted_stop_min", 0.04),
-        vol_adjusted_stop_max=getattr(cfg, "vol_adjusted_stop_max", 0.15),
+        vol_adjusted_stop_base=adaptive_vol_stop_base,
+        vol_adjusted_stop_min=adaptive_vol_stop_min,
+        vol_adjusted_stop_max=adaptive_vol_stop_max,
         age_urgency_enabled=getattr(cfg, "age_urgency_enabled", True),
         age_urgency_start_day=getattr(cfg, "age_urgency_start_day", 2),
         age_urgency_min_return=getattr(cfg, "age_urgency_min_return", 0.01),

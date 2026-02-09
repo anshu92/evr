@@ -1,9 +1,15 @@
 """Adaptive exposure policy using Bayesian linear Thompson Sampling.
 
 The policy learns the relationship between portfolio/market state and
-optimal exposure/conviction scaling, using daily returns as reward.
-No deep-learning dependencies -- uses only numpy for closed-form
+optimal portfolio scalars, using daily returns as reward.  No
+deep-learning dependencies -- uses only numpy for closed-form
 Bayesian linear regression updates.
+
+Action dimensions (4):
+  0: exposure_scalar     — total portfolio exposure level
+  1: conviction_scalar   — amplify spread between high/low conviction picks
+  2: exit_tightness      — scale stop-loss distances (high = tighter stops)
+  3: hold_patience        — scale holding period (high = hold longer)
 """
 from __future__ import annotations
 
@@ -28,9 +34,22 @@ STATE_FEATURES = [
     "reward_ic_recent",
 ]
 
-# Number of action dimensions
-# 0: exposure_scalar, 1: conviction_scalar
-N_ACTIONS = 2
+# Action dimension names (order matters)
+ACTION_NAMES = [
+    "exposure_scalar",
+    "conviction_scalar",
+    "exit_tightness",
+    "hold_patience",
+]
+N_ACTIONS = len(ACTION_NAMES)
+
+# Default action values (used during warmup and fallback)
+_DEFAULT_ACTION: dict[str, float] = {
+    "exposure_scalar": 1.0,
+    "conviction_scalar": 1.0,
+    "exit_tightness": 1.0,
+    "hold_patience": 1.0,
+}
 
 
 @dataclass
@@ -113,7 +132,11 @@ def compute_reward(
 
 
 class RewardPolicy:
-    """Bayesian linear bandit for adaptive exposure/conviction scaling."""
+    """Bayesian linear bandit for adaptive portfolio parameter scaling.
+
+    Controls 4 scalars: exposure, conviction spread, exit tightness,
+    and hold patience.
+    """
 
     def __init__(
         self,
@@ -122,6 +145,10 @@ class RewardPolicy:
         exposure_max: float = 1.5,
         conviction_min: float = 0.5,
         conviction_max: float = 2.0,
+        exit_tightness_min: float = 0.5,
+        exit_tightness_max: float = 2.0,
+        hold_patience_min: float = 0.5,
+        hold_patience_max: float = 2.0,
         drawdown_penalty: float = 2.0,
         exploration_scale: float = 0.5,
     ) -> None:
@@ -130,6 +157,10 @@ class RewardPolicy:
         self.exposure_max = exposure_max
         self.conviction_min = conviction_min
         self.conviction_max = conviction_max
+        self.exit_tightness_min = exit_tightness_min
+        self.exit_tightness_max = exit_tightness_max
+        self.hold_patience_min = hold_patience_min
+        self.hold_patience_max = hold_patience_max
         self.drawdown_penalty = drawdown_penalty
         self.exploration_scale = exploration_scale
         self.state = PolicyState()
@@ -138,7 +169,11 @@ class RewardPolicy:
 
     @classmethod
     def load(cls, path: str | Path, **kwargs: Any) -> "RewardPolicy":
-        """Load policy from JSON or create a fresh one."""
+        """Load policy from JSON or create a fresh one.
+
+        Handles migration from older 2-action policies gracefully by
+        resetting the posterior when the dimension has changed.
+        """
         p = Path(path)
         policy = cls(**kwargs)
         if not p.exists():
@@ -149,23 +184,37 @@ class RewardPolicy:
             return policy
 
         ps = data.get("policy_state", {})
-        policy.state = PolicyState(
-            dim=ps.get("dim", policy.state.dim),
-            mu=ps.get("mu", []),
-            precision_flat=ps.get("precision_flat", []),
-            a=ps.get("a", 1.0),
-            b=ps.get("b", 1.0),
-            n_updates=ps.get("n_updates", 0),
-            cumulative_reward=ps.get("cumulative_reward", 0.0),
-            history=ps.get("history", []),
-        )
-        # Load config overrides
+
+        # Dimension migration: if saved dim differs from current, keep
+        # bookkeeping (n_updates, history) but reset the posterior.
+        saved_dim = ps.get("dim", policy.state.dim)
+        if saved_dim != policy.state.dim:
+            policy.state.n_updates = ps.get("n_updates", 0)
+            policy.state.cumulative_reward = ps.get("cumulative_reward", 0.0)
+            policy.state.history = ps.get("history", [])
+            # mu and precision stay at fresh defaults for the new dim
+        else:
+            policy.state = PolicyState(
+                dim=saved_dim,
+                mu=ps.get("mu", []),
+                precision_flat=ps.get("precision_flat", []),
+                a=ps.get("a", 1.0),
+                b=ps.get("b", 1.0),
+                n_updates=ps.get("n_updates", 0),
+                cumulative_reward=ps.get("cumulative_reward", 0.0),
+                history=ps.get("history", []),
+            )
+
         cfg = data.get("config", {})
         policy.warmup_days = cfg.get("warmup_days", policy.warmup_days)
         policy.exposure_min = cfg.get("exposure_min", policy.exposure_min)
         policy.exposure_max = cfg.get("exposure_max", policy.exposure_max)
         policy.conviction_min = cfg.get("conviction_min", policy.conviction_min)
         policy.conviction_max = cfg.get("conviction_max", policy.conviction_max)
+        policy.exit_tightness_min = cfg.get("exit_tightness_min", policy.exit_tightness_min)
+        policy.exit_tightness_max = cfg.get("exit_tightness_max", policy.exit_tightness_max)
+        policy.hold_patience_min = cfg.get("hold_patience_min", policy.hold_patience_min)
+        policy.hold_patience_max = cfg.get("hold_patience_max", policy.hold_patience_max)
         policy.drawdown_penalty = cfg.get("drawdown_penalty", policy.drawdown_penalty)
         return policy
 
@@ -180,6 +229,10 @@ class RewardPolicy:
                 "exposure_max": self.exposure_max,
                 "conviction_min": self.conviction_min,
                 "conviction_max": self.conviction_max,
+                "exit_tightness_min": self.exit_tightness_min,
+                "exit_tightness_max": self.exit_tightness_max,
+                "hold_patience_min": self.hold_patience_min,
+                "hold_patience_max": self.hold_patience_max,
                 "drawdown_penalty": self.drawdown_penalty,
             },
             "policy_state": {
@@ -190,7 +243,6 @@ class RewardPolicy:
                 "b": self.state.b,
                 "n_updates": self.state.n_updates,
                 "cumulative_reward": self.state.cumulative_reward,
-                # Keep only last 60 history entries to limit file size
                 "history": self.state.history[-60:],
             },
         }
@@ -198,44 +250,62 @@ class RewardPolicy:
 
     # ---- action selection ---------------------------------------------------
 
-    def select_action(self, state_vec: np.ndarray) -> dict[str, float]:
-        """Select exposure_scalar and conviction_scalar given current state.
+    def _action_bounds(self) -> list[tuple[float, float]]:
+        """Return (min, max) for each action dimension."""
+        return [
+            (self.exposure_min, self.exposure_max),
+            (self.conviction_min, self.conviction_max),
+            (self.exit_tightness_min, self.exit_tightness_max),
+            (self.hold_patience_min, self.hold_patience_max),
+        ]
 
-        During warmup returns defaults (1.0, 1.0).  After warmup uses
-        Thompson Sampling: sample weights from posterior, pick action that
-        maximises predicted reward.
+    def select_action(self, state_vec: np.ndarray) -> dict[str, float]:
+        """Select all 4 scalars given current state.
+
+        During warmup returns defaults (all 1.0).  After warmup uses
+        Thompson Sampling with grid search over candidate actions.
         """
         if self.state.n_updates < self.warmup_days:
-            return {"exposure_scalar": 1.0, "conviction_scalar": 1.0}
+            return dict(_DEFAULT_ACTION)
 
         # Thompson Sampling: sample weight vector from posterior
         try:
             precision = self.state.precision_matrix
             cov = np.linalg.inv(precision) * (self.state.b / max(self.state.a, 1e-6))
-            # Ensure positive semi-definite
             cov = (cov + cov.T) / 2
             eigvals = np.linalg.eigvalsh(cov)
             if eigvals.min() < 0:
                 cov += np.eye(self.state.dim) * (abs(eigvals.min()) + 1e-6)
-            w_sample = np.random.multivariate_normal(self.state.mu_array, cov * self.exploration_scale)
+            w_sample = np.random.multivariate_normal(
+                self.state.mu_array, cov * self.exploration_scale,
+            )
         except (np.linalg.LinAlgError, ValueError):
-            return {"exposure_scalar": 1.0, "conviction_scalar": 1.0}
+            return dict(_DEFAULT_ACTION)
 
-        # Grid search over candidate actions to find the one with best predicted reward
+        bounds = self._action_bounds()
+        # Grid: 5 points for exposure, 4 for conviction, 3 for exit/hold
+        # Total: 5*4*3*3 = 180 candidates — fast enough
+        grids = [
+            np.linspace(lo, hi, n)
+            for (lo, hi), n in zip(bounds, [5, 4, 3, 3])
+        ]
+
         best_reward = -np.inf
-        best_action = np.array([1.0, 1.0])
-        for exp_s in np.linspace(self.exposure_min, self.exposure_max, 7):
-            for conv_s in np.linspace(self.conviction_min, self.conviction_max, 5):
-                action = np.array([exp_s, conv_s])
-                phi = _build_feature_vector(state_vec, action)
-                predicted_reward = float(w_sample @ phi)
-                if predicted_reward > best_reward:
-                    best_reward = predicted_reward
-                    best_action = action
+        best_action = np.ones(N_ACTIONS)
+        for exp_s in grids[0]:
+            for conv_s in grids[1]:
+                for exit_t in grids[2]:
+                    for hold_p in grids[3]:
+                        action = np.array([exp_s, conv_s, exit_t, hold_p])
+                        phi = _build_feature_vector(state_vec, action)
+                        predicted_reward = float(w_sample @ phi)
+                        if predicted_reward > best_reward:
+                            best_reward = predicted_reward
+                            best_action = action
 
         return {
-            "exposure_scalar": float(np.clip(best_action[0], self.exposure_min, self.exposure_max)),
-            "conviction_scalar": float(np.clip(best_action[1], self.conviction_min, self.conviction_max)),
+            name: float(np.clip(best_action[i], bounds[i][0], bounds[i][1]))
+            for i, name in enumerate(ACTION_NAMES)
         }
 
     # ---- posterior update ----------------------------------------------------
@@ -248,7 +318,7 @@ class RewardPolicy:
     ) -> None:
         """Update posterior with observed (state, action, reward) tuple."""
         reward = compute_reward(daily_return, self.drawdown_penalty)
-        action_vec = np.array([action["exposure_scalar"], action["conviction_scalar"]])
+        action_vec = np.array([action.get(n, 1.0) for n in ACTION_NAMES])
         phi = _build_feature_vector(state_vec, action_vec)
 
         # Bayesian linear regression update (rank-1)
@@ -269,12 +339,11 @@ class RewardPolicy:
         self.state.n_updates += 1
         self.state.cumulative_reward += reward
 
-        # Append to history (compact)
+        # Compact history entry
         self.state.history.append({
             "reward": float(reward),
             "daily_return": float(daily_return),
-            "exposure": action["exposure_scalar"],
-            "conviction": action["conviction_scalar"],
+            **{n: float(action.get(n, 1.0)) for n in ACTION_NAMES},
         })
 
     # ---- helpers ------------------------------------------------------------
@@ -285,7 +354,7 @@ class RewardPolicy:
 
     def summary(self) -> dict[str, Any]:
         """Return a compact summary for logging / run metadata."""
-        return {
+        result: dict[str, Any] = {
             "n_updates": self.state.n_updates,
             "is_warm": self.is_warm,
             "cumulative_reward": round(self.state.cumulative_reward, 6),
@@ -293,6 +362,12 @@ class RewardPolicy:
                 self.state.cumulative_reward / max(self.state.n_updates, 1), 6
             ),
         }
+        if self.state.history:
+            last = self.state.history[-1]
+            result["last_action"] = {
+                n: last.get(n, 1.0) for n in ACTION_NAMES
+            }
+        return result
 
 
 def compute_equity_slope(pnl_history: list[dict[str, Any]], window: int = 5) -> float:
