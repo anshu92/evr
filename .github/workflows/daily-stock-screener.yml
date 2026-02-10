@@ -122,10 +122,14 @@ jobs:
         env:
           MODEL_PATH: "models/ensemble/manifest.json"
           LABEL_HORIZON_DAYS: "5"
-          # Keep this lighter than the dedicated training workflow; it's only a fallback.
+          # Lightweight fallback — just enough for a usable model.
           MAX_TICKERS: "1500"
           FEATURE_LOOKBACK_DAYS: "365"
           BATCH_SIZE: "200"
+          # Disable Optuna and use minimal ensemble for speed
+          USE_OPTUNA: "0"
+          ENSEMBLE_XGB_COUNT: "2"
+          ENSEMBLE_LGBM_COUNT: "1"
         run: |
           if [ -f "$MODEL_PATH" ]; then
             echo "Model manifest found at $MODEL_PATH"

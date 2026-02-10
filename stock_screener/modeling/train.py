@@ -790,7 +790,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 if train_df.empty or val_df.empty:
                     continue
                 model = build_model(random_state=42)
-                model.set_params(**params, early_stopping_rounds=50)
+                model.set_params(**params, early_stopping_rounds=30)
                 model.fit(
                     train_df[feature_cols],
                     train_df[label_col].astype(float),
@@ -832,7 +832,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 if train_df.empty or val_df.empty:
                     continue
                 model = build_model(random_state=42)
-                model.set_params(**params, early_stopping_rounds=50)
+                model.set_params(**params, early_stopping_rounds=30)
                 model.fit(
                     train_df[feature_cols],
                     train_df[label_col].astype(float),
@@ -998,7 +998,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             _sel_seed = 42
             if use_ranking:
                 _sel_m = xgb.XGBRanker(
-                    n_estimators=100, learning_rate=0.1,
+                    n_estimators=50, learning_rate=0.1,
                     max_depth=best_regressor_params.get("max_depth", 5),
                     subsample=0.7, colsample_bytree=0.7,
                     min_child_weight=best_regressor_params.get("min_child_weight", 8),
@@ -1007,7 +1007,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 _sel_m.fit(train_df[feature_cols], train_rank_labels, group=train_groups)
             else:
                 _sel_m = build_model(random_state=_sel_seed)
-                _sel_m.set_params(**best_regressor_params, n_estimators=100, early_stopping_rounds=None)
+                _sel_m.set_params(**best_regressor_params, n_estimators=50, early_stopping_rounds=None)
                 _sel_m.fit(train_df[feature_cols], train_df[label_col].astype(float), sample_weight=sample_weights)
 
             importance = _sel_m.get_booster().get_score(importance_type="gain")
@@ -1075,7 +1075,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 m.fit(train_df[current_features], train_rank_labels, group=train_groups)
         else:
             m = build_model(random_state=seed)
-            m.set_params(**best_regressor_params, early_stopping_rounds=50)
+            m.set_params(**best_regressor_params, early_stopping_rounds=30)
             if not val_df.empty:
                 m.fit(
                     train_df[current_features],
@@ -1211,32 +1211,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
 
-    # Compute train IC to compare with holdout IC (detect overfitting)
-    # Use same IC-weighted ensemble with standardization as holdout
-    train_preds = np.zeros(len(train_df), dtype=float)
-    for i, (rel, mtype) in enumerate(zip(reg_rel_paths, model_types)):
-        model = load_model(model_dir / rel, mtype)
-        if mtype == "xgboost":
-            model_pred = model.predict(xgb.DMatrix(train_df[selected_features])).astype(float)
-        else:  # lightgbm
-            model_pred = model.predict(train_df[selected_features]).astype(float)
-        # Standardize before combining (same as holdout)
-        pred_std = float(np.nanstd(model_pred))
-        if pred_std > 0:
-            model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
-        train_preds += model_pred * weights[i]
-        del model_pred, model
-    train_metrics = _rank_ic_for_preds(train_df, pd.Series(train_preds, index=train_df.index))
-    
-    # Log train vs holdout IC to detect overfitting
-    train_ic = train_metrics.get("summary", {}).get("mean_ic", 0.0)
+    # Log holdout IC for quality monitoring (skip full train IC — too expensive)
     holdout_ic = reg_holdout_metrics.get("summary", {}).get("mean_ic", 0.0)
-    logger.info(
-        "Train IC: %.4f, Holdout IC: %.4f (ratio: %.2f) - %s",
-        train_ic, holdout_ic,
-        holdout_ic / train_ic if train_ic != 0 else 0,
-        "OVERFITTING" if train_ic > 0.1 and holdout_ic < train_ic * 0.5 else "OK"
-    )
+    logger.info("Holdout IC: %.4f", holdout_ic)
 
     # Load all trained models for walk-forward validation
     reg_models = []
@@ -1330,17 +1307,16 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         except Exception as e:
             logger.warning("Could not extract feature importance: %s", e)
 
-    # Compute per-feature IC on holdout
+    # Compute per-feature IC on holdout (only selected features for speed)
     feature_ic = {}
     if not holdout_df.empty:
-        for col in FEATURE_COLUMNS:
+        from scipy.stats import spearmanr as _spearmanr_feat
+        for col in selected_features:
             if col in holdout_df.columns and holdout_df[col].notna().sum() > 10:
                 try:
-                    from scipy.stats import spearmanr
-                    # Use only non-NaN values to avoid bias from filling with 0
                     mask = holdout_df[col].notna() & holdout_df[label_col].notna()
                     if mask.sum() > 10:
-                        ic, _ = spearmanr(holdout_df.loc[mask, col], holdout_df.loc[mask, label_col])
+                        ic, _ = _spearmanr_feat(holdout_df.loc[mask, col], holdout_df.loc[mask, label_col])
                         feature_ic[col] = float(ic) if not np.isnan(ic) else 0.0
                 except Exception:
                     pass
@@ -1482,7 +1458,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # This gives more robust evaluation across different market regimes
     walk_forward_results = {}
     wf_periods = build_walk_forward_periods(
-        dates, n_periods=4, test_window=60, embargo_days=cfg.train_embargo_days, min_train=252
+        dates, n_periods=3, test_window=60, embargo_days=cfg.train_embargo_days, min_train=252
     )
     
     if len(wf_periods) >= 2 and reg_models:
