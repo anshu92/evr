@@ -989,17 +989,68 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     selected_features = feature_cols.copy()
     dropped_features = []
     
+    # ---- Feature selection via a throwaway first model ----
+    # Train a quick model on all features, rank by importance, then keep only
+    # the top-90% cumulative gain.  All real ensemble members train on the
+    # reduced feature set so holdout prediction uses a single feature list.
+    if len(feature_cols) > 10:
+        try:
+            _sel_seed = 42
+            if use_ranking:
+                _sel_m = xgb.XGBRanker(
+                    n_estimators=100, learning_rate=0.1,
+                    max_depth=best_regressor_params.get("max_depth", 5),
+                    subsample=0.7, colsample_bytree=0.7,
+                    min_child_weight=best_regressor_params.get("min_child_weight", 8),
+                    objective="rank:pairwise", n_jobs=0, random_state=_sel_seed,
+                )
+                _sel_m.fit(train_df[feature_cols], train_rank_labels, group=train_groups)
+            else:
+                _sel_m = build_model(random_state=_sel_seed)
+                _sel_m.set_params(**best_regressor_params, n_estimators=100, early_stopping_rounds=None)
+                _sel_m.fit(train_df[feature_cols], train_df[label_col].astype(float), sample_weight=sample_weights)
+
+            importance = _sel_m.get_booster().get_score(importance_type="gain")
+            if importance:
+                feature_name_map = {f"f{j}": fname for j, fname in enumerate(feature_cols)}
+                importance_named = {feature_name_map.get(k, k): v for k, v in importance.items()}
+                sorted_imp = sorted(importance_named.items(), key=lambda x: x[1], reverse=True)
+                total_importance = sum(v for _, v in sorted_imp)
+
+                if total_importance > 0:
+                    cumsum = 0.0
+                    keep_features: list[str] = []
+                    threshold = 0.90
+                    for fname, imp in sorted_imp:
+                        cumsum += imp / total_importance
+                        keep_features.append(fname)
+                        if cumsum >= threshold:
+                            break
+                    min_features = min(10, len(feature_cols))
+                    if len(keep_features) < min_features:
+                        keep_features = [f for f, _ in sorted_imp[:min_features]]
+
+                    dropped_features = [f for f in feature_cols if f not in keep_features]
+                    if dropped_features:
+                        logger.info(
+                            "Feature selection: keeping %d/%d features (%.1f%% importance)",
+                            len(keep_features), len(feature_cols), threshold * 100,
+                        )
+                        logger.info("Dropped features: %s", dropped_features[:10])
+                        selected_features = keep_features
+            del _sel_m
+        except Exception as e:
+            logger.warning("Feature selection failed, using all features: %s", e)
+
     # Train XGBoost models (with ranking or regression objective)
+    # All models use the same selected_features.
     for i in range(n_xgb):
         seed = 42 + i * 10
-        
-        # Use selected_features (may be filtered after first model)
         current_features = selected_features
-        
+
         if use_ranking:
-            # Use XGBRanker for learning-to-rank
             m = xgb.XGBRanker(
-                n_estimators=400,  # Balanced: quality vs speed
+                n_estimators=400,
                 learning_rate=best_regressor_params.get("learning_rate", 0.04),
                 max_depth=best_regressor_params.get("max_depth", 5),
                 subsample=0.75,
@@ -1011,7 +1062,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 n_jobs=0,
                 random_state=seed,
             )
-            # Use integer rank labels for XGBRanker
             if not val_df.empty and val_groups is not None and val_rank_labels is not None:
                 m.fit(
                     train_df[current_features],
@@ -1024,7 +1074,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             else:
                 m.fit(train_df[current_features], train_rank_labels, group=train_groups)
         else:
-            # Use XGBRegressor for regression
             m = build_model(random_state=seed)
             m.set_params(**best_regressor_params, early_stopping_rounds=50)
             if not val_df.empty:
@@ -1037,55 +1086,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 )
             else:
                 m.fit(
-                    train_df[current_features], 
+                    train_df[current_features],
                     train_df[label_col].astype(float),
-                    sample_weight=sample_weights
+                    sample_weight=sample_weights,
                 )
-        
-        # After first model: perform feature selection based on importance
-        if i == 0 and len(feature_cols) > 10:
-            try:
-                # Get feature importances (gain-based)
-                importance = m.get_booster().get_score(importance_type="gain")
-                if importance:
-                    # Map feature names (fX -> actual name)
-                    feature_name_map = {f"f{j}": fname for j, fname in enumerate(current_features)}
-                    importance_named = {feature_name_map.get(k, k): v for k, v in importance.items()}
-                    
-                    # Sort by importance
-                    sorted_imp = sorted(importance_named.items(), key=lambda x: x[1], reverse=True)
-                    total_importance = sum(v for _, v in sorted_imp)
-                    
-                    if total_importance > 0:
-                        # Keep features that account for top 90% of cumulative importance
-                        cumsum = 0.0
-                        keep_features = []
-                        threshold = 0.90  # Keep features up to 90% cumulative importance
-                        
-                        for fname, imp in sorted_imp:
-                            cumsum += imp / total_importance
-                            keep_features.append(fname)
-                            if cumsum >= threshold:
-                                break
-                        
-                        # Always keep at least 10 features
-                        min_features = min(10, len(feature_cols))
-                        if len(keep_features) < min_features:
-                            keep_features = [f for f, _ in sorted_imp[:min_features]]
-                        
-                        # Identify dropped features
-                        dropped_features = [f for f in feature_cols if f not in keep_features]
-                        
-                        if dropped_features:
-                            logger.info(
-                                "Feature selection: keeping %d/%d features (%.1f%% importance)",
-                                len(keep_features), len(feature_cols), threshold * 100
-                            )
-                            logger.info("Dropped features: %s", dropped_features[:10])  # Log first 10
-                            selected_features = keep_features
-            except Exception as e:
-                logger.warning("Feature selection failed, using all features: %s", e)
-        
+
         rel = f"xgb_model_{i}.json"
         save_model(m, model_dir / rel)
         reg_rel_paths.append(rel)
