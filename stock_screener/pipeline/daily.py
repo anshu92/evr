@@ -805,6 +805,7 @@ def run_daily(cfg: Config, logger) -> None:
         screened=screened,
         weights=target_weights,
         prices_cad=prices_cad,
+        scored=scored,
     )
 
     # Build holdings weights from ALL open positions using the full features

@@ -633,6 +633,7 @@ class PortfolioManager:
         screened: pd.DataFrame,
         weights: pd.DataFrame,
         prices_cad: pd.Series,
+        scored: pd.DataFrame | None = None,
     ) -> TradePlan:
         # weights is expected to represent the *target* holdings universe, but we may rotate.
         now = _utcnow()
@@ -802,14 +803,24 @@ class PortfolioManager:
             in_target = t in target_set
             hold_reason = "IN_TARGET" if in_target else "HOLDING"
 
-            # Get pred_return and pred_peak_days from weights if available
+            # Get pred_return and pred_peak_days -- try weights first (target
+            # positions), then screened, then the full scored DataFrame.
             pred_ret = None
             pred_peak_days = None
             try:
-                if in_target and "pred_return" in weights.columns:
-                    pred_ret = float(weights.loc[t, "pred_return"])
-                if in_target and "pred_peak_days" in weights.columns:
-                    pred_peak_days = float(weights.loc[t, "pred_peak_days"])
+                for source in (weights if in_target else None, screened, scored):
+                    if source is None or source.empty or t not in source.index:
+                        continue
+                    if pred_ret is None and "pred_return" in source.columns:
+                        val = source.loc[t, "pred_return"]
+                        if not pd.isna(val):
+                            pred_ret = float(val)
+                    if pred_peak_days is None and "pred_peak_days" in source.columns:
+                        val = source.loc[t, "pred_peak_days"]
+                        if not pd.isna(val):
+                            pred_peak_days = float(val)
+                    if pred_ret is not None and pred_peak_days is not None:
+                        break
             except Exception:
                 pass
             
