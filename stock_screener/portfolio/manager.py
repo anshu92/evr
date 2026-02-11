@@ -416,7 +416,7 @@ class PortfolioManager:
 
             # Peak-target exit: the model predicted the peak day at entry.
             # Sell when we reach that day — capital should be redeployed, not left idle.
-            if self.peak_based_exit and p.entry_pred_peak_days is not None:
+            if self.peak_based_exit and p.entry_pred_peak_days is not None and not pd.isna(p.entry_pred_peak_days):
                 target_day = max(1, int(p.entry_pred_peak_days))
                 if days >= target_day:
                     actions.append(self._sell_position(
@@ -761,9 +761,13 @@ class PortfolioManager:
                 pred_peak_days = None
                 try:
                     if "pred_return" in weights.columns:
-                        pred_ret = float(weights.loc[t, "pred_return"])
+                        v = float(weights.loc[t, "pred_return"])
+                        if not pd.isna(v):
+                            pred_ret = v
                     if "pred_peak_days" in weights.columns:
-                        pred_peak_days = float(weights.loc[t, "pred_peak_days"])
+                        v = float(weights.loc[t, "pred_peak_days"])
+                        if not pd.isna(v):
+                            pred_peak_days = v
                 except Exception:
                     pass
                 
@@ -838,7 +842,7 @@ class PortfolioManager:
             
             # Compute sell date: prefer entry-time peak prediction (stored at BUY),
             # then today's re-prediction, then fallback to max holding days.
-            if p and p.entry_pred_peak_days is not None and p.entry_pred_peak_days > 0:
+            if p and p.entry_pred_peak_days is not None and not pd.isna(p.entry_pred_peak_days) and p.entry_pred_peak_days > 0:
                 # Use peak day stored at entry (consistent with exit logic)
                 peak_day = max(1, int(p.entry_pred_peak_days))
                 sell_dt = p.entry_date + timedelta(days=peak_day)

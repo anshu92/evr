@@ -306,13 +306,13 @@ class Config:
             regime_min_scalar=_get_float("REGIME_MIN_SCALAR", 0.5),
             regime_max_scalar=_get_float("REGIME_MAX_SCALAR", 1.2),
             portfolio_budget_cad=_get_float("PORTFOLIO_BUDGET_CAD", 500.0),
-            max_holding_days=_get_int("MAX_HOLDING_DAYS", 5) or 5,
-            max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 10) or 10,
+            max_holding_days=_get_int("MAX_HOLDING_DAYS", 3) or 3,
+            max_holding_days_hard=_get_int("MAX_HOLDING_DAYS_HARD", 5) or 5,
             peak_based_exit=_get_bool("PEAK_BASED_EXIT", True),
             twr_optimization=_get_bool("TWR_OPTIMIZATION", True),
-            quick_profit_pct=_get_float("QUICK_PROFIT_PCT", 0.05),
-            quick_profit_days=_get_int("QUICK_PROFIT_DAYS", 3) or 3,
-            min_daily_return=_get_float("MIN_DAILY_RETURN", 0.005),
+            quick_profit_pct=_get_float("QUICK_PROFIT_PCT", 0.03),
+            quick_profit_days=_get_int("QUICK_PROFIT_DAYS", 2) or 2,
+            min_daily_return=_get_float("MIN_DAILY_RETURN", 0.008),
             momentum_decay_exit=_get_bool("MOMENTUM_DECAY_EXIT", True),
             extend_hold_min_pred_return=(
                 _get_float("EXTEND_HOLD_MIN_PRED_RETURN", 0.0)
