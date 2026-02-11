@@ -65,6 +65,8 @@ class Config:
     # Training target and objective
     use_market_relative_returns: bool = True  # Train on alpha (stock return - market return) instead of absolute returns
     use_ranking_objective: bool = True  # Use LTR (learning-to-rank) objective instead of regression
+    train_on_peak_return: bool = True  # Train on peak achievable return (max within horizon) instead of end-of-horizon return
+    peak_label_winsorize_n_mad: float = 5.0  # Relaxed winsorization for peak returns (spikes are the signal, not noise)
     
     # Portfolio construction
     sector_neutral_selection: bool = True  # Diversify picks across sectors instead of pure top-N
@@ -114,15 +116,15 @@ class Config:
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
-    max_holding_days: int = 5
-    max_holding_days_hard: int = 10
-    peak_based_exit: bool = True  # Exit at peak (trailing stop) instead of fixed days
+    max_holding_days: int = 3  # Soft cap — peak model drives actual exit
+    max_holding_days_hard: int = 5  # Hard cap — never hold longer (for compounding)
+    peak_based_exit: bool = True  # Exit at predicted peak day, not fixed time
     
     # Time-weighted return optimization
     twr_optimization: bool = True  # Optimize for time-weighted returns
-    quick_profit_pct: float = 0.05  # Take profit if hit 5% gain quickly
-    quick_profit_days: int = 3  # "Quickly" means within 3 days
-    min_daily_return: float = 0.005  # Exit if daily return drops below 0.5%/day
+    quick_profit_pct: float = 0.03  # Take profit at 3% gain quickly (redeploy capital)
+    quick_profit_days: int = 2  # "Quickly" means within 2 days
+    min_daily_return: float = 0.008  # Exit if return/day < 0.8% (redeploy to better picks)
     momentum_decay_exit: bool = True  # Exit when return momentum decelerates
     extend_hold_min_pred_return: float | None = 0.03
     extend_hold_min_score: float | None = None
@@ -273,6 +275,8 @@ class Config:
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
             use_ranking_objective=os.getenv("USE_RANKING_OBJECTIVE", "1").strip() in {"1", "true", "True"},
+            train_on_peak_return=os.getenv("TRAIN_ON_PEAK_RETURN", "1").strip() in {"1", "true", "True"},
+            peak_label_winsorize_n_mad=_get_float("PEAK_LABEL_WINSORIZE_N_MAD", 5.0),
             sector_neutral_selection=os.getenv("SECTOR_NEUTRAL_SELECTION", "1").strip() in {"1", "true", "True"},
             volatility_targeting=os.getenv("VOLATILITY_TARGETING", "1").strip() in {"1", "true", "True"},
             target_volatility=_get_float("TARGET_VOLATILITY", 0.15),

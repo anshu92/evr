@@ -263,6 +263,18 @@ def run_daily(cfg: Config, logger) -> None:
                             features["pred_peak_days"].max(),
                         )
                     
+                    # Compute return-per-day: ranks stocks by how quickly they spike
+                    # pred_return is the predicted peak return (if model trained on peak),
+                    # pred_peak_days is the predicted day of peak
+                    if "pred_peak_days" in features.columns:
+                        safe_days = features["pred_peak_days"].clip(lower=1.0)
+                        features["ret_per_day"] = features["pred_return"] / safe_days
+                        logger.info(
+                            "Return-per-day: mean=%.4f, max=%.4f (optimizing for spike capture)",
+                            features["ret_per_day"].mean(),
+                            features["ret_per_day"].max(),
+                        )
+                    
                     logger.info(
                         "ML predictions: mean=%.4f, confidence range=[%.3f, %.3f]",
                         features["pred_return"].mean(),

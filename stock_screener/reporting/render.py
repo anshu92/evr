@@ -218,7 +218,7 @@ def render_reports(
         lines.append("")
 
     if trade_actions:
-        lines.append("RECOMMENDED ACTIONS (max hold)")
+        lines.append("RECOMMENDED ACTIONS (sell at predicted peak)")
         lines.append("-" * 78)
         for a in trade_actions:
             # Support both dataclass actions and dict-like actions.
@@ -582,7 +582,7 @@ def render_reports(
     Generated: <strong>{_html_escape(now)}</strong>
   </p>
 
-  <h3 style="margin: 0 0 10px 0;">Recommended Actions (max hold)</h3>
+  <h3 style="margin: 0 0 10px 0;">Recommended Actions (sell at predicted peak)</h3>
   <div style="background:#fef3c7;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
     {actions_html}
   </div>

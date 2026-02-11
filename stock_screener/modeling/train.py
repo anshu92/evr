@@ -657,9 +657,28 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Compute market-relative returns (alpha = stock return - market return)
     panel["future_alpha"] = panel["future_ret"] - panel["market_ret"]
     
+    # Peak-based alpha: peak return minus market return (for peak target mode)
+    if "peak_return" in panel.columns:
+        panel["peak_alpha"] = panel["peak_return"] - panel["market_ret"]
+    
     # Configure which target to use for training
+    use_peak_target = getattr(cfg, 'train_on_peak_return', True)
     use_market_relative = getattr(cfg, 'use_market_relative_returns', True)
-    if use_market_relative:
+    
+    if use_peak_target and "peak_return" in panel.columns:
+        if use_market_relative:
+            target_col = "peak_alpha"
+            logger.info(
+                "Training on PEAK market-relative returns (peak achievable return - market return). "
+                "This teaches the model to predict spikes, not diluted horizon returns."
+            )
+        else:
+            target_col = "peak_return"
+            logger.info(
+                "Training on PEAK absolute returns (max achievable return within holding period). "
+                "This teaches the model to predict spikes."
+            )
+    elif use_market_relative:
         target_col = "future_alpha"
         logger.info("Training on market-relative returns (alpha). Market avg will be subtracted.")
     else:
@@ -697,11 +716,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     logger.info("Applying cross-sectional winsorization (MAD-based) and normalization...")
     panel = normalize_features_cross_section(panel, date_col="date")
 
-    # Also winsorize labels to remove extreme outliers (MAD-based)
+    # Winsorize labels to remove extreme outliers (MAD-based)
+    # Use relaxed winsorization for peak targets — spikes are the signal, not noise
+    peak_n_mad = float(getattr(cfg, 'peak_label_winsorize_n_mad', 5.0))
+    
     panel["future_ret"] = panel.groupby("date")["future_ret"].transform(winsorize_mad)
     if "future_alpha" in panel.columns:
         panel["future_alpha"] = panel.groupby("date")["future_alpha"].transform(winsorize_mad)
-    logger.info("Winsorized target labels to reduce outlier impact")
+    if "peak_return" in panel.columns:
+        panel["peak_return"] = panel.groupby("date")["peak_return"].transform(
+            lambda s: winsorize_mad(s, n_mad=peak_n_mad)
+        )
+    if "peak_alpha" in panel.columns:
+        panel["peak_alpha"] = panel.groupby("date")["peak_alpha"].transform(
+            lambda s: winsorize_mad(s, n_mad=peak_n_mad)
+        )
+    logger.info(
+        "Winsorized labels: horizon n_mad=3.0, peak n_mad=%.1f (target=%s)",
+        peak_n_mad, target_col,
+    )
     
     # Validate that required features exist
     missing_features = [c for c in feature_cols if c not in panel.columns]
@@ -1573,6 +1606,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "training_config": {
             "use_market_relative_returns": use_market_relative,
             "use_ranking_objective": use_ranking,
+            "train_on_peak_return": use_peak_target,
             "target_column": label_col,
             "n_xgb_models": n_xgb,
             "n_lgbm_models": n_lgbm,

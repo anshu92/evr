@@ -151,11 +151,12 @@ jobs:
           # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
           USE_ML: "1"
           MODEL_PATH: "models/ensemble/manifest.json"
-          # Short-horizon trading goal
-          MAX_HOLDING_DAYS: "5"
-          MAX_HOLDING_DAYS_HARD: "10"
-          # If the model is very confident, allow holding beyond 5 days up to the hard cap.
-          EXTEND_HOLD_MIN_PRED_RETURN: "0.03"
+          # Quick-compounding: sell at predicted peak, redeploy capital fast
+          MAX_HOLDING_DAYS: "3"
+          MAX_HOLDING_DAYS_HARD: "5"
+          QUICK_PROFIT_PCT: "0.03"
+          QUICK_PROFIT_DAYS: "2"
+          MIN_DAILY_RETURN: "0.008"
           PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
           # Peak detection and partial exit settings
           PEAK_DETECTION_ENABLED: "1"

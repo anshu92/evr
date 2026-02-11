@@ -413,15 +413,28 @@ class PortfolioManager:
                 continue
 
             days = p.days_held(now)
-            # Time exits (skipped if peak_based_exit is enabled):
-            # - Default behavior: exit at max_holding_days (dynamic if enabled).
-            # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
-            # When peak_based_exit is True, we rely on trailing stops instead of fixed time.
-            if not self.peak_based_exit and days >= max_hold:
-                if days >= max_hold_hard:
-                    actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT_HARD", days_held=days))
+
+            # Peak-target exit: the model predicted the peak day at entry.
+            # Sell when we reach that day — capital should be redeployed, not left idle.
+            if self.peak_based_exit and p.entry_pred_peak_days is not None:
+                target_day = max(1, int(p.entry_pred_peak_days))
+                if days >= target_day:
+                    actions.append(self._sell_position(
+                        state, p, price_cad=px,
+                        reason=f"PEAK_TARGET(day{target_day})",
+                        days_held=days,
+                    ))
                     continue
 
+            # Hard time cap — safety net regardless of peak prediction
+            if days >= max_hold_hard:
+                actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT_HARD", days_held=days))
+                continue
+
+            # Time exits (only when peak_based_exit is disabled):
+            # - Default behavior: exit at max_holding_days (dynamic if enabled).
+            # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
+            if not self.peak_based_exit and days >= max_hold:
                 strong = False
                 strong_reason = None
                 if pred_return is not None and self.extend_hold_min_pred_return is not None:
@@ -767,15 +780,14 @@ class PortfolioManager:
                 )
                 state.positions.append(pos)
                 
-                # Compute expected sell date based on predicted peak
+                # Compute expected sell date from predicted peak day
                 if pred_peak_days is not None and pred_peak_days > 0:
-                    # Use ML-predicted peak day
-                    sell_dt = now + timedelta(days=int(pred_peak_days))
-                    expected_sell = sell_dt.strftime("%Y-%m-%d")
+                    peak_day = max(1, int(pred_peak_days))
+                    sell_dt = now + timedelta(days=peak_day)
+                    expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day})"
                 else:
-                    # Fallback to max holding days
-                    sell_dt = now + timedelta(days=self.max_holding_days or 5)
-                    expected_sell = sell_dt.strftime("%Y-%m-%d") + " (max)"
+                    sell_dt = now + timedelta(days=self.max_holding_days or 3)
+                    expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
                 
                 actions.append(
                     TradeAction(
@@ -824,19 +836,25 @@ class PortfolioManager:
             except Exception:
                 pass
             
-            # Compute expected sell date based on predicted peak
-            # Note: pred_peak_days is today's prediction, so sell = now + pred_peak_days
-            if pred_peak_days is not None and pred_peak_days > 0:
-                # Use ML-predicted peak day (from today, since that's when prediction was made)
-                sell_dt = now + timedelta(days=int(pred_peak_days))
-                expected_sell = sell_dt.strftime("%Y-%m-%d")
+            # Compute sell date: prefer entry-time peak prediction (stored at BUY),
+            # then today's re-prediction, then fallback to max holding days.
+            if p and p.entry_pred_peak_days is not None and p.entry_pred_peak_days > 0:
+                # Use peak day stored at entry (consistent with exit logic)
+                peak_day = max(1, int(p.entry_pred_peak_days))
+                sell_dt = p.entry_date + timedelta(days=peak_day)
+                days_left = max(0, (sell_dt - now).days)
+                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day}, {days_left}d left)"
+            elif pred_peak_days is not None and pred_peak_days > 0:
+                # Today's re-prediction (position may not have had peak at entry)
+                peak_day = max(1, int(pred_peak_days))
+                sell_dt = now + timedelta(days=peak_day)
+                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day})"
             elif p and self.max_holding_days:
-                # Fallback to max holding days from entry
                 sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
-                expected_sell = sell_dt.strftime("%Y-%m-%d") + " (max)"
+                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
             else:
-                sell_dt = now + timedelta(days=self.max_holding_days or 5)
-                expected_sell = sell_dt.strftime("%Y-%m-%d") + " (max)"
+                sell_dt = now + timedelta(days=self.max_holding_days or 3)
+                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
             
             actions.append(
                 TradeAction(

@@ -36,10 +36,12 @@ def score_universe(
 
     # Score:
     # - If ML predictions are available, blend them in as the primary alpha term.
+    # - Prefer ret_per_day (return/day = pred_return / pred_peak_days) to maximize daily returns.
     # - Otherwise use a robust baseline factor score.
     has_score = "pred_score" in df.columns and pd.to_numeric(df["pred_score"], errors="coerce").notna().any()
+    has_ret_per_day = "ret_per_day" in df.columns and pd.to_numeric(df["ret_per_day"], errors="coerce").notna().any()
     has_return = "pred_return" in df.columns and pd.to_numeric(df["pred_return"], errors="coerce").notna().any()
-    has_ml = has_score or has_return
+    has_ml = has_score or has_ret_per_day or has_return
 
     baseline = (
         0.60 * _zscore(df["ret_60d"])
@@ -50,10 +52,21 @@ def score_universe(
     )
 
     if has_ml:
-        ml_signal = df["pred_score"] if has_score else df["pred_return"]
+        # Priority: ret_per_day > pred_score > pred_return
+        # ret_per_day = pred_return / pred_peak_days, which ranks stocks by
+        # how quickly they spike — directly optimizing returns per day held.
+        if has_ret_per_day:
+            ml_signal = df["ret_per_day"]
+            ml_label = "ret_per_day (return/day)"
+        elif has_score:
+            ml_signal = df["pred_score"]
+            ml_label = "pred_score"
+        else:
+            ml_signal = df["pred_return"]
+            ml_label = "pred_return"
         ml = _zscore(pd.to_numeric(ml_signal, errors="coerce"))
         score = 0.70 * ml + 0.30 * baseline
-        logger.info("Scoring uses ML blend (70%% ML / 30%% baseline).")
+        logger.info("Scoring uses ML blend: 70%% %s / 30%% baseline.", ml_label)
     else:
         score = baseline
         logger.info("Scoring uses baseline factors (no ML predictions).")
