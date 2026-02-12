@@ -23,7 +23,7 @@ from stock_screener.utils import Universe, ensure_dir, read_json, write_json, su
 suppress_external_warnings()
 from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty, predict_peak_days
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
-from stock_screener.portfolio.manager import PortfolioManager
+from stock_screener.portfolio.manager import PortfolioManager, TradePlan
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
 from stock_screener.reward.tracker import RewardEntry, RewardLog, ActionRewardEntry, ActionRewardLog
 from stock_screener.reward.feedback import (
@@ -819,6 +819,25 @@ def run_daily(cfg: Config, logger) -> None:
         prices_cad=prices_cad,
         scored=scored,
     )
+
+    # Merge exit-based SELL actions (PEAK_TARGET, STOP_LOSS, etc.) into the
+    # trade plan so they appear in the report and email.  Place sells first.
+    if exit_actions:
+        # Avoid duplicates: build_trade_plan may also generate ROTATION sells
+        # for the same tickers that apply_exits already closed.
+        existing_sell_tickers = {
+            a.ticker for a in trade_plan.actions
+            if a.action in ("SELL", "SELL_PARTIAL")
+        }
+        new_sells = [
+            a for a in exit_actions
+            if a.ticker not in existing_sell_tickers
+        ]
+        if new_sells:
+            trade_plan = TradePlan(
+                actions=new_sells + trade_plan.actions,
+                holdings=trade_plan.holdings,
+            )
 
     # Build holdings weights from ALL open positions using the full features
     # DataFrame (not just 'screened'), so positions that have fallen out of
