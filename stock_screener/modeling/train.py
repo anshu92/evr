@@ -661,23 +661,38 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     if "peak_return" in panel.columns:
         panel["peak_alpha"] = panel["peak_return"] - panel["market_ret"]
     
+    # Risk-adjust peak labels: divide by volatility to remove mechanical vol bias.
+    # peak_return ∝ vol (high-vol stocks have mechanically higher peaks from noise).
+    # risk_adj_peak = peak / vol rewards stocks that spike *disproportionately* to
+    # their expected volatility — genuine alpha, not just noise.
+    if "peak_return" in panel.columns and "vol_60d_ann" in panel.columns:
+        safe_vol = panel["vol_60d_ann"].clip(lower=0.10)
+        panel["risk_adj_peak_return"] = panel["peak_return"] / safe_vol
+        if "peak_alpha" in panel.columns:
+            panel["risk_adj_peak_alpha"] = panel["peak_alpha"] / safe_vol
+        logger.info("Computed risk-adjusted peak labels (peak / vol) to remove vol bias")
+    
     # Configure which target to use for training
     use_peak_target = getattr(cfg, 'train_on_peak_return', True)
     use_market_relative = getattr(cfg, 'use_market_relative_returns', True)
     
-    if use_peak_target and "peak_return" in panel.columns:
+    if use_peak_target and "risk_adj_peak_alpha" in panel.columns:
         if use_market_relative:
-            target_col = "peak_alpha"
+            target_col = "risk_adj_peak_alpha"
             logger.info(
-                "Training on PEAK market-relative returns (peak achievable return - market return). "
-                "This teaches the model to predict spikes, not diluted horizon returns."
+                "Training on RISK-ADJUSTED PEAK alpha (peak_alpha / vol). "
+                "This teaches the model to find genuine spikes, not just volatile stocks."
             )
         else:
-            target_col = "peak_return"
+            target_col = "risk_adj_peak_return"
             logger.info(
-                "Training on PEAK absolute returns (max achievable return within holding period). "
-                "This teaches the model to predict spikes."
+                "Training on RISK-ADJUSTED PEAK returns (peak_return / vol). "
+                "This teaches the model to find genuine spikes, not just volatile stocks."
             )
+    elif use_peak_target and "peak_return" in panel.columns:
+        # Fallback if vol_60d_ann missing (shouldn't happen)
+        target_col = "peak_alpha" if use_market_relative else "peak_return"
+        logger.info("Training on raw peak labels (vol_60d_ann missing for risk adjustment)")
     elif use_market_relative:
         target_col = "future_alpha"
         logger.info("Training on market-relative returns (alpha). Market avg will be subtracted.")
@@ -710,6 +725,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     panel = panel[panel["n_days"] >= 90]
     panel = panel[panel["last_close_cad"] >= float(cfg.min_price_cad)]
     panel = panel[panel["avg_dollar_volume_cad"] >= float(cfg.min_avg_dollar_volume_cad)]
+    # Vol cap: exclude ultra-volatile stocks from training (same filter as screening)
+    max_screen_vol = float(getattr(cfg, "max_screen_volatility", 0.80))
+    if "vol_60d_ann" in panel.columns and max_screen_vol > 0:
+        before = len(panel)
+        panel = panel[panel["vol_60d_ann"] <= max_screen_vol]
+        logger.info("Vol cap (%.0f%%): removed %d rows from training", max_screen_vol * 100, before - len(panel))
 
     # CRITICAL: Cross-sectional winsorization and normalization
     # Financial returns are relative games - normalize within each date
@@ -729,6 +750,14 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         )
     if "peak_alpha" in panel.columns:
         panel["peak_alpha"] = panel.groupby("date")["peak_alpha"].transform(
+            lambda s: winsorize_mad(s, n_mad=peak_n_mad)
+        )
+    if "risk_adj_peak_return" in panel.columns:
+        panel["risk_adj_peak_return"] = panel.groupby("date")["risk_adj_peak_return"].transform(
+            lambda s: winsorize_mad(s, n_mad=peak_n_mad)
+        )
+    if "risk_adj_peak_alpha" in panel.columns:
+        panel["risk_adj_peak_alpha"] = panel.groupby("date")["risk_adj_peak_alpha"].transform(
             lambda s: winsorize_mad(s, n_mad=peak_n_mad)
         )
     logger.info(

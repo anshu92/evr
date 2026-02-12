@@ -294,6 +294,7 @@ def run_daily(cfg: Config, logger) -> None:
         min_price_cad=cfg.min_price_cad,
         min_avg_dollar_volume_cad=cfg.min_avg_dollar_volume_cad,
         logger=logger,
+        max_volatility=getattr(cfg, "max_screen_volatility", None),
     )
     n = int(cfg.top_n)
     if n <= 0:

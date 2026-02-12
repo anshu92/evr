@@ -146,8 +146,14 @@ jobs:
           PORTFOLIO_SIZE: "5"
           PORTFOLIO_BUDGET_CAD: "500"
           WEIGHT_CAP: "0.10"
-          MIN_PRICE_CAD: "2.0"
-          MIN_AVG_DOLLAR_VOLUME_CAD: "250000"
+          MIN_PRICE_CAD: "5.0"
+          MIN_AVG_DOLLAR_VOLUME_CAD: "5000000"
+          MAX_SCREEN_VOLATILITY: "0.80"
+          # Entry quality filters (always on)
+          ENTRY_MIN_CONFIDENCE: "0.5"
+          ENTRY_MIN_PRED_RETURN: "0.01"
+          ENTRY_MAX_VOLATILITY: "0.60"
+          ENTRY_MIN_MOMENTUM_5D: "-0.05"
           # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
           USE_ML: "1"
           MODEL_PATH: "models/ensemble/manifest.json"

@@ -18,8 +18,9 @@ class Config:
     feature_lookback_days: int = 180
 
     # Filters
-    min_price_cad: float = 2.0
-    min_avg_dollar_volume_cad: float = 250_000.0
+    min_price_cad: float = 5.0  # Exclude penny stocks (sub-$5 are illiquid, high spread)
+    min_avg_dollar_volume_cad: float = 5_000_000.0  # $5M/day min liquidity
+    max_screen_volatility: float = 0.80  # 80% ann vol cap — exclude ultra-vol junk
 
     # Screening + portfolio
     top_n: int = 50
@@ -169,7 +170,7 @@ class Config:
     # Entry confirmation filters (reduce false positives)
     entry_min_confidence: float | None = 0.5  # Minimum model confidence to enter
     entry_min_pred_return: float | None = 0.01  # Minimum predicted return (calibrated)
-    entry_max_volatility: float | None = 0.60  # Max annualized volatility to enter
+    entry_max_volatility: float | None = 0.60  # Max ann vol to enter (stricter than screen cap)
     entry_min_momentum_5d: float | None = -0.05  # Reject stocks with recent sharp drops
     entry_momentum_alignment: bool = True  # Reject bullish signals with bearish price action
 
@@ -246,8 +247,9 @@ class Config:
             max_total_tickers=_get_int("MAX_TICKERS", 4000),
             liquidity_lookback_days=_get_int("LIQUIDITY_LOOKBACK_DAYS", 30) or 30,
             feature_lookback_days=_get_int("FEATURE_LOOKBACK_DAYS", 180) or 180,
-            min_price_cad=_get_float("MIN_PRICE_CAD", 2.0),
-            min_avg_dollar_volume_cad=_get_float("MIN_AVG_DOLLAR_VOLUME_CAD", 250_000.0),
+            min_price_cad=_get_float("MIN_PRICE_CAD", 5.0),
+            min_avg_dollar_volume_cad=_get_float("MIN_AVG_DOLLAR_VOLUME_CAD", 5_000_000.0),
+            max_screen_volatility=_get_float("MAX_SCREEN_VOLATILITY", 0.80),
             top_n=_get_int("TOP_N", 50) or 50,
             portfolio_size=ps,
             weight_cap=_get_float("WEIGHT_CAP", 0.10),
@@ -371,26 +373,10 @@ class Config:
                 if os.getenv("PEAK_ABOVE_MA_RATIO") not in {None, ""}
                 else None
             ),
-            entry_min_confidence=(
-                _get_float("ENTRY_MIN_CONFIDENCE", 0.5)
-                if os.getenv("ENTRY_MIN_CONFIDENCE") not in {None, ""}
-                else None
-            ),
-            entry_min_pred_return=(
-                _get_float("ENTRY_MIN_PRED_RETURN", 0.01)
-                if os.getenv("ENTRY_MIN_PRED_RETURN") not in {None, ""}
-                else None
-            ),
-            entry_max_volatility=(
-                _get_float("ENTRY_MAX_VOLATILITY", 0.60)
-                if os.getenv("ENTRY_MAX_VOLATILITY") not in {None, ""}
-                else None
-            ),
-            entry_min_momentum_5d=(
-                _get_float("ENTRY_MIN_MOMENTUM_5D", -0.05)
-                if os.getenv("ENTRY_MIN_MOMENTUM_5D") not in {None, ""}
-                else None
-            ),
+            entry_min_confidence=_get_float("ENTRY_MIN_CONFIDENCE", 0.5),
+            entry_min_pred_return=_get_float("ENTRY_MIN_PRED_RETURN", 0.01),
+            entry_max_volatility=_get_float("ENTRY_MAX_VOLATILITY", 0.60),
+            entry_min_momentum_5d=_get_float("ENTRY_MIN_MOMENTUM_5D", -0.05),
             entry_momentum_alignment=os.getenv("ENTRY_MOMENTUM_ALIGNMENT", "1").strip() in {"1", "true", "True"},
             reward_model_enabled=_get_bool("REWARD_MODEL_ENABLED", True),
             reward_log_path=_get_str("REWARD_LOG_PATH", "reward_log.json"),

@@ -61,6 +61,10 @@ jobs:
           MAX_TICKERS: "4000"
           FEATURE_LOOKBACK_DAYS: "730"
           BATCH_SIZE: "250"
+          # Quality filters — train only on investable stocks
+          MIN_PRICE_CAD: "5.0"
+          MIN_AVG_DOLLAR_VOLUME_CAD: "5000000"
+          MAX_SCREEN_VOLATILITY: "0.80"
           # Optuna tuning (8 trials is sufficient; marginal gains diminish fast)
           OPTUNA_N_TRIALS: "8"
           OPTUNA_TIMEOUT_SECONDS: "120"

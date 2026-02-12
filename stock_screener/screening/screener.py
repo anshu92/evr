@@ -18,6 +18,8 @@ def score_universe(
     min_price_cad: float,
     min_avg_dollar_volume_cad: float,
     logger,
+    *,
+    max_volatility: float | None = None,
 ) -> pd.DataFrame:
     """Compute scores for all eligible tickers (no top-N truncation)."""
 
@@ -31,12 +33,21 @@ def score_universe(
     df = df[df["last_close_cad"] >= float(min_price_cad)]
     df = df[df["avg_dollar_volume_cad"] >= float(min_avg_dollar_volume_cad)]
 
+    # Volatility cap — hard filter to exclude ultra-vol junk before scoring.
+    # Without this, high-vol micro-caps dominate because peak_return ∝ vol.
+    if max_volatility is not None and "vol_60d_ann" in df.columns:
+        before = len(df)
+        df = df[df["vol_60d_ann"] <= float(max_volatility)]
+        dropped = before - len(df)
+        if dropped > 0:
+            logger.info("Vol cap (%.0f%%): removed %d tickers", max_volatility * 100, dropped)
+
     if df.empty:
-        raise RuntimeError("No tickers left after liquidity/price filters")
+        raise RuntimeError("No tickers left after liquidity/price/vol filters")
 
     # Score:
     # - If ML predictions are available, blend them in as the primary alpha term.
-    # - Prefer ret_per_day (return/day = pred_return / pred_peak_days) to maximize daily returns.
+    # - Use risk-adjusted ret_per_day (return/day / vol) to prevent vol-chasing.
     # - Otherwise use a robust baseline factor score.
     has_score = "pred_score" in df.columns and pd.to_numeric(df["pred_score"], errors="coerce").notna().any()
     has_ret_per_day = "ret_per_day" in df.columns and pd.to_numeric(df["ret_per_day"], errors="coerce").notna().any()
@@ -52,12 +63,18 @@ def score_universe(
     )
 
     if has_ml:
-        # Priority: ret_per_day > pred_score > pred_return
-        # ret_per_day = pred_return / pred_peak_days, which ranks stocks by
-        # how quickly they spike — directly optimizing returns per day held.
+        # Priority: risk-adj ret_per_day > pred_score > pred_return
+        # Risk-adjust by dividing by vol to prevent high-vol stocks from dominating.
         if has_ret_per_day:
-            ml_signal = df["ret_per_day"]
-            ml_label = "ret_per_day (return/day)"
+            raw_signal = pd.to_numeric(df["ret_per_day"], errors="coerce")
+            # Sharpe-like risk adjustment: return/day / vol
+            if "vol_60d_ann" in df.columns:
+                safe_vol = df["vol_60d_ann"].clip(lower=0.10)
+                ml_signal = raw_signal / safe_vol
+                ml_label = "risk_adj_ret_per_day (return/day/vol)"
+            else:
+                ml_signal = raw_signal
+                ml_label = "ret_per_day (return/day)"
         elif has_score:
             ml_signal = df["pred_score"]
             ml_label = "pred_score"
@@ -65,8 +82,8 @@ def score_universe(
             ml_signal = df["pred_return"]
             ml_label = "pred_return"
         ml = _zscore(pd.to_numeric(ml_signal, errors="coerce"))
-        score = 0.70 * ml + 0.30 * baseline
-        logger.info("Scoring uses ML blend: 70%% %s / 30%% baseline.", ml_label)
+        score = 0.60 * ml + 0.40 * baseline
+        logger.info("Scoring uses ML blend: 60%% %s / 40%% baseline.", ml_label)
     else:
         score = baseline
         logger.info("Scoring uses baseline factors (no ML predictions).")
@@ -155,22 +172,15 @@ def screen_universe(
     top_n: int,
     logger,
     sector_neutral: bool = True,
+    max_volatility: float | None = None,
 ) -> pd.DataFrame:
-    """Filter and rank tickers by a robust multi-factor score.
-    
-    Args:
-        features: Feature DataFrame with tickers
-        min_price_cad: Minimum stock price filter
-        min_avg_dollar_volume_cad: Minimum liquidity filter
-        top_n: Number of stocks to select
-        logger: Logger instance
-        sector_neutral: If True, diversify picks across sectors
-    """
+    """Filter and rank tickers by a robust multi-factor score."""
     scored = score_universe(
         features=features,
         min_price_cad=min_price_cad,
         min_avg_dollar_volume_cad=min_avg_dollar_volume_cad,
         logger=logger,
+        max_volatility=max_volatility,
     )
 
     n = int(top_n)
