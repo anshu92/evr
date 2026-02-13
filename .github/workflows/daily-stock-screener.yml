@@ -100,18 +100,34 @@ jobs:
 
       - name: Download latest trained model
         if: steps.model_artifact.outputs.artifact_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Found latest model artifact: ${{ steps.model_artifact.outputs.artifact_name }} from run ${{ steps.model_artifact.outputs.run_id }}"
-          echo "Clearing cached model to use latest..."
+          echo "Found model: ${{ steps.model_artifact.outputs.artifact_name }} (run ${{ steps.model_artifact.outputs.run_id }})"
           rm -rf models/ensemble/
-          mkdir -p models/ensemble/
 
-      - name: Download artifact
-        if: steps.model_artifact.outputs.artifact_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          artifact-id: ${{ steps.model_artifact.outputs.artifact_id }}
-          path: .
+          # download-artifact@v4 cannot fetch artifacts from other workflow runs.
+          # Use the REST API directly instead (gh cli handles auth + redirects).
+          gh api "repos/${{ github.repository }}/actions/artifacts/${{ steps.model_artifact.outputs.artifact_id }}/zip" > /tmp/model.zip
+          unzip -o /tmp/model.zip -d /tmp/model-extract
+
+          # Handle both possible structures:
+          #   a) artifact preserves workspace-relative path: models/ensemble/*
+          #   b) artifact contains files at root: manifest.json, *.json, *.bin
+          if [ -d "/tmp/model-extract/models/ensemble" ]; then
+            mv /tmp/model-extract/models/ensemble models/ensemble
+          elif [ -f "/tmp/model-extract/manifest.json" ]; then
+            mkdir -p models/ensemble
+            mv /tmp/model-extract/* models/ensemble/
+          else
+            echo "WARNING: Unexpected artifact structure:"
+            find /tmp/model-extract -type f | head -20
+            mkdir -p models/ensemble
+          fi
+
+          rm -rf /tmp/model.zip /tmp/model-extract
+          echo "Model files downloaded:"
+          ls -la models/ensemble/ 2>/dev/null || echo "No model files found"
 
       - name: Install dependencies
         run: |
