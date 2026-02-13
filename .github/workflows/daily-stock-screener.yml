@@ -26,6 +26,7 @@ permissions:
 jobs:
   daily_screener:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -130,6 +131,10 @@ jobs:
           USE_OPTUNA: "0"
           ENSEMBLE_XGB_COUNT: "2"
           ENSEMBLE_LGBM_COUNT: "1"
+          # Quality filters — must match daily screener and full training
+          MIN_PRICE_CAD: "5.0"
+          MIN_AVG_DOLLAR_VOLUME_CAD: "5000000"
+          MAX_SCREEN_VOLATILITY: "0.80"
         run: |
           if [ -f "$MODEL_PATH" ]; then
             echo "Model manifest found at $MODEL_PATH"
@@ -167,7 +172,7 @@ jobs:
           # Peak detection and partial exit settings
           PEAK_DETECTION_ENABLED: "1"
           PEAK_SELL_PORTION_PCT: "0.50"
-          PEAK_MIN_GAIN_PCT: "0.10"
+          PEAK_MIN_GAIN_PCT: "0.04"
           PEAK_MIN_HOLDING_DAYS: "2"
           PEAK_PRED_RETURN_THRESHOLD: "-0.02"
           PEAK_SCORE_PERCENTILE_DROP: "0.30"

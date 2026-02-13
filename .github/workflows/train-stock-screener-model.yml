@@ -11,6 +11,7 @@ on:
 jobs:
   train_model:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -75,7 +76,7 @@ jobs:
           python -m stock_screener.cli train-model --log-level INFO
 
       - name: Upload trained model artifact
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: screener-model-${{ github.run_number }}

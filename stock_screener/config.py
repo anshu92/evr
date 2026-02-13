@@ -265,14 +265,14 @@ class Config:
             train_ensemble_seeds=None,  # Use default in train.py
             train_cv_splits=_get_int("TRAIN_CV_SPLITS", 3) or 3,
             train_val_window_days=_get_int("TRAIN_VAL_WINDOW_DAYS", 60) or 60,
-            train_embargo_days=_get_int("TRAIN_EMBARGO_DAYS", 5) or 5,
+            train_embargo_days=_get_int("TRAIN_EMBARGO_DAYS", 10) or 10,
             fundamentals_cache_ttl_days=_get_int("FUNDAMENTALS_CACHE_TTL_DAYS", 7) or 7,
             use_lightgbm=os.getenv("USE_LIGHTGBM", "1").strip() in {"1", "true", "True"},
             use_optuna=os.getenv("USE_OPTUNA", "1").strip() in {"1", "true", "True"},
-            optuna_n_trials=_get_int("OPTUNA_N_TRIALS", 12) or 12,
-            optuna_timeout_seconds=_get_int("OPTUNA_TIMEOUT_SECONDS", 180) or 180,
+            optuna_n_trials=_get_int("OPTUNA_N_TRIALS", 6) or 6,
+            optuna_timeout_seconds=_get_int("OPTUNA_TIMEOUT_SECONDS", 90) or 90,
             ensemble_xgb_count=_get_int("ENSEMBLE_XGB_COUNT", 3) or 3,
-            ensemble_lgbm_count=_get_int("ENSEMBLE_LGBM_COUNT", 3) or 3,
+            ensemble_lgbm_count=_get_int("ENSEMBLE_LGBM_COUNT", 2) or 2,
             use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
@@ -316,11 +316,7 @@ class Config:
             quick_profit_days=_get_int("QUICK_PROFIT_DAYS", 2) or 2,
             min_daily_return=_get_float("MIN_DAILY_RETURN", 0.008),
             momentum_decay_exit=_get_bool("MOMENTUM_DECAY_EXIT", True),
-            extend_hold_min_pred_return=(
-                _get_float("EXTEND_HOLD_MIN_PRED_RETURN", 0.0)
-                if os.getenv("EXTEND_HOLD_MIN_PRED_RETURN") not in {None, ""}
-                else None
-            ),
+            extend_hold_min_pred_return=_get_float("EXTEND_HOLD_MIN_PRED_RETURN", 0.03),
             extend_hold_min_score=(
                 _get_float("EXTEND_HOLD_MIN_SCORE", 0.0) if os.getenv("EXTEND_HOLD_MIN_SCORE") not in {None, ""} else None
             ),

@@ -802,6 +802,12 @@ def run_daily(cfg: Config, logger) -> None:
     if exit_actions:
         sells = len([a for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")])
         logger.info("Exited %s position(s) (time/stop/target/peak).", sells)
+        # Persist state immediately after exits so position closures and cash
+        # updates are not lost if the pipeline crashes before build_trade_plan.
+        try:
+            save_portfolio_state(cfg.portfolio_state_path, state)
+        except Exception as e:
+            logger.warning("Could not save portfolio state after exits: %s", e)
 
     # Add pred_return and pred_peak_days to target_weights for email reporting
     if "pred_return" in screened.columns:
