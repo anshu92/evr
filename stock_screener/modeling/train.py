@@ -682,20 +682,19 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # (sell prices, entry filters, etc.) receives interpretable return values.
     calibration_col = None  # set below alongside target_col
 
-    if use_peak_target and "risk_adj_peak_alpha" in panel.columns:
+    if use_peak_target and "peak_alpha" in panel.columns:
         if use_market_relative:
-            target_col = "risk_adj_peak_alpha"
-            calibration_col = "peak_alpha"
+            target_col = "peak_alpha"
+            calibration_col = None  # Same column, no separate calibration needed
             logger.info(
-                "Training on RISK-ADJUSTED PEAK alpha (peak_alpha / vol). "
-                "Calibration will map predictions back to actual peak_alpha (return space)."
+                "Training on PEAK alpha (market-relative peak return). "
+                "Direct target — no risk-adjustment (vol is a feature, not label divisor)."
             )
         else:
-            target_col = "risk_adj_peak_return"
-            calibration_col = "peak_return"
+            target_col = "peak_return"
+            calibration_col = None
             logger.info(
-                "Training on RISK-ADJUSTED PEAK returns (peak_return / vol). "
-                "Calibration will map predictions back to actual peak_return."
+                "Training on PEAK returns (absolute peak return within horizon)."
             )
     elif use_peak_target and "peak_return" in panel.columns:
         # Fallback if vol_60d_ann missing (shouldn't happen)
@@ -1013,39 +1012,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     
     objective_type = "LTR (rank)" if use_ranking else "regression"
     
-    # PRE-TRAINING FEATURE IC SELECTION: Drop features with negative IC on validation data
-    # This removes features that are inversely correlated with future returns
-    pre_training_ic = {}
-    if not val_df.empty and len(feature_cols) > 10:
-        from scipy.stats import spearmanr
-        for col in feature_cols:
-            if col in val_df.columns and val_df[col].notna().sum() > 100:
-                try:
-                    mask = val_df[col].notna() & val_df[label_col].notna()
-                    if mask.sum() > 100:
-                        ic, _ = spearmanr(val_df.loc[mask, col], val_df.loc[mask, label_col])
-                        if not np.isnan(ic):
-                            pre_training_ic[col] = float(ic)
-                except Exception:
-                    pass
-        
-        # Keep only features with non-negative IC (neutral or helpful)
-        positive_ic_features = [f for f in feature_cols if pre_training_ic.get(f, 0.0) >= -0.01]
-        negative_ic_features = [f for f in feature_cols if pre_training_ic.get(f, 0.0) < -0.01]
-        
-        # Always keep at least 50% of features
-        min_features = max(15, len(feature_cols) // 2)
-        if len(positive_ic_features) >= min_features:
-            logger.info(
-                "IC-based feature selection: keeping %d/%d features (dropped %d with IC < -0.01)",
-                len(positive_ic_features), len(feature_cols), len(negative_ic_features)
-            )
-            if negative_ic_features:
-                # Log features with most negative IC
-                worst_features = sorted([(f, pre_training_ic.get(f, 0)) for f in negative_ic_features], key=lambda x: x[1])[:5]
-                logger.info("Dropped features (worst IC): %s", [(f, f"{ic:.3f}") for f, ic in worst_features])
-            feature_cols = positive_ic_features
-    
+    # NOTE: IC-based feature pre-selection was removed — per-feature IC on a
+    # 60-day validation slice is too noisy and can drop features that are
+    # predictive on the holdout.  Let the tree models decide importance.
+
     logger.info(
         "Training mixed ensemble: %d XGBoost + %d LightGBM models on %s samples, %s tickers (%s)",
         n_xgb,
@@ -1090,7 +1060,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 if total_importance > 0:
                     cumsum = 0.0
                     keep_features: list[str] = []
-                    threshold = 0.90
+                    threshold = 0.95  # Keep 95% of signal — avoid over-pruning
                     for fname, imp in sorted_imp:
                         cumsum += imp / total_importance
                         keep_features.append(fname)
@@ -1168,14 +1138,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         logger.info("Trained XGBoost %s model %d/%d", "ranker" if use_ranking else "regressor", i+1, n_xgb)
     
     # Train LightGBM models if enabled (using selected features)
-    # Use QUANTILE TRANSFORMATION: convert continuous target to cross-sectional percentile rank
-    # This is more robust to outliers and focuses on relative ranking
+    # Use the SAME target as XGBoost for ensemble consistency.  Predictions are
+    # z-scored before blending anyway, so keeping the same label space avoids
+    # the signal loss that quantile-transformation introduces.
     if use_lgbm and n_lgbm > 0:
-        # Transform target to cross-sectional percentile rank (0-1 scale)
-        train_target_quantile = train_df.groupby("date")[label_col].rank(pct=True).astype(float)
-        val_target_quantile = val_df.groupby("date")[label_col].rank(pct=True).astype(float) if not val_df.empty else None
-        logger.info("Using quantile-transformed target for LightGBM (more robust to outliers)")
-        
         for i in range(n_lgbm):
             seed = 42 + i * 10
             m = build_lgbm_model(random_state=seed)
@@ -1183,25 +1149,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             lgbm_params = {
                 "max_depth": best_regressor_params.get("max_depth", 6),
                 "learning_rate": best_regressor_params.get("learning_rate", 0.05),
-                "min_child_samples": best_regressor_params.get("min_child_weight", 5) * 4,  # Approximate conversion
+                "min_child_samples": best_regressor_params.get("min_child_weight", 5) * 4,
                 "subsample": best_regressor_params.get("subsample", 0.8),
                 "colsample_bytree": best_regressor_params.get("colsample_bytree", 0.8),
                 "reg_lambda": best_regressor_params.get("reg_lambda", 1.0),
             }
             m.set_params(**lgbm_params)
-            if not val_df.empty and val_target_quantile is not None:
+            if not val_df.empty:
                 m.fit(
                     train_df[selected_features],
-                    train_target_quantile,  # Use quantile-transformed target
+                    train_df[label_col].astype(float),
                     sample_weight=sample_weights,
-                    eval_set=[(val_df[selected_features], val_target_quantile)],
-                    callbacks=[],  # Disable callbacks to reduce verbosity
+                    eval_set=[(val_df[selected_features], val_df[label_col].astype(float))],
+                    callbacks=[],
                 )
             else:
                 m.fit(
-                    train_df[selected_features], 
-                    train_target_quantile,  # Use quantile-transformed target
-                    sample_weight=sample_weights
+                    train_df[selected_features],
+                    train_df[label_col].astype(float),
+                    sample_weight=sample_weights,
                 )
             rel = f"lgbm_model_{i}.txt"
             save_model(m, model_dir / rel)

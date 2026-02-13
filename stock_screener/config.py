@@ -268,7 +268,7 @@ class Config:
             train_embargo_days=_get_int("TRAIN_EMBARGO_DAYS", 10) or 10,
             fundamentals_cache_ttl_days=_get_int("FUNDAMENTALS_CACHE_TTL_DAYS", 7) or 7,
             use_lightgbm=os.getenv("USE_LIGHTGBM", "1").strip() in {"1", "true", "True"},
-            use_optuna=os.getenv("USE_OPTUNA", "1").strip() in {"1", "true", "True"},
+            use_optuna=os.getenv("USE_OPTUNA", "0").strip() in {"1", "true", "True"},
             optuna_n_trials=_get_int("OPTUNA_N_TRIALS", 6) or 6,
             optuna_timeout_seconds=_get_int("OPTUNA_TIMEOUT_SECONDS", 90) or 90,
             ensemble_xgb_count=_get_int("ENSEMBLE_XGB_COUNT", 3) or 3,
