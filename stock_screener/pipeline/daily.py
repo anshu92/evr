@@ -856,6 +856,19 @@ def run_daily(cfg: Config, logger) -> None:
     # the report, even tickers that dropped out of the screened top-N.
     if "score" not in holdings_features.columns and "score" in scored.columns:
         holdings_features["score"] = scored["score"].reindex(holdings_features.index)
+    # Positions filtered out by quality gates (vol cap, price, liquidity) won't
+    # appear in 'scored' and will have NaN score.  Compute a simple proxy so the
+    # report never shows NaN in the score column.
+    if "score" in holdings_features.columns:
+        import numpy as np
+        missing_score = holdings_features["score"].isna()
+        if missing_score.any():
+            proxy = pd.Series(0.0, index=holdings_features.index)
+            if "ret_60d" in holdings_features.columns:
+                proxy += pd.to_numeric(holdings_features["ret_60d"], errors="coerce").fillna(0)
+            if "ret_120d" in holdings_features.columns:
+                proxy += 0.5 * pd.to_numeric(holdings_features["ret_120d"], errors="coerce").fillna(0)
+            holdings_features.loc[missing_score, "score"] = proxy[missing_score]
     holdings_features = holdings_features.sort_values("score" if "score" in holdings_features.columns else "last_close_cad", ascending=False)
     if holdings_features.empty:
         holdings_weights = holdings_features.copy()
