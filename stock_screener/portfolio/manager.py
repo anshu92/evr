@@ -13,29 +13,130 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+# ---------------------------------------------------------------------------
+# Trading-day calendar: weekdays minus NYSE market holidays.
+# Self-contained — no external dependency required.
+# ---------------------------------------------------------------------------
+from datetime import date as _date
+
+_HOLIDAY_CACHE: dict[int, set] = {}
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> _date:
+    """Return the Nth occurrence of a weekday in a month (1-indexed)."""
+    first = _date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> _date:
+    """Return the last occurrence of a weekday in a month."""
+    if month == 12:
+        last_day = _date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_day = _date(year, month + 1, 1) - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+
+def _observed(d: _date) -> _date:
+    """Shift a fixed holiday to the observed weekday (Fri if Sat, Mon if Sun)."""
+    if d.weekday() == 5:  # Saturday → Friday
+        return d - timedelta(days=1)
+    if d.weekday() == 6:  # Sunday → Monday
+        return d + timedelta(days=1)
+    return d
+
+
+def _easter(year: int) -> _date:
+    """Compute Easter Sunday using the Anonymous Gregorian algorithm."""
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return _date(year, month, day + 1)
+
+
+def _nyse_holidays(year: int) -> set:
+    """Compute NYSE market holidays for a given year."""
+    if year in _HOLIDAY_CACHE:
+        return _HOLIDAY_CACHE[year]
+
+    holidays = set()
+
+    # New Year's Day (Jan 1)
+    holidays.add(_observed(_date(year, 1, 1)))
+
+    # Martin Luther King Jr. Day (3rd Monday in January)
+    holidays.add(_nth_weekday(year, 1, 0, 3))  # 0 = Monday
+
+    # Presidents' Day (3rd Monday in February)
+    holidays.add(_nth_weekday(year, 2, 0, 3))
+
+    # Good Friday (2 days before Easter Sunday)
+    holidays.add(_easter(year) - timedelta(days=2))
+
+    # Memorial Day (last Monday in May)
+    holidays.add(_last_weekday(year, 5, 0))
+
+    # Juneteenth (June 19) — observed since 2022
+    if year >= 2022:
+        holidays.add(_observed(_date(year, 6, 19)))
+
+    # Independence Day (July 4)
+    holidays.add(_observed(_date(year, 7, 4)))
+
+    # Labor Day (1st Monday in September)
+    holidays.add(_nth_weekday(year, 9, 0, 1))
+
+    # Thanksgiving (4th Thursday in November)
+    holidays.add(_nth_weekday(year, 11, 3, 4))  # 3 = Thursday
+
+    # Christmas (December 25)
+    holidays.add(_observed(_date(year, 12, 25)))
+
+    _HOLIDAY_CACHE[year] = holidays
+    return holidays
+
+
+def _is_trading_day(d) -> bool:
+    """Check if a date is a trading day (weekday + not an NYSE holiday)."""
+    if hasattr(d, "date"):
+        d = d.date()
+    if d.weekday() >= 5:
+        return False
+    return d not in _nyse_holidays(d.year)
+
+
 def _trading_days_between(start: datetime, end: datetime) -> int:
-    """Count trading days (Mon-Fri) between two dates, excluding start, including end."""
+    """Count trading days between two dates, excluding start, including end."""
     if end <= start:
         return 0
     count = 0
     d = start.date() + timedelta(days=1)
     end_d = end.date()
     while d <= end_d:
-        if d.weekday() < 5:  # Mon=0 .. Fri=4
+        if _is_trading_day(d):
             count += 1
         d += timedelta(days=1)
     return count
 
 
 def _add_trading_days(start: datetime, trading_days: int) -> datetime:
-    """Return the date that is N trading days after start."""
+    """Return the datetime that is N trading days after start."""
     if trading_days <= 0:
         return start
     d = start
     added = 0
     while added < trading_days:
         d += timedelta(days=1)
-        if d.weekday() < 5:  # Mon-Fri
+        if _is_trading_day(d):
             added += 1
     return d
 
