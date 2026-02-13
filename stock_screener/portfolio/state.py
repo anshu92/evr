@@ -31,7 +31,8 @@ class Position:
     exit_date: datetime | None = None
     exit_reason: str | None = None
     highest_price: float | None = None  # Peak price for trailing stop
-    entry_pred_peak_days: float | None = None  # Predicted peak at entry (for tracking)
+    entry_pred_peak_days: float | None = None  # Predicted peak day at entry
+    entry_pred_return: float | None = None  # Predicted return at entry (for sell target)
 
     def days_held(self, now: datetime | None = None) -> int:
         n = now or _utcnow()
@@ -80,6 +81,7 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
             exit_reason=raw.get("exit_reason"),
             highest_price=raw.get("highest_price"),
             entry_pred_peak_days=raw.get("entry_pred_peak_days"),
+            entry_pred_return=raw.get("entry_pred_return"),
         )
         if pos.ticker and pos.shares > 0:
             positions.append(pos)

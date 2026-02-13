@@ -414,14 +414,43 @@ class PortfolioManager:
 
             days = p.days_held(now)
 
-            # Peak-target exit: the model predicted the peak day at entry.
-            # Sell when we reach that day — capital should be redeployed, not left idle.
-            if self.peak_based_exit and p.entry_pred_peak_days is not None and not pd.isna(p.entry_pred_peak_days):
-                target_day = max(1, int(p.entry_pred_peak_days))
-                if days >= target_day:
+            # Adaptive peak-target exit: combine entry-time and today's predictions.
+            # Use whichever says "peak has passed" first — conservative approach that
+            # reacts to new information without endlessly extending hold periods.
+            if self.peak_based_exit:
+                entry_target = None
+                if p.entry_pred_peak_days is not None and not pd.isna(p.entry_pred_peak_days):
+                    entry_target = max(1, int(p.entry_pred_peak_days))
+
+                # Today's prediction: how many days from NOW until peak
+                today_target = None
+                if features is not None and p.ticker in features.index and "pred_peak_days" in features.columns:
+                    v = features.loc[p.ticker, "pred_peak_days"]
+                    if not pd.isna(v) and float(v) > 0:
+                        # Convert "days from today" to "days from entry" for comparison
+                        today_target = days + max(1, int(float(v)))
+
+                # Choose the tighter (earlier) target
+                effective_target = None
+                exit_source = None
+                if entry_target is not None and today_target is not None:
+                    if today_target <= entry_target:
+                        effective_target = today_target
+                        exit_source = "updated"
+                    else:
+                        effective_target = entry_target
+                        exit_source = "entry"
+                elif entry_target is not None:
+                    effective_target = entry_target
+                    exit_source = "entry"
+                elif today_target is not None:
+                    effective_target = today_target
+                    exit_source = "updated"
+
+                if effective_target is not None and days >= effective_target:
                     actions.append(self._sell_position(
                         state, p, price_cad=px,
-                        reason=f"PEAK_TARGET(day{target_day})",
+                        reason=f"PEAK_TARGET(day{effective_target},{exit_source})",
                         days_held=days,
                     ))
                     continue
@@ -647,6 +676,7 @@ class PortfolioManager:
         weights: pd.DataFrame,
         prices_cad: pd.Series,
         scored: pd.DataFrame | None = None,
+        features: pd.DataFrame | None = None,
     ) -> TradePlan:
         # weights is expected to represent the *target* holdings universe, but we may rotate.
         now = _utcnow()
@@ -780,7 +810,8 @@ class PortfolioManager:
                     shares=float(shares),  # Fractional shares
                     stop_loss_pct=self.stop_loss_pct,
                     take_profit_pct=self.take_profit_pct,
-                    entry_pred_peak_days=pred_peak_days,  # Store prediction at entry
+                    entry_pred_peak_days=pred_peak_days,
+                    entry_pred_return=pred_ret,
                 )
                 state.positions.append(pos)
                 
@@ -819,12 +850,15 @@ class PortfolioManager:
             in_target = t in target_set
             hold_reason = "IN_TARGET" if in_target else "HOLDING"
 
-            # Get pred_return and pred_peak_days -- try weights first (target
-            # positions), then screened, then the full scored DataFrame.
+            # Get pred_return and pred_peak_days -- cascade through progressively
+            # broader DataFrames: weights → screened → scored → features (unfiltered).
+            # The features fallback ensures held positions that were filtered out by
+            # quality gates (vol cap, price, liquidity) still show predictions.
             pred_ret = None
             pred_peak_days = None
             try:
-                for source in (weights if in_target else None, screened, scored):
+                sources = [weights if in_target else None, screened, scored, features]
+                for source in sources:
                     if source is None or source.empty or t not in source.index:
                         continue
                     if pred_ret is None and "pred_return" in source.columns:
@@ -840,25 +874,48 @@ class PortfolioManager:
             except Exception:
                 pass
             
-            # Compute sell date: prefer entry-time peak prediction (stored at BUY),
-            # then today's re-prediction, then fallback to max holding days.
+            # Adaptive sell date: mirrors the exit logic — use the earlier of
+            # entry prediction and today's prediction (whichever triggers first).
+            entry_peak = None
+            today_peak = None
             if p and p.entry_pred_peak_days is not None and not pd.isna(p.entry_pred_peak_days) and p.entry_pred_peak_days > 0:
-                # Use peak day stored at entry (consistent with exit logic)
-                peak_day = max(1, int(p.entry_pred_peak_days))
-                sell_dt = p.entry_date + timedelta(days=peak_day)
+                entry_peak = max(1, int(p.entry_pred_peak_days))
+            if pred_peak_days is not None and pred_peak_days > 0:
+                today_peak = max(1, int(pred_peak_days))
+
+            if entry_peak is not None or today_peak is not None:
+                # Convert both to absolute sell dates
+                entry_sell_dt = p.entry_date + timedelta(days=entry_peak) if entry_peak and p else None
+                today_sell_dt = now + timedelta(days=today_peak) if today_peak else None
+
+                # Pick the earlier date (adaptive: react to new info)
+                if entry_sell_dt and today_sell_dt:
+                    if today_sell_dt <= entry_sell_dt:
+                        sell_dt = today_sell_dt
+                        source = "updated"
+                    else:
+                        sell_dt = entry_sell_dt
+                        source = "entry"
+                elif entry_sell_dt:
+                    sell_dt = entry_sell_dt
+                    source = "entry"
+                else:
+                    sell_dt = today_sell_dt
+                    source = "updated"
+
                 days_left = max(0, (sell_dt - now).days)
-                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day}, {days_left}d left)"
-            elif pred_peak_days is not None and pred_peak_days > 0:
-                # Today's re-prediction (position may not have had peak at entry)
-                peak_day = max(1, int(pred_peak_days))
-                sell_dt = now + timedelta(days=peak_day)
-                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day})"
+                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} ({source}, {days_left}d left)"
             elif p and self.max_holding_days:
                 sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
             else:
                 sell_dt = now + timedelta(days=self.max_holding_days or 3)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
+            
+            # For sell price: prefer today's prediction (latest info),
+            # fall back to entry prediction for positions filtered from scoring.
+            if pred_ret is None and p and p.entry_pred_return is not None and not pd.isna(p.entry_pred_return):
+                pred_ret = float(p.entry_pred_return)
             
             actions.append(
                 TradeAction(

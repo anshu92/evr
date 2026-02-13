@@ -819,6 +819,7 @@ def run_daily(cfg: Config, logger) -> None:
         weights=target_weights,
         prices_cad=prices_cad,
         scored=scored,
+        features=features,
     )
 
     # Merge exit-based SELL actions (PEAK_TARGET, STOP_LOSS, etc.) into the
