@@ -13,6 +13,33 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+def _trading_days_between(start: datetime, end: datetime) -> int:
+    """Count trading days (Mon-Fri) between two dates, excluding start, including end."""
+    if end <= start:
+        return 0
+    count = 0
+    d = start.date() + timedelta(days=1)
+    end_d = end.date()
+    while d <= end_d:
+        if d.weekday() < 5:  # Mon=0 .. Fri=4
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
+def _add_trading_days(start: datetime, trading_days: int) -> datetime:
+    """Return the date that is N trading days after start."""
+    if trading_days <= 0:
+        return start
+    d = start
+    added = 0
+    while added < trading_days:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # Mon-Fri
+            added += 1
+    return d
+
+
 @dataclass(frozen=True)
 class TradeAction:
     ticker: str
@@ -412,22 +439,22 @@ class PortfolioManager:
                 keep.append(p)
                 continue
 
-            days = p.days_held(now)
+            cal_days = p.days_held(now)  # calendar days (for logging)
+            days = _trading_days_between(p.entry_date, now)  # trading days (matches model)
 
             # Adaptive peak-target exit: combine entry-time and today's predictions.
-            # Use whichever says "peak has passed" first — conservative approach that
-            # reacts to new information without endlessly extending hold periods.
+            # pred_peak_days is in trading days (model trained on trading-day rows).
             if self.peak_based_exit:
                 entry_target = None
                 if p.entry_pred_peak_days is not None and not pd.isna(p.entry_pred_peak_days):
                     entry_target = max(1, int(p.entry_pred_peak_days))
 
-                # Today's prediction: how many days from NOW until peak
+                # Today's prediction: how many trading days from NOW until peak
                 today_target = None
                 if features is not None and p.ticker in features.index and "pred_peak_days" in features.columns:
                     v = features.loc[p.ticker, "pred_peak_days"]
                     if not pd.isna(v) and float(v) > 0:
-                        # Convert "days from today" to "days from entry" for comparison
+                        # Convert "trading days from today" to "trading days from entry"
                         today_target = days + max(1, int(float(v)))
 
                 # Choose the tighter (earlier) target
@@ -815,13 +842,14 @@ class PortfolioManager:
                 )
                 state.positions.append(pos)
                 
-                # Compute expected sell date from predicted peak day
+                # Compute expected sell date from predicted peak day.
+                # pred_peak_days is in trading days (model trained on trading-day data).
                 if pred_peak_days is not None and pred_peak_days > 0:
                     peak_day = max(1, int(pred_peak_days))
-                    sell_dt = now + timedelta(days=peak_day)
+                    sell_dt = _add_trading_days(now, peak_day)
                     expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day})"
                 else:
-                    sell_dt = now + timedelta(days=self.max_holding_days or 3)
+                    sell_dt = _add_trading_days(now, self.max_holding_days or 3)
                     expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
                 
                 actions.append(
@@ -845,7 +873,7 @@ class PortfolioManager:
                 continue  # Already have a BUY/SELL action for this ticker
             p = open_by_ticker.get(t)
             px = float(prices_cad.get(t, float("nan")))
-            days = p.days_held(now) if p else None
+            days = _trading_days_between(p.entry_date, now) if p else None
 
             in_target = t in target_set
             hold_reason = "IN_TARGET" if in_target else "HOLDING"
@@ -884,9 +912,9 @@ class PortfolioManager:
                 today_peak = max(1, int(pred_peak_days))
 
             if entry_peak is not None or today_peak is not None:
-                # Convert both to absolute sell dates
-                entry_sell_dt = p.entry_date + timedelta(days=entry_peak) if entry_peak and p else None
-                today_sell_dt = now + timedelta(days=today_peak) if today_peak else None
+                # Convert trading-day offsets to actual calendar sell dates.
+                entry_sell_dt = _add_trading_days(p.entry_date, entry_peak) if entry_peak and p else None
+                today_sell_dt = _add_trading_days(now, today_peak) if today_peak else None
 
                 # Pick the earlier date (adaptive: react to new info)
                 if entry_sell_dt and today_sell_dt:
@@ -903,13 +931,13 @@ class PortfolioManager:
                     sell_dt = today_sell_dt
                     source = "updated"
 
-                days_left = max(0, (sell_dt - now).days)
-                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} ({source}, {days_left}d left)"
+                days_left = _trading_days_between(now, sell_dt)
+                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} ({source}, {days_left}td left)"
             elif p and self.max_holding_days:
-                sell_dt = p.entry_date + timedelta(days=self.max_holding_days)
+                sell_dt = _add_trading_days(p.entry_date, self.max_holding_days)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
             else:
-                sell_dt = now + timedelta(days=self.max_holding_days or 3)
+                sell_dt = _add_trading_days(now, self.max_holding_days or 3)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
             
             # For sell price: prefer today's prediction (latest info),
