@@ -676,18 +676,26 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     use_peak_target = getattr(cfg, 'train_on_peak_return', True)
     use_market_relative = getattr(cfg, 'use_market_relative_returns', True)
     
+    # calibration_col: the column used to build the calibration map at inference.
+    # We train on risk-adjusted labels (model learns vol-independent patterns),
+    # but calibrate predictions to actual-return space so downstream code
+    # (sell prices, entry filters, etc.) receives interpretable return values.
+    calibration_col = None  # set below alongside target_col
+
     if use_peak_target and "risk_adj_peak_alpha" in panel.columns:
         if use_market_relative:
             target_col = "risk_adj_peak_alpha"
+            calibration_col = "peak_alpha"
             logger.info(
                 "Training on RISK-ADJUSTED PEAK alpha (peak_alpha / vol). "
-                "This teaches the model to find genuine spikes, not just volatile stocks."
+                "Calibration will map predictions back to actual peak_alpha (return space)."
             )
         else:
             target_col = "risk_adj_peak_return"
+            calibration_col = "peak_return"
             logger.info(
                 "Training on RISK-ADJUSTED PEAK returns (peak_return / vol). "
-                "This teaches the model to find genuine spikes, not just volatile stocks."
+                "Calibration will map predictions back to actual peak_return."
             )
     elif use_peak_target and "peak_return" in panel.columns:
         # Fallback if vol_60d_ann missing (shouldn't happen)
@@ -1637,6 +1645,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "use_ranking_objective": use_ranking,
             "train_on_peak_return": use_peak_target,
             "target_column": label_col,
+            "calibration_column": calibration_col or label_col,
             "n_xgb_models": n_xgb,
             "n_lgbm_models": n_lgbm,
         },
@@ -1649,6 +1658,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "filters": {
             "min_price_cad": float(cfg.min_price_cad),
             "min_avg_dollar_volume_cad": float(cfg.min_avg_dollar_volume_cad),
+            "max_screen_volatility": float(getattr(cfg, "max_screen_volatility", 0.80)),
             "min_history_days": 90,
         },
         "regressor": {
@@ -1673,9 +1683,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "feature_importance": feature_importance,
         "feature_ic": feature_ic,  # Per-feature IC for adaptive selection
         "model_ics": model_ics,  # Per-model IC for ensemble weighting
-        # Calibration map for realistic prediction magnitudes
-        # Use label_col (future_alpha or future_ret) for calibration to match training target
-        "prediction_calibration": build_calibration_map(panel[label_col].dropna(), n_quantiles=20),
+        # Calibration map: maps prediction ranks to actual return magnitudes.
+        # When training on risk-adjusted labels, we calibrate to the ACTUAL return
+        # distribution (e.g. peak_alpha) so pred_return is in interpretable units
+        # for sell prices, entry filters, and reporting.
+        "prediction_calibration": build_calibration_map(
+            panel[calibration_col or label_col].dropna(), n_quantiles=20
+        ),
         # Target encodings for inference
         "target_encodings": {
             "sector": sector_encodings,
