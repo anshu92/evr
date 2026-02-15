@@ -90,7 +90,7 @@ def compute_inverse_vol_weights(
         )
     w = _cap_weights(w, cap, allow_cash=allow_cash)
     w = w.fillna(0.0)
-    if w.sum() > 0:
+    if (not allow_cash) and w.sum() > 0:
         w = w / w.sum()
 
     out = df.copy()
@@ -179,7 +179,7 @@ def apply_confidence_weighting(
     """Adjust position sizes by model confidence."""
     result = weights_df.copy()
     
-    if confidence is None:
+    if confidence is None and "pred_confidence" not in result.columns:
         if logger:
             logger.info("No confidence data provided, skipping confidence weighting")
         return result
@@ -735,9 +735,11 @@ def apply_correlation_limits(
                     adjustments_made += 1
                     pairs_adjusted.append((ticker1, ticker2, corr))
         
-        # Renormalize
+        # Do not renormalize upward after applying pair limits.
+        # Pair adjustments intentionally reduce gross exposure; scaling up would
+        # re-violate the pair cap constraint.
         weight_sum = result["weight"].sum()
-        if weight_sum > 0:
+        if weight_sum > 1.0:
             result["weight"] = result["weight"] / weight_sum
         
         if logger and adjustments_made > 0:
@@ -916,41 +918,70 @@ def apply_max_position_cap(
     if result.empty or "weight" not in result.columns:
         return result
     
-    capped_count = 0
-    excess_weight = 0.0
-    
-    # Cap any positions above max
-    for ticker in result.index:
-        weight = result.loc[ticker, "weight"]
-        if weight > max_position_pct:
-            excess_weight += weight - max_position_pct
-            result.loc[ticker, "weight"] = max_position_pct
-            capped_count += 1
-    
-    if capped_count > 0:
-        # Redistribute excess to uncapped positions proportionally
-        uncapped_mask = result["weight"] < max_position_pct
-        uncapped_total = result.loc[uncapped_mask, "weight"].sum()
-        
-        if uncapped_total > 0:
-            # Distribute proportionally
-            for ticker in result.index:
-                if result.loc[ticker, "weight"] < max_position_pct:
-                    share = result.loc[ticker, "weight"] / uncapped_total
-                    result.loc[ticker, "weight"] += excess_weight * share
-        
-        # Re-cap in case redistribution pushed any over
-        result["weight"] = result["weight"].clip(upper=max_position_pct)
-        
-        # Renormalize
-        weight_sum = result["weight"].sum()
-        if weight_sum > 0:
-            result["weight"] = result["weight"] / weight_sum
-        
+    weights = pd.to_numeric(result["weight"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if float(weights.sum()) <= 0:
+        result["weight"] = weights
+        return result.sort_values("weight", ascending=False)
+
+    n_positions = len(weights)
+    cap = float(max_position_pct)
+    if cap <= 0:
+        result["weight"] = 0.0
+        return result.sort_values("weight", ascending=False)
+
+    # Infeasible cap (e.g. 20% cap with only 3 names): keep cash unallocated
+    # rather than violating the hard concentration limit.
+    if cap * n_positions < 1.0:
+        capped = weights.clip(upper=cap)
+        result["weight"] = capped
         if logger:
-            logger.info(
-                "Position cap: %d positions capped at %.0f%%",
-                capped_count, max_position_pct * 100
+            logger.warning(
+                "Position cap infeasible for %d positions at %.0f%%; leaving %.1f%% in cash",
+                n_positions,
+                cap * 100,
+                max(0.0, 1.0 - float(capped.sum())) * 100,
             )
+        return result.sort_values("weight", ascending=False)
+
+    # Feasible case: iterative projection to simplex with upper bounds.
+    projected = weights / float(weights.sum())
+    fixed = pd.Series(False, index=projected.index)
+    for _ in range(n_positions + 1):
+        free = ~fixed
+        free_count = int(free.sum())
+        if free_count <= 0:
+            break
+
+        fixed_sum = float(projected[fixed].sum())
+        remaining = max(0.0, 1.0 - fixed_sum)
+        free_sum = float(projected[free].sum())
+        if free_sum > 0:
+            projected.loc[free] = projected.loc[free] * (remaining / free_sum)
+        else:
+            projected.loc[free] = remaining / free_count
+
+        over = free & (projected > cap + 1e-12)
+        if not over.any():
+            break
+        projected.loc[over] = cap
+        fixed = fixed | over
+
+    projected = projected.clip(lower=0.0, upper=cap)
+    total = float(projected.sum())
+    if total > 0:
+        projected = projected / total
+    projected = projected.clip(upper=cap)
+
+    # Minor floating-point cleanup: preserve cap as hard invariant.
+    if float(projected.max()) > cap + 1e-10:
+        projected = projected.clip(upper=cap)
+
+    result["weight"] = projected
+    if logger:
+        n_capped = int((result["weight"] >= cap - 1e-9).sum())
+        logger.info(
+            "Position cap applied: %d positions at/near cap %.0f%%",
+            n_capped, cap * 100
+        )
     
     return result.sort_values("weight", ascending=False)

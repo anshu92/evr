@@ -10,6 +10,7 @@ import pandas as pd
 from stock_screener.config import Config
 from stock_screener.data.fundamentals import fetch_fundamentals
 from stock_screener.data.fx import fetch_usdcad
+from stock_screener.data.macro import fetch_macro_indicators
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.technical import compute_features, apply_target_encodings
 from stock_screener.optimization.risk_parity import compute_inverse_vol_weights, compute_correlation_aware_weights, apply_confidence_weighting, apply_volatility_targeting, apply_conviction_sizing, apply_liquidity_adjustment, apply_correlation_limits, apply_beta_adjustment, apply_min_position_filter, apply_max_position_cap, apply_regime_exposure
@@ -21,7 +22,7 @@ from stock_screener.utils import Universe, ensure_dir, read_json, write_json, su
 
 # Suppress known external library warnings
 suppress_external_warnings()
-from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty, predict_peak_days
+from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty, predict_peak_days, compute_feature_schema_hash
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
 from stock_screener.portfolio.manager import PortfolioManager, TradePlan
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
@@ -127,9 +128,145 @@ def compute_dynamic_portfolio_size(
     return dynamic_size
 
 
+def _check_runtime_budget(started_utc: datetime, cfg: Config, logger, stage: str) -> None:
+    max_minutes = max(1, int(getattr(cfg, "max_daily_runtime_minutes", 12)))
+    elapsed_minutes = (datetime.now(tz=timezone.utc) - started_utc).total_seconds() / 60.0
+    if elapsed_minutes > max_minutes:
+        raise TimeoutError(
+            f"Runtime budget exceeded at stage '{stage}': "
+            f"{elapsed_minutes:.1f}m > {max_minutes}m"
+        )
+    if elapsed_minutes > max_minutes * 0.8:
+        logger.warning(
+            "Runtime budget nearing limit at %s: %.1fm / %dm",
+            stage, elapsed_minutes, max_minutes,
+        )
+
+
+def _validate_feature_parity(
+    features_df: pd.DataFrame,
+    selected_features: list[str] | None,
+    *,
+    strict: bool,
+    logger,
+) -> list[str]:
+    if not selected_features:
+        return []
+    missing = [c for c in selected_features if c not in features_df.columns]
+    if missing:
+        msg = (
+            f"Feature schema mismatch: missing {len(missing)} selected features "
+            f"(examples: {missing[:8]})"
+        )
+        if strict:
+            raise RuntimeError(msg)
+        logger.warning("%s. Continuing with NaN-filled fallback.", msg)
+    return missing
+
+
+def _apply_uncertainty_weighting(
+    target_weights: pd.DataFrame,
+    screened: pd.DataFrame,
+    logger,
+) -> pd.DataFrame:
+    if target_weights.empty or "pred_uncertainty" not in screened.columns:
+        return target_weights
+    out = target_weights.copy()
+    uncertainty = screened["pred_uncertainty"].reindex(out.index)
+    if uncertainty.isna().all():
+        return out
+    # Higher uncertainty -> smaller weight; bounded and smooth.
+    scalar = 1.0 / (1.0 + uncertainty.fillna(uncertainty.median()).clip(lower=0.0))
+    out["weight"] = out["weight"] * scalar
+    total = float(out["weight"].sum())
+    if total > 0:
+        out["weight"] = out["weight"] / total
+    logger.info(
+        "Applied uncertainty weighting: uncertainty range [%.4f, %.4f]",
+        float(uncertainty.min(skipna=True)),
+        float(uncertainty.max(skipna=True)),
+    )
+    return out.sort_values("weight", ascending=False)
+
+
+def _apply_rebalance_controls(
+    target_weights: pd.DataFrame,
+    *,
+    state,
+    prices_cad: pd.Series,
+    min_rebalance_weight_delta: float,
+    min_trade_notional_cad: float,
+    turnover_penalty_bps: float,
+    logger,
+) -> pd.DataFrame:
+    if target_weights.empty:
+        return target_weights
+
+    min_delta = max(0.0, float(min_rebalance_weight_delta))
+    min_notional = max(1.0, float(min_trade_notional_cad))
+    penalty_bps = max(0.0, float(turnover_penalty_bps))
+
+    open_values: dict[str, float] = {}
+    open_total = 0.0
+    for p in state.positions:
+        if p.status != "OPEN" or not p.ticker or p.shares <= 0:
+            continue
+        px = float(prices_cad.get(p.ticker, float("nan")))
+        if pd.isna(px) or px <= 0:
+            continue
+        val = float(px) * float(p.shares)
+        open_values[p.ticker] = val
+        open_total += val
+
+    equity = float(state.cash_cad) + float(open_total)
+    if equity <= 0:
+        return target_weights
+
+    current_weights = {t: v / equity for t, v in open_values.items() if v > 0}
+    adjusted = target_weights.copy()
+    effective_weights: dict[str, float] = {}
+    skipped_small = 0
+    for t in set(adjusted.index.astype(str)).union(current_weights.keys()):
+        tgt_w = float(adjusted.loc[t, "weight"]) if t in adjusted.index and "weight" in adjusted.columns else 0.0
+        cur_w = float(current_weights.get(t, 0.0))
+        delta = abs(tgt_w - cur_w)
+        trade_notional = delta * equity
+
+        if delta < min_delta or trade_notional < min_notional:
+            effective = cur_w
+            skipped_small += 1
+        else:
+            # Transaction-cost-aware shrinkage of turnover-heavy moves.
+            turnover_penalty = penalty_bps * 1e-4 * delta
+            effective = max(0.0, tgt_w - turnover_penalty)
+
+        # Avoid initiating tiny new positions.
+        if cur_w <= 0 and effective * equity < min_notional:
+            effective = 0.0
+        effective_weights[t] = effective
+
+    if skipped_small > 0:
+        logger.info(
+            "Rebalance hysteresis kept %d small-delta/notional changes",
+            skipped_small,
+        )
+
+    for t, w in effective_weights.items():
+        if t not in adjusted.index:
+            adjusted.loc[t] = pd.NA
+        adjusted.loc[t, "weight"] = w
+
+    adjusted = adjusted[adjusted["weight"].fillna(0.0) > 0.0].copy()
+    total = float(adjusted["weight"].sum()) if not adjusted.empty else 0.0
+    if total > 1.0:
+        adjusted["weight"] = adjusted["weight"] / total
+    return adjusted.sort_values("weight", ascending=False)
+
+
 def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
+    started_utc = datetime.now(tz=timezone.utc)
     cache_dir = ensure_dir(cfg.cache_dir)
     data_cache_dir = ensure_dir(cfg.data_cache_dir)
     reports_dir = ensure_dir(cfg.reports_dir)
@@ -142,6 +279,7 @@ def run_daily(cfg: Config, logger) -> None:
 
     us = fetch_us_universe(cfg=cfg, cache_dir=cache_dir, logger=logger)
     tsx = fetch_tsx_universe(cfg=cfg, cache_dir=cache_dir, logger=logger)
+    _check_runtime_budget(started_utc, cfg, logger, "universe")
 
     all_tickers = list(dict.fromkeys(us.tickers + tsx.tickers))
     if cfg.max_total_tickers is not None:
@@ -170,11 +308,16 @@ def run_daily(cfg: Config, logger) -> None:
         batch_size=cfg.batch_size,
         logger=logger,
     )
+    _check_runtime_budget(started_utc, cfg, logger, "price_download")
 
     fundamentals = fetch_fundamentals(
         tickers=universe.tickers,
         cache_dir=data_cache_dir,
         cache_ttl_days=cfg.fundamentals_cache_ttl_days,
+        logger=logger,
+    )
+    macro = fetch_macro_indicators(
+        lookback_days=max(cfg.feature_lookback_days, cfg.liquidity_lookback_days),
         logger=logger,
     )
     features = compute_features(
@@ -184,7 +327,9 @@ def run_daily(cfg: Config, logger) -> None:
         feature_lookback_days=cfg.feature_lookback_days,
         logger=logger,
         fundamentals=fundamentals,
+        macro=macro,
     )
+    _check_runtime_budget(started_utc, cfg, logger, "feature_build")
 
     if cfg.use_ml:
         try:
@@ -211,6 +356,14 @@ def run_daily(cfg: Config, logger) -> None:
             selected_features = None
             if model_metadata:
                 selected_features = model_metadata.get("feature_columns")
+                expected_schema_hash = model_metadata.get("feature_schema_hash")
+                if selected_features and expected_schema_hash:
+                    actual_schema_hash = compute_feature_schema_hash(list(selected_features))
+                    if str(actual_schema_hash) != str(expected_schema_hash):
+                        raise RuntimeError(
+                            "Model metadata schema hash mismatch; artifact may be corrupted "
+                            f"(expected={expected_schema_hash}, actual={actual_schema_hash})"
+                        )
                 if selected_features:
                     fs = model_metadata.get("feature_selection", {})
                     if fs.get("dropped_features"):
@@ -223,6 +376,14 @@ def run_daily(cfg: Config, logger) -> None:
             
             # Normalize features for ML
             features_ml = normalize_features_cross_section(features, date_col=None)
+            missing_schema = _validate_feature_parity(
+                features_ml,
+                selected_features,
+                strict=bool(getattr(cfg, "strict_feature_parity", True)),
+                logger=logger,
+            )
+            if missing_schema:
+                run_meta["feature_schema_missing"] = missing_schema
             
             if mp.name.lower() == "manifest.json":
                 models, weights, peak_model = load_ensemble(mp)
@@ -326,6 +487,7 @@ def run_daily(cfg: Config, logger) -> None:
     )
     if entry_filter_stats.get("rejected_count", 0) > 0:
         run_meta["entry_filters"] = entry_filter_stats
+    _check_runtime_budget(started_utc, cfg, logger, "screening")
 
     alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
     
@@ -381,6 +543,8 @@ def run_daily(cfg: Config, logger) -> None:
             cfg.confidence_weight_floor,
             logger,
         )
+    if "pred_uncertainty" in screened.columns:
+        target_weights = _apply_uncertainty_weighting(target_weights, screened, logger)
     
     # Apply conviction-based position sizing if enabled
     conviction_sizing_enabled = getattr(cfg, "conviction_sizing", True)
@@ -458,6 +622,18 @@ def run_daily(cfg: Config, logger) -> None:
             logger=logger,
         )
         run_meta["min_position_filter"] = {"min_pct": min_pos_pct}
+
+    # Re-apply correlation limits after renormalizing filters/caps to preserve
+    # pair constraints in the final investable weights.
+    if corr_limits_enabled:
+        target_weights = apply_correlation_limits(
+            target_weights,
+            prices,
+            max_corr_weight=getattr(cfg, "max_corr_weight", 0.25),
+            corr_threshold=getattr(cfg, "corr_threshold", 0.70),
+            lookback_days=60,
+            logger=logger,
+        )
     
     # Apply regime-aware exposure scaling
     cash_from_regime = 0.0
@@ -784,6 +960,8 @@ def run_daily(cfg: Config, logger) -> None:
         peak_score_percentile_drop=cfg.peak_score_percentile_drop,
         peak_rsi_overbought=cfg.peak_rsi_overbought,
         peak_above_ma_ratio=cfg.peak_above_ma_ratio,
+        min_trade_notional_cad=getattr(cfg, "min_trade_notional_cad", 10.0),
+        min_rebalance_weight_delta=getattr(cfg, "min_rebalance_weight_delta", 0.01),
         logger=logger,
     )
     # Extract market volatility regime for dynamic holding period
@@ -808,6 +986,17 @@ def run_daily(cfg: Config, logger) -> None:
             save_portfolio_state(cfg.portfolio_state_path, state)
         except Exception as e:
             logger.warning("Could not save portfolio state after exits: %s", e)
+
+    # Apply rebalance hysteresis and transaction-cost-aware turnover controls.
+    target_weights = _apply_rebalance_controls(
+        target_weights,
+        state=state,
+        prices_cad=prices_cad,
+        min_rebalance_weight_delta=getattr(cfg, "min_rebalance_weight_delta", 0.01),
+        min_trade_notional_cad=getattr(cfg, "min_trade_notional_cad", 10.0),
+        turnover_penalty_bps=getattr(cfg, "turnover_penalty_bps", 10.0),
+        logger=logger,
+    )
 
     # Add pred_return and pred_peak_days to target_weights for email reporting
     if "pred_return" in screened.columns:
@@ -901,6 +1090,7 @@ def run_daily(cfg: Config, logger) -> None:
         fx_usdcad_rate=float(fx.dropna().iloc[-1]) if fx is not None and not fx.dropna().empty else None,
         total_processed=len(features),
     )
+    _check_runtime_budget(started_utc, cfg, logger, "reporting")
 
     # ---- Reward model: record today's predictions and save ----
     if cfg.reward_model_enabled and reward_log is not None:

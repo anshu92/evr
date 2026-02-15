@@ -1,6 +1,6 @@
 # Stock Screener (CAD) + Short-Horizon Trading (max 5 days)
 
-This repo runs a daily **US + TSX/TSXV** stock screener, recommends a portfolio, and produces explicit **BUY/SELL/HOLD** actions with a **max holding period of 5 days**. It also trains a single ML ranking model every ~3 days.
+This repo runs a daily **US + TSX/TSXV** stock screener, recommends a portfolio, and produces explicit **BUY/SELL/HOLD** actions with a **max holding period of 5 days**. It also trains a single ML ranking model weekly (Sunday 02:00 UTC).
 
 ### What you get each day
 
@@ -38,5 +38,4 @@ Outputs:
 
 ### GitHub Actions
 
-See `[docs/GITHUB_WORKFLOWS.md](/Users/sahooa3/Documents/git/evr/docs/GITHUB_WORKFLOWS.md)` for the two workflows and required secrets.
-
+See `docs/GITHUB_WORKFLOWS.md` for workflow schedules, runtime-budget settings, and required secrets.

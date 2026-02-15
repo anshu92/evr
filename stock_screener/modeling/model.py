@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import hashlib
 from typing import Any
 
 import numpy as np
@@ -192,6 +193,14 @@ TECHNICAL_FEATURES_ONLY = [
     "size_momentum_interaction",
     "zscore_reversal",
 ]
+
+FEATURE_SCHEMA_VERSION = "1"
+
+
+def compute_feature_schema_hash(feature_cols: list[str]) -> str:
+    """Stable hash for a feature schema ordering."""
+    joined = "\n".join(feature_cols).encode("utf-8")
+    return hashlib.sha256(joined).hexdigest()
 
 
 def _require_xgb() -> None:

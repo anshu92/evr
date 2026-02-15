@@ -66,6 +66,8 @@ class Config:
     # Training target and objective
     use_market_relative_returns: bool = True  # Train on alpha (stock return - market return) instead of absolute returns
     use_ranking_objective: bool = True  # Use LTR (learning-to-rank) objective instead of regression
+    xgb_ranking_objective: str = "rank:pairwise"  # rank:pairwise | rank:ndcg | rank:map
+    lgbm_ranking_objective: str = "rank_xendcg"  # lambdarank | rank_xendcg
     train_on_peak_return: bool = True  # Train on peak achievable return (max within horizon) instead of end-of-horizon return
     peak_label_winsorize_n_mad: float = 5.0  # Relaxed winsorization for peak returns (spikes are the signal, not noise)
     
@@ -192,6 +194,13 @@ class Config:
     reward_hold_patience_max: float = 2.0    # Long holding (patient)
     reward_verified_label_weight: float = 2.0  # Sample weight boost for verified labels
 
+    # Runtime and rebalancing controls
+    strict_feature_parity: bool = True
+    max_daily_runtime_minutes: int = 12
+    turnover_penalty_bps: float = 10.0
+    min_rebalance_weight_delta: float = 0.01
+    min_trade_notional_cad: float = 10.0
+
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
     base_currency: str = "CAD"
@@ -277,6 +286,8 @@ class Config:
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
             use_ranking_objective=os.getenv("USE_RANKING_OBJECTIVE", "1").strip() in {"1", "true", "True"},
+            xgb_ranking_objective=_get_str("XGB_RANKING_OBJECTIVE", "rank:pairwise"),
+            lgbm_ranking_objective=_get_str("LGBM_RANKING_OBJECTIVE", "rank_xendcg"),
             train_on_peak_return=os.getenv("TRAIN_ON_PEAK_RETURN", "1").strip() in {"1", "true", "True"},
             peak_label_winsorize_n_mad=_get_float("PEAK_LABEL_WINSORIZE_N_MAD", 5.0),
             sector_neutral_selection=os.getenv("SECTOR_NEUTRAL_SELECTION", "1").strip() in {"1", "true", "True"},
@@ -390,6 +401,11 @@ class Config:
             reward_hold_patience_min=_get_float("REWARD_HOLD_PATIENCE_MIN", 0.5),
             reward_hold_patience_max=_get_float("REWARD_HOLD_PATIENCE_MAX", 2.0),
             reward_verified_label_weight=_get_float("REWARD_VERIFIED_LABEL_WEIGHT", 2.0),
+            strict_feature_parity=_get_bool("STRICT_FEATURE_PARITY", True),
+            max_daily_runtime_minutes=_get_int("MAX_DAILY_RUNTIME_MINUTES", 12) or 12,
+            turnover_penalty_bps=_get_float("TURNOVER_PENALTY_BPS", 10.0),
+            min_rebalance_weight_delta=_get_float("MIN_REBALANCE_WEIGHT_DELTA", 0.01),
+            min_trade_notional_cad=_get_float("MIN_TRADE_NOTIONAL_CAD", 10.0),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(
@@ -401,4 +417,3 @@ class Config:
             batch_size=_get_int("BATCH_SIZE", 200) or 200,
             yfinance_threads=os.getenv("YFINANCE_THREADS", "1").strip() not in {"0", "false", "False"},
         )
-

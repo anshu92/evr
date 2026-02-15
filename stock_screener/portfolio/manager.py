@@ -203,6 +203,8 @@ class PortfolioManager:
         peak_rsi_overbought: float | None,
         peak_above_ma_ratio: float | None,
         logger,
+        min_trade_notional_cad: float = 10.0,
+        min_rebalance_weight_delta: float = 0.01,
     ) -> None:
         self.state_path = state_path
         self.max_holding_days = max(1, int(max_holding_days))
@@ -240,6 +242,8 @@ class PortfolioManager:
         self.peak_score_percentile_drop = peak_score_percentile_drop
         self.peak_rsi_overbought = peak_rsi_overbought
         self.peak_above_ma_ratio = peak_above_ma_ratio
+        self.min_trade_notional_cad = max(1.0, float(min_trade_notional_cad))
+        self.min_rebalance_weight_delta = max(0.0, float(min_rebalance_weight_delta))
         self.logger = logger
 
     def _positions_by_ticker(self, state: PortfolioState) -> dict[str, Position]:
@@ -780,6 +784,10 @@ class PortfolioManager:
                     )
                     
                     if is_peak and p.shares >= 2:  # Only do partial sell if we have at least 2 shares
+                        potential_shares = max(0.01, round(p.shares * self.peak_sell_portion_pct, 4))
+                        if float(potential_shares) * float(px) < self.min_trade_notional_cad:
+                            keep.append(p)
+                            continue
                         action, remaining_pos = self._sell_partial_position(
                             state, p, price_cad=px, reason=peak_reason,
                             days_held=days, sell_portion=self.peak_sell_portion_pct
@@ -820,6 +828,16 @@ class PortfolioManager:
         # Avoid excessive turnover by requiring deteriorating fundamentals to rotate out.
         # Positions that survive rotation will get a HOLD action in the loop below
         # so they are always visible in the report.
+        open_mkt_value_for_rotation = 0.0
+        for p in state.positions:
+            if p.status != "OPEN" or not p.ticker or p.shares <= 0:
+                continue
+            px = float(prices_cad.get(p.ticker, float("nan")))
+            if pd.isna(px) or px <= 0:
+                continue
+            open_mkt_value_for_rotation += float(px) * float(p.shares)
+        equity_for_rotation = float(state.cash_cad) + float(open_mkt_value_for_rotation)
+
         for t, p in list(open_by_ticker.items()):
             if t not in target_set:
                 px = float(prices_cad.get(t, float("nan")))
@@ -859,6 +877,22 @@ class PortfolioManager:
                 elif pred_ret is None and days >= 2:
                     should_rotate = True
                     rotation_reason = "ROTATION:NO_DATA"
+
+                # Churn controls: avoid tiny trades and tiny reallocations.
+                trade_notional = float(px) * float(p.shares)
+                cur_weight = (
+                    trade_notional / equity_for_rotation
+                    if equity_for_rotation > 0
+                    else 0.0
+                )
+                if trade_notional < self.min_trade_notional_cad:
+                    should_rotate = False
+                elif (
+                    should_rotate
+                    and cur_weight < self.min_rebalance_weight_delta
+                    and rotation_reason in {"ROTATION:LOW_RANK", "ROTATION:NO_DATA"}
+                ):
+                    should_rotate = False
                 
                 if should_rotate:
                     actions.append(self._sell_position(state, p, price_cad=px, reason=rotation_reason, days_held=days))
@@ -893,8 +927,6 @@ class PortfolioManager:
                 px = float(prices_cad.get(t, float("nan")))
                 if pd.isna(px) or px <= 0:
                     continue
-                if float(state.cash_cad) < float(px):
-                    continue
 
                 w = 0.0
                 try:
@@ -907,12 +939,18 @@ class PortfolioManager:
                 # This ensures we can invest in high-priced stocks within budget
                 target_shares = max(0.0, target_value) / float(px)
                 affordable_shares = float(state.cash_cad) / float(px)
+                if affordable_shares < 0.01:
+                    continue
                 # Minimum 0.01 shares (most brokers support fractional to 0.001)
                 shares = min(affordable_shares, max(0.01, target_shares))
                 if shares < 0.01 or (shares * px) < 1.0:  # Skip if less than $1 investment
                     continue
                 # Round to 4 decimal places for practical fractional share trading
                 shares = round(shares, 4)
+
+                # Turnover controls: skip small target allocations/trades.
+                if w > 0 and w < self.min_rebalance_weight_delta:
+                    continue
                 
                 # Get pred_return and pred_peak_days from weights BEFORE creating position
                 pred_ret = None
@@ -930,6 +968,8 @@ class PortfolioManager:
                     pass
                 
                 cost = float(px) * float(shares)
+                if cost < self.min_trade_notional_cad:
+                    continue
                 state.cash_cad = float(state.cash_cad) - float(cost)
                 pos = Position(
                     ticker=t,
@@ -1071,5 +1111,3 @@ class PortfolioManager:
             self.logger.warning("Could not compute/append portfolio P&L snapshot: %s", e)
         save_portfolio_state(self.state_path, state)
         return TradePlan(actions=actions, holdings=holdings)
-
-

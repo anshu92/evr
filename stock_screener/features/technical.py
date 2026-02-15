@@ -26,6 +26,14 @@ def _rolling_vol(returns: pd.Series, window: int) -> float:
     return float(returns.dropna().iloc[-window:].std(ddof=0) * np.sqrt(252.0))
 
 
+def _annualized_vol(close: pd.Series, window: int = 20) -> float:
+    """Backward-compatible helper used by tests."""
+    if close is None or close.empty:
+        return float("nan")
+    returns = pd.to_numeric(close, errors="coerce").pct_change(fill_method=None)
+    return _rolling_vol(returns, window)
+
+
 def _rsi(close: pd.Series, period: int = 14) -> float:
     if close is None or close.empty or len(close.dropna()) < period + 1:
         return float("nan")
@@ -35,6 +43,11 @@ def _rsi(close: pd.Series, period: int = 14) -> float:
     roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
     roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
     rs = roll_up / roll_down.replace(0.0, np.nan)
+    # Handle monotonic moves explicitly to avoid NaN RSI:
+    # - only gains -> RSI 100
+    # - only losses -> RSI 0
+    rs = rs.where(~((roll_down == 0) & (roll_up > 0)), np.inf)
+    rs = rs.where(~((roll_up == 0) & (roll_down > 0)), 0.0)
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return float(rsi.iloc[-1])
 
@@ -65,6 +78,11 @@ def _rolling_drawdown(close: pd.Series, window: int) -> float:
     return float(recent.iloc[-1] / roll_max - 1.0)
 
 
+def _drawdown(close: pd.Series, window: int = 60) -> float:
+    """Backward-compatible helper used by tests."""
+    return _rolling_drawdown(close, window)
+
+
 def _dist_to_52w_high(close: pd.Series) -> float:
     if close is None or close.empty or len(close.dropna()) < 252:
         return float("nan")
@@ -92,6 +110,7 @@ def compute_features(
     feature_lookback_days: int,
     logger,
     fundamentals: pd.DataFrame | None = None,
+    macro: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compute per-ticker features in CAD terms."""
 
@@ -358,14 +377,34 @@ def compute_features(
 
     # Cross-sectional ranking (percentile ranks)
     rank_map = {
+        "ret_5d": "rank_ret_5d",
         "ret_20d": "rank_ret_20d",
         "ret_60d": "rank_ret_60d",
         "vol_60d_ann": "rank_vol_60d",
         "avg_dollar_volume_cad": "rank_avg_dollar_volume",
+        "ret_5d_sharpe": "rank_ret_5d_sharpe",
+        "momentum_reversal": "rank_momentum_reversal",
+        "ma20_zscore": "rank_ma20_zscore",
     }
     for col, out_col in rank_map.items():
         if col in df.columns:
             df[out_col] = df[col].rank(pct=True)
+
+    if "rank_ret_20d" in df.columns and "rank_ret_60d" in df.columns:
+        df["momentum_strength"] = (df["rank_ret_20d"] + df["rank_ret_60d"]) / 2.0
+    else:
+        df["momentum_strength"] = float("nan")
+
+    if "sector" in df.columns:
+        for col in ["ret_20d", "ret_60d", "ret_5d_sharpe", "vol_60d_ann", "momentum_reversal"]:
+            out_col = f"sector_rank_{col}"
+            if col in df.columns:
+                df[out_col] = df.groupby("sector")[col].rank(pct=True)
+            else:
+                df[out_col] = float("nan")
+    else:
+        for col in ["ret_20d", "ret_60d", "ret_5d_sharpe", "vol_60d_ann", "momentum_reversal"]:
+            df[f"sector_rank_{col}"] = float("nan")
 
     # Compute RELATIVE MOMENTUM (stock vs cap-weighted market average)
     if "ret_20d" in df.columns and "log_market_cap" in df.columns:
@@ -398,7 +437,7 @@ def compute_features(
 
     if "ma20_ratio" in df.columns:
         # Market breadth: % of stocks above their 20-day MA
-        above_ma = (df["ma20_ratio"] > 1.0).sum()
+        above_ma = (df["ma20_ratio"] > 0.0).sum()
         total = len(df)
         df["market_breadth"] = above_ma / total if total > 0 else 0.5
     else:
@@ -414,6 +453,43 @@ def compute_features(
         df["market_momentum_accel"] = (market_ret_5d * 4) - market_ret_20d_val  # 5d * 4 ≈ 20d
     else:
         df["market_momentum_accel"] = 0.0
+
+    # Feature interactions (must match training-time construction).
+    if "ret_20d_sharpe" in df.columns and "momentum_strength" in df.columns:
+        df["sharpe_x_rank"] = df["ret_20d_sharpe"] * df["momentum_strength"]
+    else:
+        df["sharpe_x_rank"] = float("nan")
+    if "ret_5d" in df.columns and "vol_20d_ann" in df.columns:
+        df["momentum_vol_interaction"] = df["ret_5d"] * df["vol_20d_ann"]
+    else:
+        df["momentum_vol_interaction"] = float("nan")
+    if "rsi_14" in df.columns and "ret_5d" in df.columns:
+        df["rsi_momentum_interaction"] = (df["rsi_14"] - 50.0) / 50.0 * df["ret_5d"]
+    else:
+        df["rsi_momentum_interaction"] = float("nan")
+    if "log_market_cap" in df.columns and "relative_momentum_20d" in df.columns:
+        df["size_momentum_interaction"] = df["log_market_cap"] * df["relative_momentum_20d"]
+    else:
+        df["size_momentum_interaction"] = float("nan")
+    if "ma20_zscore" in df.columns and "ret_5d" in df.columns:
+        df["zscore_reversal"] = -df["ma20_zscore"] * np.sign(df["ret_5d"])
+    else:
+        df["zscore_reversal"] = float("nan")
+
+    # Attach macro regime features for schema parity (fallback to NaN if unavailable).
+    macro_cols = ["vix", "treasury_10y", "treasury_13w", "yield_curve_slope"]
+    if macro is not None and not macro.empty and "last_date" in df.columns:
+        macro_df = macro.copy()
+        macro_df.index = pd.to_datetime(macro_df.index).normalize()
+        asof = pd.to_datetime(df["last_date"]).dt.normalize()
+        for col in macro_cols:
+            if col in macro_df.columns:
+                df[col] = asof.map(macro_df[col])
+            else:
+                df[col] = float("nan")
+    else:
+        for col in macro_cols:
+            df[col] = float("nan")
 
     # Add fundamental composite scores
     # Note: date_col=None is correct here since compute_features() produces single-date snapshots.

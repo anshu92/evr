@@ -11,7 +11,12 @@ def test_model_save_and_load(tmp_path):
     logger = logging.getLogger("test")
     
     # Create a simple model
-    model = build_model(random_state=42)
+    try:
+        model = build_model(random_state=42)
+    except RuntimeError as e:
+        if "not available" in str(e):
+            pytest.skip("XGBoost not available in test environment")
+        raise
     
     # Create dummy training data
     X = pd.DataFrame(np.random.randn(100, len(FEATURE_COLUMNS)), columns=FEATURE_COLUMNS)

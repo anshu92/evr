@@ -44,10 +44,12 @@ from stock_screener.modeling.eval import (
     aggregate_walk_forward_results,
 )
 from stock_screener.modeling.model import (
+    FEATURE_SCHEMA_VERSION,
     FEATURE_COLUMNS,
     TECHNICAL_FEATURES_ONLY,
     build_model,
     build_lgbm_model,
+    compute_feature_schema_hash,
     load_bundle,
     load_model,
     predict_ensemble,
@@ -617,7 +619,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     
     # Market breadth: % of stocks above their 20-day MA on each date (fast)
     if "ma20_ratio" in panel.columns:
-        above_ma = (panel["ma20_ratio"] > 1.0).astype(int).values
+        above_ma = (panel["ma20_ratio"] > 0.0).astype(int).values
         date_series = pd.Series(_dates)
         breadth_count = date_series.groupby(date_series).count()
         above_sum = pd.Series(above_ma).groupby(date_series).sum()
@@ -968,6 +970,14 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     n_lgbm = getattr(cfg, 'ensemble_lgbm_count', 3)
     use_lgbm = getattr(cfg, 'use_lightgbm', True)
     use_ranking = getattr(cfg, 'use_ranking_objective', True)
+    xgb_rank_objective = str(getattr(cfg, "xgb_ranking_objective", "rank:pairwise")).strip().lower()
+    if xgb_rank_objective not in {"rank:pairwise", "rank:ndcg", "rank:map"}:
+        logger.warning("Unsupported XGBoost ranking objective '%s', falling back to rank:pairwise", xgb_rank_objective)
+        xgb_rank_objective = "rank:pairwise"
+    lgbm_rank_objective = str(getattr(cfg, "lgbm_ranking_objective", "rank_xendcg")).strip().lower()
+    if lgbm_rank_objective not in {"lambdarank", "rank_xendcg"}:
+        logger.warning("Unsupported LightGBM ranking objective '%s', falling back to rank_xendcg", lgbm_rank_objective)
+        lgbm_rank_objective = "rank_xendcg"
     
     if not use_lgbm:
         n_xgb = 7  # Fallback to 7 XGBoost models
@@ -1042,7 +1052,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                     max_depth=best_regressor_params.get("max_depth", 5),
                     subsample=0.7, colsample_bytree=0.7,
                     min_child_weight=best_regressor_params.get("min_child_weight", 8),
-                    objective="rank:pairwise", n_jobs=0, random_state=_sel_seed,
+                    objective=xgb_rank_objective, n_jobs=0, random_state=_sel_seed,
                 )
                 _sel_m.fit(train_df[feature_cols], train_rank_labels, group=train_groups)
             else:
@@ -1097,7 +1107,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 colsample_bytree=0.75,
                 reg_lambda=2.0,
                 min_child_weight=best_regressor_params.get("min_child_weight", 8),
-                objective="rank:pairwise",
+                objective=xgb_rank_objective,
                 eval_metric="ndcg@30",
                 n_jobs=0,
                 random_state=seed,
@@ -1144,7 +1154,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     if use_lgbm and n_lgbm > 0:
         for i in range(n_lgbm):
             seed = 42 + i * 10
-            m = build_lgbm_model(random_state=seed)
             # Translate XGBoost params to LightGBM equivalents
             lgbm_params = {
                 "max_depth": best_regressor_params.get("max_depth", 6),
@@ -1154,26 +1163,57 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 "colsample_bytree": best_regressor_params.get("colsample_bytree", 0.8),
                 "reg_lambda": best_regressor_params.get("reg_lambda", 1.0),
             }
-            m.set_params(**lgbm_params)
-            if not val_df.empty:
-                m.fit(
-                    train_df[selected_features],
-                    train_df[label_col].astype(float),
-                    sample_weight=sample_weights,
-                    eval_set=[(val_df[selected_features], val_df[label_col].astype(float))],
-                    callbacks=[],
+            if use_ranking:
+                if lgb is None:
+                    logger.warning("LightGBM unavailable; skipping ranking LightGBM model %d", i + 1)
+                    continue
+                m = lgb.LGBMRanker(
+                    n_estimators=350,
+                    objective=lgbm_rank_objective,
+                    random_state=seed,
+                    verbose=-1,
+                    **lgbm_params,
                 )
+                if not val_df.empty and val_groups is not None and val_rank_labels is not None:
+                    m.fit(
+                        train_df[selected_features],
+                        train_rank_labels,
+                        group=train_groups,
+                        eval_set=[(val_df[selected_features], val_rank_labels)],
+                        eval_group=[val_groups],
+                    )
+                else:
+                    m.fit(
+                        train_df[selected_features],
+                        train_rank_labels,
+                        group=train_groups,
+                    )
             else:
-                m.fit(
-                    train_df[selected_features],
-                    train_df[label_col].astype(float),
-                    sample_weight=sample_weights,
-                )
+                m = build_lgbm_model(random_state=seed)
+                m.set_params(**lgbm_params)
+                if not val_df.empty:
+                    m.fit(
+                        train_df[selected_features],
+                        train_df[label_col].astype(float),
+                        sample_weight=sample_weights,
+                        eval_set=[(val_df[selected_features], val_df[label_col].astype(float))],
+                        callbacks=[],
+                    )
+                else:
+                    m.fit(
+                        train_df[selected_features],
+                        train_df[label_col].astype(float),
+                        sample_weight=sample_weights,
+                    )
             rel = f"lgbm_model_{i}.txt"
             save_model(m, model_dir / rel)
             reg_rel_paths.append(rel)
             model_types.append("lightgbm")
-            logger.info("Trained LightGBM model %d/%d", i+1, n_lgbm)
+            logger.info(
+                "Trained LightGBM %s model %d/%d",
+                "ranker" if use_ranking else "regressor",
+                i + 1, n_lgbm,
+            )
 
     reg_holdout_preds: list[float] = []
     model_ics: list[float] = []  # Track IC per model for adaptive weighting
@@ -1609,6 +1649,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "training_config": {
             "use_market_relative_returns": use_market_relative,
             "use_ranking_objective": use_ranking,
+            "xgb_ranking_objective": xgb_rank_objective if use_ranking else None,
+            "lgbm_ranking_objective": lgbm_rank_objective if use_ranking else None,
             "train_on_peak_return": use_peak_target,
             "target_column": label_col,
             "calibration_column": calibration_col or label_col,
@@ -1616,6 +1658,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "n_lgbm_models": n_lgbm,
         },
         "feature_columns": selected_features,  # Features used in final models (after selection)
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "feature_schema_hash": compute_feature_schema_hash(selected_features),
         "feature_selection": {
             "original_count": len(feature_cols),
             "selected_count": len(selected_features),

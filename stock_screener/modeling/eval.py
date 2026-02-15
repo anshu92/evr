@@ -131,7 +131,8 @@ def aggregate_walk_forward_results(period_results: list[dict]) -> dict[str, obje
     # Key metrics to aggregate
     metrics_to_agg = [
         "sharpe_ratio", "sortino_ratio", "max_drawdown", "total_return",
-        "ann_return", "alpha_ann", "alpha_sharpe", "avg_turnover",
+        "ann_return", "return_per_day", "cost_adjusted_sharpe",
+        "alpha_ann", "alpha_sharpe", "avg_turnover", "turnover_efficiency",
         "mean_ic", "ic_ir",
     ]
     
@@ -474,9 +475,12 @@ def simulate_realistic_portfolio(
     summary = {
         "total_return": total_return,
         "ann_return": ann_return,
+        "return_per_day": float(total_return / n_days) if n_days > 0 else float("nan"),
         "sharpe_ratio": sharpe,
+        "cost_adjusted_sharpe": sharpe,
         "max_drawdown": max_dd,
         "avg_turnover": avg_turnover,
+        "turnover_efficiency": float(ann_return / avg_turnover) if avg_turnover > 0 else float("nan"),
         "total_cost_bps": float(total_cost_paid * 10000),
         "n_rebalances": n_rebalances,
         "n_days": n_days,

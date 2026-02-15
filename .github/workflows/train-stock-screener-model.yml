@@ -30,13 +30,14 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Cache universe/data/models
+        id: cache_model_data
         uses: actions/cache@v4
         with:
           path: |
             cache/
             data_cache/
             models/
-          key: ${{ runner.os }}-screener-model-${{ github.run_id }}
+          key: ${{ runner.os }}-screener-model-${{ hashFiles('requirements.txt', '.github/workflows/train-stock-screener-model.yml') }}
           restore-keys: |
             ${{ runner.os }}-screener-model-
 
@@ -83,5 +84,4 @@ jobs:
           path: |
             models/ensemble/
           retention-days: 90
-
 

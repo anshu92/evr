@@ -2,12 +2,12 @@
 
 This repo has **two** GitHub Actions workflows:
 
-- **Train model** (every ~3 days): `[.github/workflows/train-stock-screener-model.yml](/Users/sahooa3/Documents/git/evr/.github/workflows/train-stock-screener-model.yml)`
-- **Daily trading run** (weekdays): `[.github/workflows/daily-stock-screener.yml](/Users/sahooa3/Documents/git/evr/.github/workflows/daily-stock-screener.yml)`
+- **Train model** (weekly): `.github/workflows/train-stock-screener-model.yml`
+- **Daily trading run** (3x per weekday): `.github/workflows/daily-stock-screener.yml`
 
 Both workflows use **Actions cache** (no repo commits).
 
-### 1) Train model workflow (every ~3 days)
+### 1) Train model workflow (weekly)
 
 - **What it does**:
   - Trains the single stock-ranking ML model (`models/ensemble/manifest.json` + members)
@@ -15,7 +15,7 @@ Both workflows use **Actions cache** (no repo commits).
   - Uploads the model artifact and also stores it in cache for the daily workflow
 
 - **Schedule**:
-  - Runs daily at 02:00 UTC, but is gated to execute only every 3rd day.
+  - Runs weekly on **Sunday at 02:00 UTC**.
   - Can be run any time via `workflow_dispatch`.
 
 ### 2) Daily trading workflow (weekdays)
@@ -33,6 +33,15 @@ Both workflows use **Actions cache** (no repo commits).
     - `reports/daily_report.txt`
     - `reports/portfolio_weights.csv`
     - `reports/trade_actions.json`
+
+- **Runtime budget controls**:
+  - `MAX_DAILY_RUNTIME_MINUTES=12` (default)
+  - strict feature schema parity (`STRICT_FEATURE_PARITY=1`)
+  - fallback model training disabled by default (`ALLOW_FALLBACK_TRAINING=0`)
+
+- **Cache strategy**:
+  - uses stable hash-based cache keys (not per-run IDs) for better cache reuse
+  - telemetry artifact emitted at `reports/telemetry/actions_telemetry.json`
 
 ### Portfolio state
 
@@ -55,4 +64,3 @@ Both workflows use **Actions cache** (no repo commits).
   - `MAX_HOLDING_DAYS=5`
   - Optional: `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`
   - `PORTFOLIO_STATE_PATH=screener_portfolio_state.json`
-

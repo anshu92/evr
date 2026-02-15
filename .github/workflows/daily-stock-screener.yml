@@ -35,6 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Start telemetry timer
+        run: echo "WORKFLOW_START_TS=$(date +%s)" >> $GITHUB_ENV
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -44,6 +47,7 @@ jobs:
           python-version: '3.11'
 
       - name: Cache pip
+        id: cache_pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -52,22 +56,24 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Cache universe/data
+        id: cache_data
         uses: actions/cache@v4
         with:
           path: |
             cache/
             data_cache/
             screener_portfolio_state.json
-          key: ${{ runner.os }}-daily-screener-data-${{ github.run_id }}
+          key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements.txt', '.github/workflows/daily-stock-screener.yml') }}
           restore-keys: |
             ${{ runner.os }}-daily-screener-data-
 
       - name: Cache ML model
+        id: cache_model
         uses: actions/cache@v4
         with:
           path: |
             models/
-          key: ${{ runner.os }}-screener-model-${{ github.run_id }}
+          key: ${{ runner.os }}-screener-model-${{ hashFiles('.github/workflows/train-stock-screener-model.yml') }}
           restore-keys: |
             ${{ runner.os }}-screener-model-
 
@@ -144,6 +150,7 @@ jobs:
       - name: Ensure ML model exists (train if missing)
         shell: bash
         env:
+          ALLOW_FALLBACK_TRAINING: "0"
           MODEL_PATH: "models/ensemble/manifest.json"
           LABEL_HORIZON_DAYS: "5"
           # Lightweight fallback — just enough for a usable model.
@@ -161,9 +168,12 @@ jobs:
         run: |
           if [ -f "$MODEL_PATH" ]; then
             echo "Model manifest found at $MODEL_PATH"
-          else
+          elif [ "$ALLOW_FALLBACK_TRAINING" = "1" ]; then
             echo "Model manifest missing; training a fallback model..."
             python -m stock_screener.cli train-model --log-level INFO
+          else
+            echo "Model manifest missing; skipping fallback training to protect runtime budget."
+            echo "Daily run will continue and gracefully fall back from ML scoring if needed."
           fi
 
       - name: Run daily screener
@@ -185,6 +195,11 @@ jobs:
           # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
           USE_ML: "1"
           MODEL_PATH: "models/ensemble/manifest.json"
+          STRICT_FEATURE_PARITY: "1"
+          MAX_DAILY_RUNTIME_MINUTES: "12"
+          TURNOVER_PENALTY_BPS: "10"
+          MIN_REBALANCE_WEIGHT_DELTA: "0.01"
+          MIN_TRADE_NOTIONAL_CAD: "10"
           # Quick-compounding: sell at predicted peak, redeploy capital fast
           MAX_HOLDING_DAYS: "3"
           MAX_HOLDING_DAYS_HARD: "5"
@@ -204,6 +219,35 @@ jobs:
         run: |
           python -m stock_screener.cli daily --log-level INFO
 
+      - name: Collect workflow telemetry
+        if: always()
+        shell: bash
+        run: |
+          END_TS=$(date +%s)
+          START_TS=${WORKFLOW_START_TS:-$END_TS}
+          ELAPSED_SEC=$((END_TS - START_TS))
+          ELAPSED_MIN=$(awk "BEGIN {printf \"%.2f\", $ELAPSED_SEC/60.0}")
+          CACHE_HITS=0
+          TOTAL_CACHES=3
+          [ "${{ steps.cache_pip.outputs.cache-hit }}" = "true" ] && CACHE_HITS=$((CACHE_HITS + 1))
+          [ "${{ steps.cache_data.outputs.cache-hit }}" = "true" ] && CACHE_HITS=$((CACHE_HITS + 1))
+          [ "${{ steps.cache_model.outputs.cache-hit }}" = "true" ] && CACHE_HITS=$((CACHE_HITS + 1))
+          CACHE_RATIO=$(awk "BEGIN {if($TOTAL_CACHES>0) printf \"%.3f\", $CACHE_HITS/$TOTAL_CACHES; else print \"0.000\"}")
+          mkdir -p reports/telemetry
+          cat > reports/telemetry/actions_telemetry.json <<JSON
+          {
+            "workflow": "daily-stock-screener",
+            "run_id": "${{ github.run_id }}",
+            "run_number": "${{ github.run_number }}",
+            "elapsed_seconds": $ELAPSED_SEC,
+            "elapsed_minutes": $ELAPSED_MIN,
+            "minutes_estimate": $ELAPSED_MIN,
+            "cache_hits": $CACHE_HITS,
+            "cache_total": $TOTAL_CACHES,
+            "cache_hit_ratio": $CACHE_RATIO
+          }
+          JSON
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -213,7 +257,7 @@ jobs:
             reports/
             cache/last_run_meta.json
             screener_portfolio_state.json
-          retention-days: 30
+          retention-days: 14
 
       - name: Determine market session
         id: session
@@ -261,5 +305,3 @@ jobs:
             } catch (error) {
               console.log(`Could not create issue: ${error.message}`);
             }
-
-

@@ -20,6 +20,7 @@ def test_portfolio_manager_time_exit():
         max_positions=5,
         stop_loss_pct=None,
         take_profit_pct=None,
+        peak_based_exit=False,
         peak_detection_enabled=False,
         peak_sell_portion_pct=0.5,
         peak_min_gain_pct=None,
@@ -31,11 +32,11 @@ def test_portfolio_manager_time_exit():
         logger=logger,
     )
     
-    # Create a position that's 6 days old
+    # Create a position old enough to exceed 5 trading days.
     now = datetime.now(tz=timezone.utc)
-    entry_date = now - timedelta(days=6)
+    entry_date = now - timedelta(days=8)
     
-    state = PortfolioState(cash_cad=1000.0, positions=[])
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
     state.positions.append(
         Position(
             ticker="AAPL",
@@ -69,6 +70,7 @@ def test_portfolio_manager_stop_loss():
         max_positions=5,
         stop_loss_pct=0.10,  # 10% stop loss
         take_profit_pct=None,
+        peak_based_exit=False,
         peak_detection_enabled=False,
         peak_sell_portion_pct=0.5,
         peak_min_gain_pct=None,
@@ -84,7 +86,7 @@ def test_portfolio_manager_stop_loss():
     now = datetime.now(tz=timezone.utc)
     entry_date = now - timedelta(days=2)
     
-    state = PortfolioState(cash_cad=1000.0, positions=[])
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
     state.positions.append(
         Position(
             ticker="AAPL",
@@ -117,6 +119,7 @@ def test_portfolio_manager_take_profit():
         max_positions=5,
         stop_loss_pct=None,
         take_profit_pct=0.15,  # 15% take profit
+        peak_based_exit=False,
         peak_detection_enabled=False,
         peak_sell_portion_pct=0.5,
         peak_min_gain_pct=None,
@@ -132,7 +135,7 @@ def test_portfolio_manager_take_profit():
     now = datetime.now(tz=timezone.utc)
     entry_date = now - timedelta(days=2)
     
-    state = PortfolioState(cash_cad=1000.0, positions=[])
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
     state.positions.append(
         Position(
             ticker="AAPL",
@@ -165,6 +168,9 @@ def test_portfolio_manager_peak_detection():
         max_positions=5,
         stop_loss_pct=None,
         take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
         peak_detection_enabled=True,
         peak_sell_portion_pct=0.5,  # Sell 50%
         peak_min_gain_pct=0.05,  # Need at least 5% gain
@@ -176,11 +182,11 @@ def test_portfolio_manager_peak_detection():
         logger=logger,
     )
     
-    # Create a position that's up 10% and held for 3 days
+    # Create a position that's up 10% and held long enough in trading days.
     now = datetime.now(tz=timezone.utc)
-    entry_date = now - timedelta(days=3)
+    entry_date = now - timedelta(days=7)
     
-    state = PortfolioState(cash_cad=1000.0, positions=[])
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
     state.positions.append(
         Position(
             ticker="AAPL",
@@ -206,3 +212,47 @@ def test_portfolio_manager_peak_detection():
     assert actions[0].action == "SELL_PARTIAL"
     assert "PEAK" in actions[0].reason
     assert actions[0].shares == 5  # 50% of 10
+
+
+def test_fractional_buy_when_cash_below_share_price(tmp_path):
+    """Allow fractional entry even when cash is below one full share price."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        min_trade_notional_cad=10.0,
+        logger=logger,
+    )
+
+    state = PortfolioState(cash_cad=100.0, positions=[], last_updated=now)
+    screened = pd.DataFrame(index=["AAPL"])
+    weights = pd.DataFrame({"weight": [1.0]}, index=["AAPL"])
+    prices = pd.Series({"AAPL": 300.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+    buys = [a for a in plan.actions if a.action == "BUY" and a.ticker == "AAPL"]
+    assert len(buys) == 1
+    assert buys[0].shares > 0
+    assert buys[0].shares < 1.0

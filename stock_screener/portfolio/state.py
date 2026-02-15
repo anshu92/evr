@@ -121,7 +121,7 @@ def save_portfolio_state(path: str | Path, state: PortfolioState) -> None:
     p = Path(path)
     obj: dict[str, Any] = asdict(state)
     obj["last_updated"] = state.last_updated.isoformat()
-    for pos, raw in zip(state.positions, obj.get("positions", []), strict=False):
+    for pos, raw in zip(state.positions, obj.get("positions", [])):
         raw["entry_date"] = pos.entry_date.isoformat()
         raw["exit_date"] = pos.exit_date.isoformat() if pos.exit_date else None
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -231,5 +231,4 @@ def compute_drawdown_scalar(
     
     dd_info["drawdown_scalar"] = scalar
     return scalar, dd_info
-
 
