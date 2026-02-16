@@ -42,6 +42,9 @@ class Config:
     model_path: str = "models/ensemble/manifest.json"
     label_horizon_days: int = 5
     trade_cost_bps: float = 0.0
+    cost_model_base_bps: float = 3.0
+    cost_model_spread_coef: float = 0.5
+    cost_model_vol_coef: float = 0.5
     
     # Training configuration
     use_fundamentals_in_training: bool = False  # Set to False to avoid lookahead bias
@@ -270,6 +273,9 @@ class Config:
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
             label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 5) or 5,
             trade_cost_bps=_get_float("TRADE_COST_BPS", 0.0),
+            cost_model_base_bps=_get_float("COST_MODEL_BASE_BPS", 3.0),
+            cost_model_spread_coef=_get_float("COST_MODEL_SPREAD_COEF", 0.5),
+            cost_model_vol_coef=_get_float("COST_MODEL_VOL_COEF", 0.5),
             use_fundamentals_in_training=os.getenv("USE_FUNDAMENTALS_IN_TRAINING", "0").strip() in {"1", "true", "True"},
             train_ensemble_seeds=None,  # Use default in train.py
             train_cv_splits=_get_int("TRAIN_CV_SPLITS", 3) or 3,

@@ -57,6 +57,7 @@ from stock_screener.modeling.model import (
     save_ensemble,
     save_model,
 )
+from stock_screener.modeling.costs import apply_cost_to_label, estimate_trade_cost_bps
 from stock_screener.modeling.transform import normalize_features_cross_section, winsorize_mad, build_calibration_map
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
@@ -674,40 +675,59 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             panel["risk_adj_peak_alpha"] = panel["peak_alpha"] / safe_vol
         logger.info("Computed risk-adjusted peak labels (peak / vol) to remove vol bias")
     
-    # Configure which target to use for training
+    # Build per-sample cost model and net labels for cost-aware training.
+    cost_base_bps = float(getattr(cfg, "cost_model_base_bps", 3.0))
+    cost_spread_coef = float(getattr(cfg, "cost_model_spread_coef", 0.5))
+    cost_vol_coef = float(getattr(cfg, "cost_model_vol_coef", 0.5))
+    panel["est_trade_cost_bps"] = estimate_trade_cost_bps(
+        panel,
+        date_col="date",
+        base_bps=cost_base_bps,
+        spread_coef=cost_spread_coef,
+        vol_coef=cost_vol_coef,
+    )
+    panel["est_trade_cost_frac"] = panel["est_trade_cost_bps"] * 1e-4
+    for base_col in ("future_ret", "future_alpha", "peak_return", "peak_alpha"):
+        if base_col in panel.columns:
+            panel[f"{base_col}_net"] = apply_cost_to_label(panel[base_col], panel["est_trade_cost_bps"])
+    logger.info(
+        "Estimated trade costs (bps): mean=%.2f, p10=%.2f, p90=%.2f",
+        float(panel["est_trade_cost_bps"].mean()),
+        float(panel["est_trade_cost_bps"].quantile(0.10)),
+        float(panel["est_trade_cost_bps"].quantile(0.90)),
+    )
+
+    # Configure which target to use for training.
     use_peak_target = getattr(cfg, 'train_on_peak_return', True)
     use_market_relative = getattr(cfg, 'use_market_relative_returns', True)
-    
-    # calibration_col: the column used to build the calibration map at inference.
-    # We train on risk-adjusted labels (model learns vol-independent patterns),
-    # but calibrate predictions to actual-return space so downstream code
-    # (sell prices, entry filters, etc.) receives interpretable return values.
-    calibration_col = None  # set below alongside target_col
 
+    target_col_gross = None
     if use_peak_target and "peak_alpha" in panel.columns:
         if use_market_relative:
-            target_col = "peak_alpha"
-            calibration_col = None  # Same column, no separate calibration needed
+            target_col_gross = "peak_alpha"
             logger.info(
                 "Training on PEAK alpha (market-relative peak return). "
                 "Direct target — no risk-adjustment (vol is a feature, not label divisor)."
             )
         else:
-            target_col = "peak_return"
-            calibration_col = None
-            logger.info(
-                "Training on PEAK returns (absolute peak return within horizon)."
-            )
+            target_col_gross = "peak_return"
+            logger.info("Training on PEAK returns (absolute peak return within horizon).")
     elif use_peak_target and "peak_return" in panel.columns:
         # Fallback if vol_60d_ann missing (shouldn't happen)
-        target_col = "peak_alpha" if use_market_relative else "peak_return"
+        target_col_gross = "peak_alpha" if use_market_relative else "peak_return"
         logger.info("Training on raw peak labels (vol_60d_ann missing for risk adjustment)")
     elif use_market_relative:
-        target_col = "future_alpha"
+        target_col_gross = "future_alpha"
         logger.info("Training on market-relative returns (alpha). Market avg will be subtracted.")
     else:
-        target_col = "future_ret"
+        target_col_gross = "future_ret"
         logger.info("Training on absolute returns.")
+
+    # Cost-aware training target for model fitting/ranking; retain gross target for calibration/output units.
+    target_col = f"{target_col_gross}_net" if f"{target_col_gross}_net" in panel.columns else target_col_gross
+    calibration_col = target_col_gross
+    if target_col != target_col_gross:
+        logger.info("Using cost-aware target %s (gross calibration target: %s)", target_col, target_col_gross)
 
     # Apply TARGET ENCODING for sector/industry (replaces useless hash encoding)
     # This encodes sectors by their historical mean return, giving the model meaningful signals
@@ -769,6 +789,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         panel["risk_adj_peak_alpha"] = panel.groupby("date")["risk_adj_peak_alpha"].transform(
             lambda s: winsorize_mad(s, n_mad=peak_n_mad)
         )
+    # Keep net labels exactly aligned with the winsorized gross labels.
+    if "est_trade_cost_bps" in panel.columns:
+        for base_col in ("future_ret", "future_alpha", "peak_return", "peak_alpha"):
+            if base_col in panel.columns:
+                panel[f"{base_col}_net"] = apply_cost_to_label(panel[base_col], panel["est_trade_cost_bps"])
+
     logger.info(
         "Winsorized labels: horizon n_mad=3.0, peak n_mad=%.1f (target=%s)",
         peak_n_mad, target_col,
@@ -826,12 +852,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             }
         temp = df.copy()
         temp["pred"] = pred
-        # CRITICAL: Always use future_ret for portfolio returns, even when training on alpha
-        # The model predicts alpha (relative returns), but portfolio P&L uses absolute returns
-        # Also pass market_ret and beta for alpha calculation
+        eval_label_col = "future_ret_net" if "future_ret_net" in temp.columns else "future_ret"
+        eval_cost_bps = 0.0 if eval_label_col == "future_ret_net" else cost_bps
         return evaluate_topn_returns(
-            temp, date_col="date", label_col="future_ret", pred_col="pred", 
-            top_n=top_n, cost_bps=cost_bps,
+            temp, date_col="date", label_col=eval_label_col, pred_col="pred",
+            top_n=top_n, cost_bps=eval_cost_bps,
             market_ret_col="market_ret" if "market_ret" in temp.columns else None,
             beta_col="beta" if "beta" in temp.columns else None,
         )
@@ -1456,9 +1481,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         }
         logger.info("Calibration error: %.6f", calibration_result["calibration_error"])
         
-        # Compute portfolio metrics from top-N daily returns
-        # NOTE: These returns are ALWAYS absolute returns (future_ret), not alpha
-        # This is correct because portfolio P&L is measured in absolute terms
+        # Compute portfolio metrics from top-N daily returns.
+        # If cost-aware labels are present, this evaluates on net returns.
         if "daily" in reg_holdout_topn and isinstance(reg_holdout_topn["daily"], pd.DataFrame):
             daily_df = reg_holdout_topn["daily"]
             if "mean_ret" in daily_df.columns and len(daily_df) > 0:
@@ -1501,16 +1525,18 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         holdout_with_preds = holdout_df.copy()
         holdout_with_preds["pred_return"] = reg_holdout_preds
         holdout_with_preds["ticker"] = holdout_with_preds.index if "ticker" not in holdout_with_preds.columns else holdout_with_preds["ticker"]
+        sim_label_col = "future_ret_net" if "future_ret_net" in holdout_with_preds.columns else "future_ret"
+        sim_cost_bps = 0.0 if sim_label_col == "future_ret_net" else 20.0
         
         realistic_result = simulate_realistic_portfolio(
             holdout_with_preds.reset_index(drop=True),
             date_col="date",
             ticker_col="ticker",
-            label_col="future_ret",
+            label_col=sim_label_col,
             pred_col="pred_return",
             top_n=top_n,
             hold_days=horizon,  # Hold for prediction horizon
-            cost_bps=20.0,  # More realistic round-trip cost
+            cost_bps=sim_cost_bps,
             market_ret_col="market_ret" if "market_ret" in holdout_with_preds.columns else None,
         )
         realistic_metrics = realistic_result.get("summary", {})
@@ -1575,11 +1601,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 period_test_df.reset_index(drop=True),
                 date_col="date",
                 ticker_col="ticker",
-                label_col="future_ret",
+                label_col="future_ret_net" if "future_ret_net" in period_test_df.columns else "future_ret",
                 pred_col="pred_return",
                 top_n=top_n,
                 hold_days=horizon,
-                cost_bps=20.0,
+                cost_bps=0.0 if "future_ret_net" in period_test_df.columns else 20.0,
                 market_ret_col="market_ret" if "market_ret" in period_test_df.columns else None,
             )
             
@@ -1653,7 +1679,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "lgbm_ranking_objective": lgbm_rank_objective if use_ranking else None,
             "train_on_peak_return": use_peak_target,
             "target_column": label_col,
+            "target_column_gross": target_col_gross,
             "calibration_column": calibration_col or label_col,
+            "cost_model_base_bps": cost_base_bps,
+            "cost_model_spread_coef": cost_spread_coef,
+            "cost_model_vol_coef": cost_vol_coef,
             "n_xgb_models": n_xgb,
             "n_lgbm_models": n_lgbm,
         },
