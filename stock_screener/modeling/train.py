@@ -55,13 +55,19 @@ from stock_screener.modeling.model import (
     load_bundle,
     load_model,
     predict_ensemble,
+    predict_quantile_lcb,
     predict_regime_gated,
     predict_score,
     save_ensemble,
     save_model,
 )
 from stock_screener.modeling.costs import apply_cost_to_label, estimate_trade_cost_bps
-from stock_screener.modeling.transform import normalize_features_cross_section, winsorize_mad, build_calibration_map
+from stock_screener.modeling.transform import (
+    build_calibration_map,
+    calibrate_predictions,
+    normalize_features_cross_section,
+    winsorize_mad,
+)
 from stock_screener.universe.tsx import fetch_tsx_universe
 from stock_screener.universe.us import fetch_us_universe
 from stock_screener.utils import Universe, ensure_dir, write_json, suppress_external_warnings
@@ -1624,6 +1630,19 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     elif quantile_enabled and lgb is None:
         logger.warning("Quantile models enabled but LightGBM unavailable; skipping quantile training.")
 
+    quantile_models_for_eval: dict[str, tuple[list, list[float] | None]] = {}
+    if quantile_manifest:
+        for q_name, payload in quantile_manifest.items():
+            rels = payload.get("models") or []
+            mtypes = payload.get("model_types") or ["lightgbm"] * len(rels)
+            if not rels:
+                continue
+            try:
+                q_models = [load_model(model_dir / rel, mtype) for rel, mtype in zip(rels, mtypes)]
+                quantile_models_for_eval[q_name] = (q_models, payload.get("weights"))
+            except Exception as e:
+                logger.warning("Could not load quantile model '%s' for evaluation: %s", q_name, e)
+
     # =========================================================================
     # PEAK TIMING MODEL: Predict days_to_peak (1 to max_horizon)
     # =========================================================================
@@ -1776,32 +1795,59 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "intercept": 0.0,
         "n_samples": 0,
     }
+    promotion_holdout_preds = pd.Series(dtype=float)
+    promotion_use_quantile_lcb = os.getenv("PROMOTION_USE_QUANTILE_LCB", "1").strip() in {"1", "true", "True"}
+    promotion_calibration_target = calibration_col or label_col
+    _promotion_calib_series = (
+        train_df[promotion_calibration_target].dropna()
+        if promotion_calibration_target in train_df.columns
+        else pd.Series(dtype=float)
+    )
+    promotion_calibration_map = build_calibration_map(_promotion_calib_series, n_quantiles=20)
+
+    def _prepare_promotion_predictions(frame: pd.DataFrame, pred: pd.Series) -> pd.Series:
+        """Apply inference-time scoring transforms for promotion evaluation."""
+        scored = pd.to_numeric(pd.Series(pred, index=frame.index), errors="coerce").astype(float)
+
+        if (
+            bool(getattr(cfg, "apply_prediction_recalibration", True))
+            and isinstance(prediction_recalibration, dict)
+            and bool(prediction_recalibration.get("enabled", False))
+        ):
+            try:
+                slope = float(prediction_recalibration.get("slope", 1.0))
+                intercept = float(prediction_recalibration.get("intercept", 0.0))
+                scored = (scored * slope) + intercept
+            except Exception as e:
+                logger.warning("Promotion eval: linear recalibration skipped due to invalid payload: %s", e)
+
+        if promotion_calibration_map and promotion_calibration_map.get("values"):
+            try:
+                scored = (
+                    calibrate_predictions(scored, promotion_calibration_map, method="rank_preserve")
+                    .reindex(frame.index)
+                    .astype(float)
+                )
+            except Exception as e:
+                logger.warning("Promotion eval: rank-preserving calibration failed: %s", e)
+
+        if promotion_use_quantile_lcb and quantile_models_for_eval:
+            try:
+                q_df = predict_quantile_lcb(
+                    quantile_models_for_eval,
+                    frame[selected_features],
+                    feature_cols=selected_features,
+                    lcb_risk_aversion=float(getattr(cfg, "lcb_risk_aversion", 0.5)),
+                )
+                scored = q_df["pred_return_lcb"].reindex(frame.index).astype(float)
+            except Exception as e:
+                logger.warning("Promotion eval: quantile LCB fallback to calibrated base (reason: %s)", e)
+
+        return scored
     
     if not holdout_df.empty and len(reg_holdout_preds) > 0:
-        # Compute calibration against the TRAINED target (alpha or absolute)
-        # This measures how well the model predicts what it was trained to predict
         holdout_pred_series = pd.Series(reg_holdout_preds, index=holdout_df.index)
         holdout_true_series = holdout_df[label_col]
-        calibration_result = compute_calibration(
-            holdout_pred_series,
-            holdout_true_series,
-            n_bins=10
-        )
-        calibration_metrics = {
-            "calibration_error": calibration_result["calibration_error"],
-            "expected_calibration_error": calibration_result.get("expected_calibration_error", float("nan")),
-            "directional_brier": calibration_result.get("directional_brier", float("nan")),
-            "calibration_slope": calibration_result.get("calibration_slope", float("nan")),
-            "calibration_intercept": calibration_result.get("calibration_intercept", float("nan")),
-            "n_deciles": len(calibration_result["by_decile"]) if isinstance(calibration_result["by_decile"], pd.DataFrame) else 0,
-        }
-        logger.info(
-            "Calibration: mse=%.6f ece=%.6f slope=%.3f brier=%.4f",
-            calibration_result["calibration_error"],
-            calibration_metrics["expected_calibration_error"],
-            calibration_metrics["calibration_slope"],
-            calibration_metrics["directional_brier"],
-        )
 
         # Optional post-model linear recalibration for inference.
         # This keeps rank ordering mostly intact while correcting scale/bias.
@@ -1831,6 +1877,34 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                     )
                 except Exception as e:
                     logger.warning("Prediction recalibration fit failed; disabled: %s", e)
+
+        promotion_holdout_preds = _prepare_promotion_predictions(holdout_df, holdout_pred_series)
+        holdout_calibration_series = (
+            holdout_df[promotion_calibration_target]
+            if promotion_calibration_target in holdout_df.columns
+            else holdout_true_series
+        )
+        calibration_result = compute_calibration(
+            promotion_holdout_preds,
+            holdout_calibration_series,
+            n_bins=10,
+        )
+        calibration_metrics = {
+            "calibration_error": calibration_result["calibration_error"],
+            "expected_calibration_error": calibration_result.get("expected_calibration_error", float("nan")),
+            "directional_brier": calibration_result.get("directional_brier", float("nan")),
+            "calibration_slope": calibration_result.get("calibration_slope", float("nan")),
+            "calibration_intercept": calibration_result.get("calibration_intercept", float("nan")),
+            "n_deciles": len(calibration_result["by_decile"]) if isinstance(calibration_result["by_decile"], pd.DataFrame) else 0,
+            "calibration_target_column": promotion_calibration_target,
+        }
+        logger.info(
+            "Calibration (promotion scoring): mse=%.6f ece=%.6f slope=%.3f brier=%.4f",
+            calibration_result["calibration_error"],
+            calibration_metrics["expected_calibration_error"],
+            calibration_metrics["calibration_slope"],
+            calibration_metrics["directional_brier"],
+        )
         
         # Compute portfolio metrics from top-N daily returns.
         # If cost-aware labels are present, this evaluates on net returns.
@@ -1872,9 +1946,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Run REALISTIC portfolio simulation (5-day holding, proper costs)
     # This is more realistic than daily rebalancing
     realistic_metrics = {}
-    if not holdout_df.empty and len(reg_holdout_preds) > 0:
+    if not holdout_df.empty and len(promotion_holdout_preds) > 0:
         holdout_with_preds = holdout_df.copy()
-        holdout_with_preds["pred_return"] = reg_holdout_preds
+        holdout_with_preds["pred_return"] = promotion_holdout_preds.reindex(holdout_with_preds.index).values
         holdout_with_preds["ticker"] = holdout_with_preds.index if "ticker" not in holdout_with_preds.columns else holdout_with_preds["ticker"]
         sim_label_col = "future_ret_net" if "future_ret_net" in holdout_with_preds.columns else "future_ret"
         sim_cost_bps = 0.0 if sim_label_col == "future_ret_net" else 20.0
@@ -1962,10 +2036,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                     base_blend=regime_base_blend,
                 )
                 period_preds = period_gated["pred_return"].values.astype(float)
+
+            period_pred_series = pd.Series(period_preds, index=period_test_df.index, dtype=float)
+            period_promotion_preds = _prepare_promotion_predictions(period_test_df, period_pred_series)
             
             # Evaluate with realistic simulation
             period_test_df = period_test_df.copy()
-            period_test_df["pred_return"] = period_preds
+            period_test_df["pred_return"] = period_promotion_preds.reindex(period_test_df.index).values
             period_test_df["ticker"] = period_test_df.index if "ticker" not in period_test_df.columns else period_test_df["ticker"]
             
             period_result = simulate_realistic_portfolio(
@@ -2147,9 +2224,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         # When training on risk-adjusted labels, we calibrate to the ACTUAL return
         # distribution (e.g. peak_alpha) so pred_return is in interpretable units
         # for sell prices, entry filters, and reporting.
-        "prediction_calibration": build_calibration_map(
-            panel[calibration_col or label_col].dropna(), n_quantiles=20
-        ),
+        "prediction_calibration": promotion_calibration_map,
         # Optional linear recalibration from holdout predictions to realized labels.
         "prediction_recalibration": prediction_recalibration,
         # Target encodings for inference
