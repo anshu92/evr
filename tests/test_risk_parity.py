@@ -164,3 +164,45 @@ def test_unified_optimizer_turnover_penalty_keeps_weights_closer_to_current():
     low_dist = float(np.abs(low_penalty - current_weights.reindex(low_penalty.index).fillna(0.0)).sum())
     high_dist = float(np.abs(high_penalty - current_weights.reindex(high_penalty.index).fillna(0.0)).sum())
     assert high_dist <= low_dist + 1e-8
+
+
+def test_unified_optimizer_shrinkage_cov_stable_on_collinear_prices():
+    np.random.seed(33)
+    idx = pd.date_range("2025-01-01", periods=100, freq="B")
+    base = np.cumprod(1.0 + np.random.normal(0, 0.004, len(idx)))
+    # Strong collinearity across names makes sample covariance ill-conditioned.
+    prices = pd.DataFrame(
+        {
+            "A": 100.0 * base,
+            "B": 90.0 * (base * 1.0002),
+            "C": 80.0 * (base * 0.9998),
+        },
+        index=idx,
+    )
+    features = pd.DataFrame(
+        {
+            "pred_return": [0.03, 0.025, 0.02],
+            "vol_60d_ann": [0.15, 0.16, 0.17],
+            "beta": [1.05, 1.00, 0.95],
+            "avg_dollar_volume_cad": [10_000_000, 9_500_000, 9_000_000],
+        },
+        index=["A", "B", "C"],
+    )
+    base_weights = pd.DataFrame({"weight": [0.34, 0.33, 0.33]}, index=features.index)
+
+    out = optimize_unified_portfolio(
+        base_weights,
+        features=features,
+        prices=prices,
+        current_weights=pd.Series({"A": 0.2, "B": 0.2, "C": 0.2}),
+        use_shrinkage_cov=True,
+        shrinkage_min_obs=30,
+        max_position_pct=0.25,
+        max_corr_weight=0.55,
+        corr_threshold=0.7,
+        logger=logging.getLogger("test"),
+    )
+
+    assert np.isfinite(out["weight"]).all()
+    assert float(out["weight"].sum()) <= 1.0 + 1e-8
+    assert float(out["weight"].max()) <= 0.25 + 1e-8

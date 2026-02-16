@@ -157,10 +157,35 @@ def aggregate_walk_forward_results(period_results: list[dict]) -> dict[str, obje
     sharpe_values = [r.get("sharpe_ratio", float("nan")) for r in period_results]
     sharpe_positive = sum(1 for s in sharpe_values if s and not np.isnan(s) and s > 0)
     consistency = sharpe_positive / len(sharpe_values) if sharpe_values else 0.0
-    
+
+    # PBO-style robustness proxy:
+    # - failure_rate: share of periods with non-positive Sharpe
+    # - instability_score: variability of return/day vs absolute mean
+    # Lower is better; 0.0 means robust.
+    failure_rate = 1.0 - consistency
+    return_day_values = [
+        float(r.get("return_per_day"))
+        for r in period_results
+        if r.get("return_per_day") is not None and np.isfinite(float(r.get("return_per_day")))
+    ]
+    instability_ratio = float("nan")
+    if len(return_day_values) >= 2:
+        rp = np.array(return_day_values, dtype=float)
+        mu_abs = abs(float(np.mean(rp)))
+        sigma = float(np.std(rp))
+        instability_ratio = sigma / (mu_abs + 1e-8)
+    if np.isfinite(instability_ratio):
+        instability_score = float(np.clip(1.0 - np.exp(-instability_ratio), 0.0, 1.0))
+    else:
+        instability_score = 0.5
+    pbo_proxy = float(np.clip((0.6 * failure_rate) + (0.4 * instability_score), 0.0, 1.0))
+
     return {
         "n_periods": len(period_results),
         "consistency": consistency,  # % of periods with positive Sharpe
+        "oos_failure_rate": failure_rate,
+        "instability_ratio": instability_ratio,
+        "pbo_proxy": pbo_proxy,
         "aggregate": aggregated,
         "per_period": period_results,
     }
@@ -170,11 +195,13 @@ def evaluate_model_promotion_gates(
     *,
     realistic_metrics: dict[str, object] | None,
     walk_forward_results: dict[str, object] | None,
+    calibration_metrics: dict[str, object] | None = None,
     thresholds: dict[str, float | int] | None = None,
 ) -> dict[str, object]:
     """Evaluate statistical/business gates required for model promotion."""
     realistic_metrics = realistic_metrics or {}
     walk_forward_results = walk_forward_results or {}
+    calibration_metrics = calibration_metrics or {}
     thr = {
         "min_return_per_day": 0.0002,
         "min_cost_adjusted_sharpe": 0.5,
@@ -183,6 +210,11 @@ def evaluate_model_promotion_gates(
         "min_turnover_efficiency": 0.20,
         "max_avg_turnover": 0.80,
         "min_periods": 2,
+        # Optional calibration gates (disabled unless finite thresholds supplied).
+        "max_calibration_error": float("inf"),
+        "min_calibration_slope": float("-inf"),
+        # Optional overfit robustness gate (disabled unless finite threshold supplied).
+        "max_pbo_proxy": float("inf"),
     }
     if thresholds:
         thr.update(thresholds)
@@ -219,6 +251,9 @@ def evaluate_model_promotion_gates(
         realistic_metrics.get("avg_turnover", float("nan")),
     )
     n_periods = int(walk_forward_results.get("n_periods", 0))
+    calibration_error = float(calibration_metrics.get("calibration_error", float("nan")))
+    calibration_slope = float(calibration_metrics.get("calibration_slope", float("nan")))
+    pbo_proxy = float(walk_forward_results.get("pbo_proxy", float("nan")))
 
     gates = [
         {
@@ -271,6 +306,43 @@ def evaluate_model_promotion_gates(
             "passed": bool(n_periods >= int(thr["min_periods"])),
         },
     ]
+
+    max_calib_err_thr = float(thr["max_calibration_error"])
+    if np.isfinite(max_calib_err_thr):
+        gates.append(
+            {
+                "name": "calibration_error_cap",
+                "operator": "<=",
+                "actual": calibration_error,
+                "threshold": max_calib_err_thr,
+                "passed": bool(np.isfinite(calibration_error) and calibration_error <= max_calib_err_thr),
+            }
+        )
+
+    min_calib_slope_thr = float(thr["min_calibration_slope"])
+    if np.isfinite(min_calib_slope_thr):
+        gates.append(
+            {
+                "name": "calibration_slope_floor",
+                "operator": ">=",
+                "actual": calibration_slope,
+                "threshold": min_calib_slope_thr,
+                "passed": bool(np.isfinite(calibration_slope) and calibration_slope >= min_calib_slope_thr),
+            }
+        )
+
+    max_pbo_thr = float(thr["max_pbo_proxy"])
+    if np.isfinite(max_pbo_thr):
+        gates.append(
+            {
+                "name": "pbo_proxy_cap",
+                "operator": "<=",
+                "actual": pbo_proxy,
+                "threshold": max_pbo_thr,
+                "passed": bool(np.isfinite(pbo_proxy) and pbo_proxy <= max_pbo_thr),
+            }
+        )
+
     passed = all(g["passed"] for g in gates)
     return {
         "passed": passed,
@@ -284,6 +356,9 @@ def evaluate_model_promotion_gates(
             "turnover_efficiency": turnover_eff,
             "avg_turnover": avg_turnover,
             "n_periods": n_periods,
+            "calibration_error": calibration_error,
+            "calibration_slope": calibration_slope,
+            "pbo_proxy": pbo_proxy,
         },
     }
 
@@ -716,18 +791,39 @@ def compute_portfolio_metrics(
 def compute_calibration(predictions: pd.Series, realized: pd.Series, n_bins: int = 10) -> dict[str, object]:
     """Measure prediction calibration across deciles."""
     if predictions.empty or realized.empty:
-        return {"calibration_error": float("nan"), "by_decile": pd.DataFrame()}
+        return {
+            "calibration_error": float("nan"),
+            "expected_calibration_error": float("nan"),
+            "directional_brier": float("nan"),
+            "calibration_slope": float("nan"),
+            "calibration_intercept": float("nan"),
+            "by_decile": pd.DataFrame(),
+        }
     
     df = pd.DataFrame({"pred": predictions, "real": realized}).dropna()
     
     if len(df) < n_bins:
-        return {"calibration_error": float("nan"), "by_decile": pd.DataFrame()}
+        return {
+            "calibration_error": float("nan"),
+            "expected_calibration_error": float("nan"),
+            "directional_brier": float("nan"),
+            "calibration_slope": float("nan"),
+            "calibration_intercept": float("nan"),
+            "by_decile": pd.DataFrame(),
+        }
     
     try:
         df["decile"] = pd.qcut(df["pred"], n_bins, labels=False, duplicates="drop")
     except ValueError:
         # Not enough unique values for binning
-        return {"calibration_error": float("nan"), "by_decile": pd.DataFrame()}
+        return {
+            "calibration_error": float("nan"),
+            "expected_calibration_error": float("nan"),
+            "directional_brier": float("nan"),
+            "calibration_slope": float("nan"),
+            "calibration_intercept": float("nan"),
+            "by_decile": pd.DataFrame(),
+        }
     
     calibration = df.groupby("decile").agg({
         "pred": ["mean", "count"],
@@ -738,8 +834,42 @@ def compute_calibration(predictions: pd.Series, realized: pd.Series, n_bins: int
     # Perfect calibration: pred_mean == real_mean for each decile
     # Use MSE as calibration error
     calibration_error = np.mean((calibration["pred_mean"] - calibration["real_mean"])**2)
+
+    # Expected calibration error (weighted absolute calibration gap).
+    count_total = float(calibration["count"].sum())
+    if count_total > 0:
+        weights = calibration["count"] / count_total
+        expected_calibration_error = float(
+            np.sum(weights * np.abs(calibration["pred_mean"] - calibration["real_mean"]))
+        )
+    else:
+        expected_calibration_error = float("nan")
+
+    # Reliability slope/intercept from linear fit: real ~= a*pred + b.
+    calibration_slope = float("nan")
+    calibration_intercept = float("nan")
+    pred_std = float(df["pred"].std(ddof=0))
+    if np.isfinite(pred_std) and pred_std > 0:
+        try:
+            slope, intercept = np.polyfit(df["pred"].values.astype(float), df["real"].values.astype(float), 1)
+            calibration_slope = float(slope)
+            calibration_intercept = float(intercept)
+        except Exception:
+            pass
+
+    # Directional calibration quality via Brier score of up/down probability.
+    directional_brier = float("nan")
+    if np.isfinite(pred_std) and pred_std > 0:
+        z = (df["pred"] - float(df["pred"].mean())) / pred_std
+        p_up = 1.0 / (1.0 + np.exp(-z.clip(-20, 20)))
+        y_up = (df["real"] > 0).astype(float)
+        directional_brier = float(np.mean(np.square(p_up - y_up)))
     
     return {
         "calibration_error": float(calibration_error),
+        "expected_calibration_error": expected_calibration_error,
+        "directional_brier": directional_brier,
+        "calibration_slope": calibration_slope,
+        "calibration_intercept": calibration_intercept,
         "by_decile": calibration.reset_index(),
     }

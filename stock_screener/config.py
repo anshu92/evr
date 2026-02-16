@@ -45,6 +45,8 @@ class Config:
     cost_model_base_bps: float = 3.0
     cost_model_spread_coef: float = 0.5
     cost_model_vol_coef: float = 0.5
+    prediction_recalibration_enabled: bool = True
+    apply_prediction_recalibration: bool = True
     
     # Training configuration
     use_fundamentals_in_training: bool = False  # Set to False to avoid lookahead bias
@@ -73,6 +75,8 @@ class Config:
     optimizer_turnover_penalty: float = 1.0
     optimizer_cost_penalty: float = 1.0
     optimizer_beta_tolerance: float = 0.25
+    optimizer_use_shrinkage_cov: bool = True
+    optimizer_shrinkage_min_obs: int = 40
     
     # Training target and objective
     use_market_relative_returns: bool = True  # Train on alpha (stock return - market return) instead of absolute returns
@@ -230,6 +234,9 @@ class Config:
     promotion_min_turnover_efficiency: float = 0.20
     promotion_max_avg_turnover: float = 0.80
     promotion_min_periods: int = 2
+    promotion_max_calibration_error: float = float("inf")
+    promotion_min_calibration_slope: float = float("-inf")
+    promotion_max_pbo_proxy: float = float("inf")
 
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
@@ -303,6 +310,8 @@ class Config:
             cost_model_base_bps=_get_float("COST_MODEL_BASE_BPS", 3.0),
             cost_model_spread_coef=_get_float("COST_MODEL_SPREAD_COEF", 0.5),
             cost_model_vol_coef=_get_float("COST_MODEL_VOL_COEF", 0.5),
+            prediction_recalibration_enabled=_get_bool("PREDICTION_RECALIBRATION_ENABLED", True),
+            apply_prediction_recalibration=_get_bool("APPLY_PREDICTION_RECALIBRATION", True),
             use_fundamentals_in_training=os.getenv("USE_FUNDAMENTALS_IN_TRAINING", "0").strip() in {"1", "true", "True"},
             train_ensemble_seeds=None,  # Use default in train.py
             train_cv_splits=_get_int("TRAIN_CV_SPLITS", 3) or 3,
@@ -325,6 +334,8 @@ class Config:
             optimizer_turnover_penalty=_get_float("OPTIMIZER_TURNOVER_PENALTY", 1.0),
             optimizer_cost_penalty=_get_float("OPTIMIZER_COST_PENALTY", 1.0),
             optimizer_beta_tolerance=_get_float("OPTIMIZER_BETA_TOLERANCE", 0.25),
+            optimizer_use_shrinkage_cov=_get_bool("OPTIMIZER_USE_SHRINKAGE_COV", True),
+            optimizer_shrinkage_min_obs=_get_int("OPTIMIZER_SHRINKAGE_MIN_OBS", 40) or 40,
             use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
             use_ranking_objective=os.getenv("USE_RANKING_OBJECTIVE", "1").strip() in {"1", "true", "True"},
             xgb_ranking_objective=_get_str("XGB_RANKING_OBJECTIVE", "rank:pairwise"),
@@ -464,6 +475,9 @@ class Config:
             promotion_min_turnover_efficiency=_get_float("PROMOTION_MIN_TURNOVER_EFFICIENCY", 0.20),
             promotion_max_avg_turnover=_get_float("PROMOTION_MAX_AVG_TURNOVER", 0.80),
             promotion_min_periods=_get_int("PROMOTION_MIN_PERIODS", 2) or 2,
+            promotion_max_calibration_error=_get_float("PROMOTION_MAX_CALIBRATION_ERROR", float("inf")),
+            promotion_min_calibration_slope=_get_float("PROMOTION_MIN_CALIBRATION_SLOPE", float("-inf")),
+            promotion_max_pbo_proxy=_get_float("PROMOTION_MAX_PBO_PROXY", float("inf")),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(

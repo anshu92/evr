@@ -47,8 +47,14 @@ def test_calibration_perfect():
     result = compute_calibration(predictions, realized, n_bins=10)
     
     assert "calibration_error" in result
+    assert "expected_calibration_error" in result
+    assert "calibration_slope" in result
+    assert "calibration_intercept" in result
+    assert "directional_brier" in result
     # Perfect calibration should have very low error
     assert result["calibration_error"] < 0.001
+    assert result["expected_calibration_error"] < 0.02
+    assert result["calibration_slope"] == pytest.approx(1.0, abs=0.1)
 
 
 def test_calibration_poor():
@@ -60,6 +66,8 @@ def test_calibration_poor():
     result = compute_calibration(predictions, realized, n_bins=10)
     
     assert "calibration_error" in result
+    assert "expected_calibration_error" in result
+    assert "calibration_slope" in result
     assert "by_decile" in result
 
 

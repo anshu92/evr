@@ -1,4 +1,4 @@
-from stock_screener.modeling.eval import evaluate_model_promotion_gates
+from stock_screener.modeling.eval import aggregate_walk_forward_results, evaluate_model_promotion_gates
 
 
 def test_model_promotion_gates_pass_when_all_thresholds_met():
@@ -66,3 +66,65 @@ def test_model_promotion_gates_use_walk_forward_aggregate_when_available():
     }
     out = evaluate_model_promotion_gates(realistic_metrics=realistic, walk_forward_results=walk_forward)
     assert out["passed"] is True
+
+
+def test_model_promotion_gates_optional_calibration_gates():
+    realistic = {
+        "return_per_day": 0.00035,
+        "cost_adjusted_sharpe": 0.92,
+        "max_drawdown": -0.12,
+        "turnover_efficiency": 0.45,
+        "avg_turnover": 0.35,
+    }
+    walk_forward = {"consistency": 0.75, "n_periods": 3}
+
+    pass_out = evaluate_model_promotion_gates(
+        realistic_metrics=realistic,
+        walk_forward_results=walk_forward,
+        calibration_metrics={"calibration_error": 0.004, "calibration_slope": 0.80},
+        thresholds={"max_calibration_error": 0.01, "min_calibration_slope": 0.25},
+    )
+    assert pass_out["passed"] is True
+    assert all(g["passed"] for g in pass_out["gates"])
+
+    fail_out = evaluate_model_promotion_gates(
+        realistic_metrics=realistic,
+        walk_forward_results=walk_forward,
+        calibration_metrics={"calibration_error": 0.020, "calibration_slope": 0.10},
+        thresholds={"max_calibration_error": 0.01, "min_calibration_slope": 0.25},
+    )
+    assert fail_out["passed"] is False
+    failed = {g["name"] for g in fail_out["gates"] if not g["passed"]}
+    assert "calibration_error_cap" in failed
+    assert "calibration_slope_floor" in failed
+
+
+def test_walk_forward_aggregate_emits_pbo_proxy():
+    period_results = [
+        {"sharpe_ratio": 1.1, "return_per_day": 0.0006},
+        {"sharpe_ratio": 0.2, "return_per_day": 0.0001},
+        {"sharpe_ratio": -0.5, "return_per_day": -0.0002},
+    ]
+    out = aggregate_walk_forward_results(period_results)
+    assert out["n_periods"] == 3
+    assert "pbo_proxy" in out
+    assert 0.0 <= float(out["pbo_proxy"]) <= 1.0
+
+
+def test_model_promotion_gates_optional_pbo_proxy_gate():
+    realistic = {
+        "return_per_day": 0.00035,
+        "cost_adjusted_sharpe": 0.92,
+        "max_drawdown": -0.12,
+        "turnover_efficiency": 0.45,
+        "avg_turnover": 0.35,
+    }
+    walk_forward = {"consistency": 0.75, "n_periods": 3, "pbo_proxy": 0.60}
+    out = evaluate_model_promotion_gates(
+        realistic_metrics=realistic,
+        walk_forward_results=walk_forward,
+        thresholds={"max_pbo_proxy": 0.45},
+    )
+    assert out["passed"] is False
+    failed = {g["name"] for g in out["gates"] if not g["passed"]}
+    assert "pbo_proxy_cap" in failed

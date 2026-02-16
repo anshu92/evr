@@ -1716,20 +1716,68 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Enhanced metrics including calibration and portfolio stats
     calibration_metrics = {}
     portfolio_metrics = {}
+    prediction_recalibration = {
+        "enabled": False,
+        "method": "linear",
+        "slope": 1.0,
+        "intercept": 0.0,
+        "n_samples": 0,
+    }
     
     if not holdout_df.empty and len(reg_holdout_preds) > 0:
         # Compute calibration against the TRAINED target (alpha or absolute)
         # This measures how well the model predicts what it was trained to predict
+        holdout_pred_series = pd.Series(reg_holdout_preds, index=holdout_df.index)
+        holdout_true_series = holdout_df[label_col]
         calibration_result = compute_calibration(
-            pd.Series(reg_holdout_preds, index=holdout_df.index),
-            holdout_df[label_col],
+            holdout_pred_series,
+            holdout_true_series,
             n_bins=10
         )
         calibration_metrics = {
             "calibration_error": calibration_result["calibration_error"],
+            "expected_calibration_error": calibration_result.get("expected_calibration_error", float("nan")),
+            "directional_brier": calibration_result.get("directional_brier", float("nan")),
+            "calibration_slope": calibration_result.get("calibration_slope", float("nan")),
+            "calibration_intercept": calibration_result.get("calibration_intercept", float("nan")),
             "n_deciles": len(calibration_result["by_decile"]) if isinstance(calibration_result["by_decile"], pd.DataFrame) else 0,
         }
-        logger.info("Calibration error: %.6f", calibration_result["calibration_error"])
+        logger.info(
+            "Calibration: mse=%.6f ece=%.6f slope=%.3f brier=%.4f",
+            calibration_result["calibration_error"],
+            calibration_metrics["expected_calibration_error"],
+            calibration_metrics["calibration_slope"],
+            calibration_metrics["directional_brier"],
+        )
+
+        # Optional post-model linear recalibration for inference.
+        # This keeps rank ordering mostly intact while correcting scale/bias.
+        if bool(getattr(cfg, "prediction_recalibration_enabled", True)):
+            calib_df = pd.DataFrame({"pred": holdout_pred_series, "real": holdout_true_series}).dropna()
+            if len(calib_df) >= 30 and float(calib_df["pred"].std(ddof=0)) > 0:
+                try:
+                    slope, intercept = np.polyfit(
+                        calib_df["pred"].values.astype(float),
+                        calib_df["real"].values.astype(float),
+                        1,
+                    )
+                    slope = float(np.clip(slope, -5.0, 5.0))
+                    intercept = float(np.clip(intercept, -1.0, 1.0))
+                    prediction_recalibration = {
+                        "enabled": True,
+                        "method": "linear",
+                        "slope": slope,
+                        "intercept": intercept,
+                        "n_samples": int(len(calib_df)),
+                    }
+                    logger.info(
+                        "Fitted prediction recalibration: y=%.4f*x + %.4f (n=%d)",
+                        slope,
+                        intercept,
+                        len(calib_df),
+                    )
+                except Exception as e:
+                    logger.warning("Prediction recalibration fit failed; disabled: %s", e)
         
         # Compute portfolio metrics from top-N daily returns.
         # If cost-aware labels are present, this evaluates on net returns.
@@ -1920,10 +1968,14 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "min_turnover_efficiency": float(getattr(cfg, "promotion_min_turnover_efficiency", 0.20)),
         "max_avg_turnover": float(getattr(cfg, "promotion_max_avg_turnover", 0.80)),
         "min_periods": int(getattr(cfg, "promotion_min_periods", 2)),
+        "max_calibration_error": float(getattr(cfg, "promotion_max_calibration_error", float("inf"))),
+        "min_calibration_slope": float(getattr(cfg, "promotion_min_calibration_slope", float("-inf"))),
+        "max_pbo_proxy": float(getattr(cfg, "promotion_max_pbo_proxy", float("inf"))),
     }
     promotion_gate_report = evaluate_model_promotion_gates(
         realistic_metrics=realistic_metrics,
         walk_forward_results=walk_forward_results,
+        calibration_metrics=calibration_metrics,
         thresholds=promotion_thresholds,
     )
     logger.info(
@@ -1983,6 +2035,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "regime_specialist_enabled": regime_enabled,
             "regime_gating_base_blend": regime_base_blend,
             "regime_specialist_min_samples": regime_min_samples,
+            "prediction_recalibration_enabled": bool(getattr(cfg, "prediction_recalibration_enabled", True)),
         },
         "feature_columns": selected_features,  # Features used in final models (after selection)
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -2040,6 +2093,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "prediction_calibration": build_calibration_map(
             panel[calibration_col or label_col].dropna(), n_quantiles=20
         ),
+        # Optional linear recalibration from holdout predictions to realized labels.
+        "prediction_recalibration": prediction_recalibration,
         # Target encodings for inference
         "target_encodings": {
             "sector": sector_encodings,

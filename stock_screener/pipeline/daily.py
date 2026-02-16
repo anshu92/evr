@@ -596,6 +596,26 @@ def run_daily(cfg: Config, logger) -> None:
                             logger.warning("Regime specialist gating failed; falling back to base ensemble: %s", ge)
                     
                     # Apply prediction calibration if available
+                    recalib_payload = model_metadata.get("prediction_recalibration") if model_metadata else None
+                    if (
+                        bool(getattr(cfg, "apply_prediction_recalibration", True))
+                        and isinstance(recalib_payload, dict)
+                        and bool(recalib_payload.get("enabled", False))
+                    ):
+                        try:
+                            slope = float(recalib_payload.get("slope", 1.0))
+                            intercept = float(recalib_payload.get("intercept", 0.0))
+                            recalibrated = (raw_preds * slope) + intercept
+                            features["pred_return_linear_recal"] = recalibrated
+                            raw_preds = recalibrated
+                            logger.info(
+                                "Applied linear prediction recalibration: y=%.4f*x + %.4f",
+                                slope,
+                                intercept,
+                            )
+                        except Exception as re:
+                            logger.warning("Prediction recalibration payload invalid; skipping: %s", re)
+
                     calibration_map = model_metadata.get("prediction_calibration") if model_metadata else None
                     if calibration_map and calibration_map.get("values"):
                         calibrated = calibrate_predictions(raw_preds, calibration_map, method="rank_preserve")
@@ -817,6 +837,8 @@ def run_daily(cfg: Config, logger) -> None:
             turnover_penalty=getattr(cfg, "optimizer_turnover_penalty", 1.0),
             cost_penalty=getattr(cfg, "optimizer_cost_penalty", 1.0),
             lookback_days=60,
+            use_shrinkage_cov=bool(getattr(cfg, "optimizer_use_shrinkage_cov", True)),
+            shrinkage_min_obs=int(getattr(cfg, "optimizer_shrinkage_min_obs", 40)),
             allow_cash=True,
             logger=logger,
         )
@@ -826,6 +848,8 @@ def run_daily(cfg: Config, logger) -> None:
             "turnover_penalty": float(getattr(cfg, "optimizer_turnover_penalty", 1.0)),
             "cost_penalty": float(getattr(cfg, "optimizer_cost_penalty", 1.0)),
             "beta_tolerance": float(getattr(cfg, "optimizer_beta_tolerance", 0.25)),
+            "use_shrinkage_cov": bool(getattr(cfg, "optimizer_use_shrinkage_cov", True)),
+            "shrinkage_min_obs": int(getattr(cfg, "optimizer_shrinkage_min_obs", 40)),
         }
     else:
         # Legacy sequential transforms.

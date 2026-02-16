@@ -9,6 +9,13 @@ try:
 except ImportError:
     SCIPY_AVAILABLE = False
 
+try:
+    from sklearn.covariance import LedoitWolf
+    SKLEARN_AVAILABLE = True
+except Exception:
+    LedoitWolf = None
+    SKLEARN_AVAILABLE = False
+
 
 def _cap_weights(w: pd.Series, cap: float, *, allow_cash: bool) -> pd.Series:
     cap = float(cap)
@@ -224,6 +231,48 @@ def _estimate_cost_vector(
     return out.values.astype(float)
 
 
+def _estimate_covariance_matrix(
+    returns: pd.DataFrame,
+    *,
+    tickers: list[str],
+    use_shrinkage_cov: bool,
+    shrinkage_min_obs: int,
+) -> tuple[np.ndarray, str]:
+    """Estimate annualized covariance matrix with optional Ledoit-Wolf shrinkage."""
+    aligned = returns.reindex(columns=tickers)
+    if aligned.empty:
+        return np.eye(len(tickers), dtype=float) * (0.30 * 0.30), "fallback_diagonal"
+
+    if (
+        use_shrinkage_cov
+        and SKLEARN_AVAILABLE
+        and LedoitWolf is not None
+        and len(aligned) >= max(10, int(shrinkage_min_obs))
+        and aligned.shape[1] >= 2
+    ):
+        try:
+            # Ledoit-Wolf requires finite matrix. Fill sparse missing values
+            # with per-column means, then 0 for fully-missing columns.
+            filled = aligned.copy()
+            col_means = filled.mean(axis=0)
+            filled = filled.fillna(col_means).fillna(0.0)
+            lw = LedoitWolf().fit(filled.values.astype(float))
+            cov = np.asarray(lw.covariance_, dtype=float) * 252.0
+            return cov, f"ledoit_wolf({float(lw.shrinkage_):.3f})"
+        except Exception:
+            # Fall through to sample covariance.
+            pass
+
+    cov_df = aligned.cov() * 252.0
+    cov = (
+        cov_df.reindex(index=tickers, columns=tickers)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .values.astype(float)
+    )
+    return cov, "sample"
+
+
 def optimize_unified_portfolio(
     weights_df: pd.DataFrame,
     features: pd.DataFrame,
@@ -242,6 +291,8 @@ def optimize_unified_portfolio(
     turnover_penalty: float = 1.0,
     cost_penalty: float = 1.0,
     lookback_days: int = 60,
+    use_shrinkage_cov: bool = True,
+    shrinkage_min_obs: int = 40,
     allow_cash: bool = True,
     logger=None,
 ) -> pd.DataFrame:
@@ -319,13 +370,18 @@ def optimize_unified_portfolio(
     close_prices = _extract_close_prices(prices, tickers, lookback_days=lookback_days)
     corr_matrix = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
     cov = None
+    cov_method = "diagonal"
     if not close_prices.empty and close_prices.shape[1] >= 2:
         returns = close_prices.pct_change(fill_method=None).dropna(how="all")
         returns = returns.replace([np.inf, -np.inf], np.nan).dropna(how="all")
         if len(returns) >= 20:
-            cov_df = returns.cov() * 252.0
             corr_matrix = returns.corr()
-            cov = cov_df.reindex(index=tickers, columns=tickers).fillna(0.0).values.astype(float)
+            cov, cov_method = _estimate_covariance_matrix(
+                returns,
+                tickers=tickers,
+                use_shrinkage_cov=bool(use_shrinkage_cov),
+                shrinkage_min_obs=max(10, int(shrinkage_min_obs)),
+            )
             corr_matrix = corr_matrix.reindex(index=tickers, columns=tickers).fillna(0.0)
     if cov is None:
         if vol_col in features.columns:
@@ -334,6 +390,7 @@ def optimize_unified_portfolio(
         else:
             var = np.full(n, 0.30 * 0.30, dtype=float)
         cov = np.diag(var)
+        cov_method = "diagonal_vol"
     # Numerical regularization for SLSQP stability.
     cov = cov + (1e-8 * np.eye(n))
 
@@ -443,13 +500,19 @@ def optimize_unified_portfolio(
     result["weight"] = pd.Series(w_opt, index=result.index).clip(lower=0.0, upper=cap)
     if logger:
         port_beta = float(np.dot(result["weight"].values.astype(float), beta_vec))
+        try:
+            cov_cond = float(np.linalg.cond(cov))
+        except Exception:
+            cov_cond = float("nan")
         logger.info(
-            "Unified optimizer: n=%d, invested=%.1f%%, max_w=%.1f%%, corr_pairs=%d, beta=%.3f",
+            "Unified optimizer: n=%d, invested=%.1f%%, max_w=%.1f%%, corr_pairs=%d, beta=%.3f, cov=%s, cond=%.2e",
             n,
             float(result["weight"].sum()) * 100.0,
             float(result["weight"].max()) * 100.0,
             len(corr_pairs),
             port_beta,
+            cov_method,
+            cov_cond,
         )
     return result.sort_values("weight", ascending=False)
 
