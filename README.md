@@ -54,7 +54,7 @@ flowchart TD
   %% ---------- Daily Pipeline ----------
   subgraph DAILY[Daily Trading Pipeline - stock_screener/pipeline/daily.py]
     D0[Load Config + runtime budget] --> D1[Fetch universes<br/>US: NasdaqTrader<br/>TSX/TSXV: TSX API]
-    D1 --> D2[Fetch FX USDCAD + prices (yfinance)<br/>fundamentals and macro]
+    D1 --> D2[Fetch FX USDCAD and prices via yfinance<br/>fundamentals and macro]
     D2 --> D3[Compute features in CAD<br/>technical + regime + macro + fundamentals]
     D3 --> D4{USE_ML and model present?}
 
