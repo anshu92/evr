@@ -79,7 +79,9 @@ jobs:
           REGIME_GATING_BASE_BLEND: "0.25"
           # PR-06: Promotion gates (block deployment if failed)
           PROMOTION_GATES_ENABLED: "1"
-          ENFORCE_PROMOTION_GATES: ${{ vars.ENFORCE_PROMOTION_GATES || '1' }}
+          # Keep training job green on non-promotions by default; artifact upload is gated below.
+          # Set repo var ENFORCE_PROMOTION_GATES=1 to restore hard-fail behavior.
+          ENFORCE_PROMOTION_GATES: ${{ vars.ENFORCE_PROMOTION_GATES || '0' }}
           PROMOTION_MIN_RETURN_PER_DAY: "0.0002"
           PROMOTION_MIN_COST_ADJUSTED_SHARPE: "0.5"
           PROMOTION_MAX_DRAWDOWN: "-0.25"
@@ -95,8 +97,34 @@ jobs:
           rm -rf models/ensemble
           python -m stock_screener.cli train-model --log-level INFO
 
+      - name: Evaluate promotion gate result
+        id: promotion_gates
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metrics_path = Path("models/ensemble/metrics.json")
+          passed = False
+
+          if metrics_path.exists():
+              data = json.loads(metrics_path.read_text(encoding="utf-8"))
+              promotion = data.get("promotion_gates") or {}
+              passed = bool(promotion.get("passed", False))
+          else:
+              print("::warning::metrics.json not found; treating as not promoted.")
+
+          print(f"Promotion gates passed: {passed}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"passed={'true' if passed else 'false'}\n")
+
+          if not passed:
+              print("::warning::Model did not pass promotion gates; artifact upload will be skipped.")
+          PY
+
       - name: Upload trained model artifact
-        if: success()
+        if: success() && steps.promotion_gates.outputs.passed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: screener-model-${{ github.run_number }}
