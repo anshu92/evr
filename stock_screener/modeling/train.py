@@ -1642,6 +1642,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     elif quantile_enabled and lgb is None:
         logger.warning("Quantile models enabled but LightGBM unavailable; skipping quantile training.")
 
+    quantile_lcb_holdout_ic = float("nan")
+    if isinstance(quantile_metrics.get("lcb"), dict):
+        quantile_lcb_holdout_ic = float(quantile_metrics["lcb"].get("mean_ic", float("nan")))
+
     quantile_models_for_eval: dict[str, tuple[list, list[float] | None]] = {}
     if quantile_manifest:
         for q_name, payload in quantile_manifest.items():
@@ -1808,7 +1812,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "n_samples": 0,
     }
     promotion_holdout_preds = pd.Series(dtype=float)
-    promotion_use_quantile_lcb = os.getenv("PROMOTION_USE_QUANTILE_LCB", "1").strip() in {"1", "true", "True"}
+    promotion_use_quantile_lcb_cfg = os.getenv("PROMOTION_USE_QUANTILE_LCB", "1").strip() in {"1", "true", "True"}
+    base_holdout_ic = float(reg_holdout_metrics.get("summary", {}).get("mean_ic", float("nan")))
+    quantile_lcb_improves_holdout = bool(
+        np.isfinite(quantile_lcb_holdout_ic)
+        and quantile_lcb_holdout_ic > 0.0
+        and (not np.isfinite(base_holdout_ic) or quantile_lcb_holdout_ic >= base_holdout_ic)
+    )
+    promotion_use_quantile_lcb = bool(
+        promotion_use_quantile_lcb_cfg
+        and quantile_models_for_eval
+        and quantile_lcb_improves_holdout
+    )
+    if promotion_use_quantile_lcb_cfg and not promotion_use_quantile_lcb:
+        logger.info(
+            "Promotion eval: disabling quantile LCB (base_ic=%.4f, lcb_ic=%.4f); using calibrated base predictions",
+            base_holdout_ic,
+            quantile_lcb_holdout_ic,
+        )
+
     promotion_calibration_target = calibration_col or label_col
     _promotion_calib_series = (
         train_df[promotion_calibration_target].dropna()

@@ -92,7 +92,10 @@ jobs:
           PROMOTION_MAX_CALIBRATION_ERROR: ${{ vars.PROMOTION_MAX_CALIBRATION_ERROR || '0.010' }}
           PROMOTION_MIN_CALIBRATION_SLOPE: ${{ vars.PROMOTION_MIN_CALIBRATION_SLOPE || '0.25' }}
           PROMOTION_MAX_PBO_PROXY: ${{ vars.PROMOTION_MAX_PBO_PROXY || '0.45' }}
+          # Use calibrated base predictions for promotion scoring unless explicitly overridden.
+          PROMOTION_USE_QUANTILE_LCB: ${{ vars.PROMOTION_USE_QUANTILE_LCB || '0' }}
           PREDICTION_RECALIBRATION_ENABLED: ${{ vars.PREDICTION_RECALIBRATION_ENABLED || '1' }}
+          APPLY_PREDICTION_RECALIBRATION: ${{ vars.APPLY_PREDICTION_RECALIBRATION || '1' }}
         run: |
           rm -rf models/ensemble
           python -m stock_screener.cli train-model --log-level INFO
