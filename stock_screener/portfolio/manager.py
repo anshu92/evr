@@ -844,7 +844,8 @@ class PortfolioManager:
                 if pd.isna(px) or px <= 0:
                     # No price data – keep position; HOLD action emitted later.
                     continue
-                days = p.days_held(now)
+                # Use trading days consistently for all max-hold logic.
+                days = _trading_days_between(p.entry_date, now)
                 
                 # Get current predictions for this ticker (if available in screened)
                 ticker_data = screened[screened.index == t] if t in screened.index else None
@@ -1099,7 +1100,7 @@ class PortfolioManager:
         holdings["entry_price_cad"] = pd.NA
         for t, p in self._positions_by_ticker(state).items():
             if t in holdings.index:
-                holdings.loc[t, "days_held"] = int(p.days_held(now))
+                holdings.loc[t, "days_held"] = int(_trading_days_between(p.entry_date, now))
                 holdings.loc[t, "entry_price_cad"] = float(p.entry_price)
 
         state.last_updated = now

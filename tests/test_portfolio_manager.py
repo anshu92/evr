@@ -256,3 +256,100 @@ def test_fractional_buy_when_cash_below_share_price(tmp_path):
     assert len(buys) == 1
     assert buys[0].shares > 0
     assert buys[0].shares < 1.0
+
+
+def test_rotation_max_days_uses_trading_days(monkeypatch, tmp_path):
+    """Do not rotate purely on weekend calendar drift; use trading days."""
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)  # Monday
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)  # Friday
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=1,
+        max_holding_days_hard=2,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=1000.0,
+        positions=[Position(ticker="AAPL", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.01]}, index=["AAPL"])
+    weights = pd.DataFrame({"weight": []})
+    prices = pd.Series({"AAPL": 102.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+
+    sells = [a for a in plan.actions if a.action == "SELL" and a.ticker == "AAPL"]
+    assert len(sells) == 0
+
+
+def test_holdings_days_held_reports_trading_days(monkeypatch, tmp_path):
+    """Holdings summary should show trading days, not calendar days."""
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)  # Monday
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)  # Friday
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=1000.0,
+        positions=[Position(ticker="AAPL", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.01]}, index=["AAPL"])
+    weights = pd.DataFrame({"weight": [1.0]}, index=["AAPL"])
+    prices = pd.Series({"AAPL": 102.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+
+    assert int(plan.holdings.loc["AAPL", "days_held"]) == 1
