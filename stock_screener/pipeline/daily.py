@@ -22,7 +22,17 @@ from stock_screener.utils import Universe, ensure_dir, read_json, write_json, su
 
 # Suppress known external library warnings
 suppress_external_warnings()
-from stock_screener.modeling.model import load_ensemble, load_model, predict, predict_ensemble, predict_ensemble_with_uncertainty, predict_peak_days, compute_feature_schema_hash
+from stock_screener.modeling.model import (
+    load_ensemble,
+    load_model,
+    load_quantile_ensembles,
+    predict,
+    predict_ensemble,
+    predict_ensemble_with_uncertainty,
+    predict_peak_days,
+    predict_quantile_lcb,
+    compute_feature_schema_hash,
+)
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
 from stock_screener.portfolio.manager import PortfolioManager, TradePlan
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
@@ -387,6 +397,12 @@ def run_daily(cfg: Config, logger) -> None:
             
             if mp.name.lower() == "manifest.json":
                 models, weights, peak_model = load_ensemble(mp)
+                quantile_ensembles = {}
+                if bool(getattr(cfg, "quantile_models_enabled", True)):
+                    try:
+                        quantile_ensembles = load_quantile_ensembles(mp)
+                    except Exception as qe:
+                        logger.warning("Could not load quantile ensembles: %s", qe)
                 if models:
                     # Use uncertainty-aware predictions with selected features
                     pred_df = predict_ensemble_with_uncertainty(
@@ -409,6 +425,31 @@ def run_daily(cfg: Config, logger) -> None:
                     
                     features["pred_uncertainty"] = pred_df["pred_uncertainty"]
                     features["pred_confidence"] = pred_df["pred_confidence"]
+                    features["pred_return_base"] = features["pred_return"]
+
+                    # Optional quantile + LCB override.
+                    if quantile_ensembles:
+                        lcb_lambda = float(getattr(cfg, "lcb_risk_aversion", 0.5))
+                        q_df = predict_quantile_lcb(
+                            quantile_ensembles,
+                            features_ml,
+                            feature_cols=selected_features,
+                            lcb_risk_aversion=lcb_lambda,
+                        )
+                        for c in q_df.columns:
+                            features[c] = q_df[c]
+                        # Use LCB as primary alpha to reduce downside surprises.
+                        features["pred_return"] = q_df["pred_return_lcb"]
+                        # Quantile spread is a more interpretable uncertainty proxy than model disagreement.
+                        features["pred_uncertainty"] = q_df["pred_quantile_spread"]
+                        features["pred_confidence"] = 1.0 / (
+                            1.0 + features["pred_uncertainty"].fillna(features["pred_uncertainty"].median()).clip(lower=0.0)
+                        )
+                        logger.info(
+                            "Using quantile LCB signal: lambda=%.2f, spread mean=%.4f",
+                            lcb_lambda,
+                            float(features["pred_quantile_spread"].mean()),
+                        )
                     
                     # Predict peak timing (days until optimal sell)
                     max_horizon = model_metadata.get("max_horizon_days", 10) if model_metadata else 10

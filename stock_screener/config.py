@@ -73,6 +73,8 @@ class Config:
     lgbm_ranking_objective: str = "rank_xendcg"  # lambdarank | rank_xendcg
     train_on_peak_return: bool = True  # Train on peak achievable return (max within horizon) instead of end-of-horizon return
     peak_label_winsorize_n_mad: float = 5.0  # Relaxed winsorization for peak returns (spikes are the signal, not noise)
+    quantile_models_enabled: bool = True  # Train q10/q50/q90 models and use LCB score at inference
+    lcb_risk_aversion: float = 0.5  # LCB = q50 - lambda * (q90 - q10)
     
     # Portfolio construction
     sector_neutral_selection: bool = True  # Diversify picks across sectors instead of pure top-N
@@ -296,6 +298,8 @@ class Config:
             lgbm_ranking_objective=_get_str("LGBM_RANKING_OBJECTIVE", "rank_xendcg"),
             train_on_peak_return=os.getenv("TRAIN_ON_PEAK_RETURN", "1").strip() in {"1", "true", "True"},
             peak_label_winsorize_n_mad=_get_float("PEAK_LABEL_WINSORIZE_N_MAD", 5.0),
+            quantile_models_enabled=_get_bool("QUANTILE_MODELS_ENABLED", True),
+            lcb_risk_aversion=_get_float("LCB_RISK_AVERSION", 0.5),
             sector_neutral_selection=os.getenv("SECTOR_NEUTRAL_SELECTION", "1").strip() in {"1", "true", "True"},
             volatility_targeting=os.getenv("VOLATILITY_TARGETING", "1").strip() in {"1", "true", "True"},
             target_volatility=_get_float("TARGET_VOLATILITY", 0.15),

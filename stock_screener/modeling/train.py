@@ -1322,6 +1322,96 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         reg_models.append(load_model(model_dir / rel, mtype))
 
     # =========================================================================
+    # QUANTILE MODELS: Predict q10/q50/q90 for uncertainty-aware LCB ranking
+    # =========================================================================
+    quantile_manifest: dict[str, dict[str, object]] = {}
+    quantile_metrics: dict[str, object] = {}
+    quantile_label_col = calibration_col or label_col
+    quantile_enabled = bool(getattr(cfg, "quantile_models_enabled", True))
+    if quantile_enabled and lgb is not None and quantile_label_col in train_df.columns:
+        logger.info("Training quantile models on label '%s'...", quantile_label_col)
+        quantile_alphas = [("q10", 0.10), ("q50", 0.50), ("q90", 0.90)]
+        q_preds_holdout: dict[str, np.ndarray] = {}
+
+        for q_name, q_alpha in quantile_alphas:
+            try:
+                q_model = lgb.LGBMRegressor(
+                    objective="quantile",
+                    alpha=float(q_alpha),
+                    n_estimators=280,
+                    learning_rate=0.03,
+                    max_depth=4,
+                    num_leaves=20,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_lambda=3.0,
+                    min_child_samples=40,
+                    random_state=42,
+                    verbose=-1,
+                )
+                if not val_df.empty:
+                    q_model.fit(
+                        train_df[selected_features],
+                        train_df[quantile_label_col].astype(float),
+                        sample_weight=sample_weights,
+                        eval_set=[(val_df[selected_features], val_df[quantile_label_col].astype(float))],
+                        callbacks=[],
+                    )
+                else:
+                    q_model.fit(
+                        train_df[selected_features],
+                        train_df[quantile_label_col].astype(float),
+                        sample_weight=sample_weights,
+                    )
+
+                rel = f"quantile_{q_name}.txt"
+                save_model(q_model, model_dir / rel)
+                quantile_manifest[q_name] = {
+                    "models": [rel],
+                    "model_types": ["lightgbm"],
+                    "weights": None,
+                }
+                logger.info("Trained quantile model %s (alpha=%.2f)", q_name, q_alpha)
+
+                if not holdout_df.empty:
+                    y_true = holdout_df[quantile_label_col].astype(float).values
+                    y_pred = q_model.predict(holdout_df[selected_features]).astype(float)
+                    q_preds_holdout[q_name] = y_pred
+                    resid = y_true - y_pred
+                    pinball = float(np.mean(np.maximum(q_alpha * resid, (q_alpha - 1.0) * resid)))
+                    coverage = float(np.mean(y_true <= y_pred))
+                    quantile_metrics[q_name] = {
+                        "alpha": float(q_alpha),
+                        "pinball_loss": pinball,
+                        "coverage": coverage,
+                        "n_holdout": int(len(y_true)),
+                    }
+            except Exception as e:
+                logger.warning("Quantile model %s failed: %s", q_name, e)
+
+        if all(k in q_preds_holdout for k in ("q10", "q50", "q90")) and not holdout_df.empty:
+            q10 = q_preds_holdout["q10"]
+            q50 = q_preds_holdout["q50"]
+            q90 = q_preds_holdout["q90"]
+            spread = np.maximum(0.0, q90 - q10)
+            lcb_lambda = max(0.0, float(getattr(cfg, "lcb_risk_aversion", 0.5)))
+            lcb = q50 - lcb_lambda * spread
+            q_metrics = _rank_ic_for_preds(holdout_df, pd.Series(lcb, index=holdout_df.index))
+            quantile_metrics["lcb"] = {
+                "lambda": lcb_lambda,
+                "mean_ic": float(q_metrics.get("summary", {}).get("mean_ic", float("nan"))),
+                "avg_spread": float(np.nanmean(spread)),
+            }
+            logger.info(
+                "Quantile LCB holdout: mean_ic=%.4f, avg_spread=%.4f (lambda=%.2f)",
+                quantile_metrics["lcb"]["mean_ic"],
+                quantile_metrics["lcb"]["avg_spread"],
+                lcb_lambda,
+            )
+    elif quantile_enabled and lgb is None:
+        logger.warning("Quantile models enabled but LightGBM unavailable; skipping quantile training.")
+
+    # =========================================================================
     # PEAK TIMING MODEL: Predict days_to_peak (1 to max_horizon)
     # =========================================================================
     peak_model_path = None
@@ -1684,6 +1774,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "cost_model_base_bps": cost_base_bps,
             "cost_model_spread_coef": cost_spread_coef,
             "cost_model_vol_coef": cost_vol_coef,
+            "quantile_models_enabled": quantile_enabled,
+            "lcb_risk_aversion": float(getattr(cfg, "lcb_risk_aversion", 0.5)),
             "n_xgb_models": n_xgb,
             "n_lgbm_models": n_lgbm,
         },
@@ -1723,6 +1815,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "feature_importance": feature_importance,
         "feature_ic": feature_ic,  # Per-feature IC for adaptive selection
         "model_ics": model_ics,  # Per-model IC for ensemble weighting
+        "quantile_models": {
+            "label_column": quantile_label_col,
+            "available": sorted(list(quantile_manifest.keys())),
+            "metrics": quantile_metrics,
+        },
         # Calibration map: maps prediction ranks to actual return magnitudes.
         # When training on risk-adjusted labels, we calibrate to the ACTUAL return
         # distribution (e.g. peak_alpha) so pred_return is in interpretable units
@@ -1751,6 +1848,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         model_types=model_types, 
         weights=None,
         peak_model_path=peak_model_path,
+        quantile_models=quantile_manifest if quantile_manifest else None,
     )
     logger.info("Saved model bundle manifest to %s", cfg.model_path)
     return TrainResult(n_samples=int(len(panel)), n_tickers=int(panel["ticker"].nunique()), horizon_days=horizon)

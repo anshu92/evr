@@ -327,8 +327,7 @@ def predict(model, features: pd.DataFrame, feature_cols: list[str] | None = None
         _require_lgb()
         preds = model.predict(x)
     else:
-        # XGBoost sklearn wrapper or other
-        _require_xgb()
+        # Generic sklearn-like model with .predict()
         preds = model.predict(x)
     
     return pd.Series(preds, index=features.index, name="pred_return")
@@ -375,6 +374,34 @@ def predict_ensemble(
         pred_std = float(np.nanstd(model_pred))
         if pred_std > 0:
             model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
+        out += w[i] * model_pred
+    return pd.Series(out, index=features.index, name="pred_return")
+
+
+def predict_ensemble_raw(
+    models: list,
+    weights: list[float] | None,
+    features: pd.DataFrame,
+    feature_cols: list[str] | None = None,
+) -> pd.Series:
+    """Ensemble prediction without per-model standardization.
+
+    Use this for calibrated regression/quantile heads where absolute prediction
+    scale matters (e.g., q10/q50/q90 in return units).
+    """
+    if not models:
+        raise ValueError("No models provided for ensemble prediction")
+    if weights is None:
+        w = np.ones(len(models), dtype=float)
+    else:
+        w = np.asarray(weights, dtype=float)
+        if len(w) != len(models):
+            raise ValueError("weights length must match models length")
+    w = w / float(w.sum())
+
+    out = np.zeros(len(features), dtype=float)
+    for i, m in enumerate(models):
+        model_pred = predict(m, features, feature_cols).astype(float).values
         out += w[i] * model_pred
     return pd.Series(out, index=features.index, name="pred_return")
 
@@ -482,6 +509,7 @@ def save_ensemble(
     model_types: list[str] | None = None, 
     weights: list[float] | None = None,
     peak_model_path: str | None = None,
+    quantile_models: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Save ensemble manifest with model paths, types, and peak model."""
     p = Path(manifest_path)
@@ -492,6 +520,7 @@ def save_ensemble(
         "model_types": model_types or ["xgboost"] * len(model_rel_paths),
         "weights": weights,
         "peak_model": peak_model_path,  # Optional peak timing model
+        "quantile_models": quantile_models or {},
     }
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -566,6 +595,83 @@ def load_ensemble(manifest_path: str | Path) -> tuple[list, list[float] | None, 
         raise ValueError(f"Unsupported ensemble manifest type: {manifest_type}")
 
 
+def load_quantile_ensembles(manifest_path: str | Path) -> dict[str, tuple[list, list[float] | None]]:
+    """Load optional quantile model ensembles from a manifest.
+
+    Returns mapping like:
+    {
+      "q10": ([models...], weights_or_none),
+      "q50": (...),
+      "q90": (...),
+    }
+    """
+    mp = Path(manifest_path)
+    manifest = json.loads(mp.read_text(encoding="utf-8"))
+    base = mp.parent
+    out: dict[str, tuple[list, list[float] | None]] = {}
+    q_payload = manifest.get("quantile_models") or {}
+    for q_name, payload in q_payload.items():
+        if not isinstance(payload, dict):
+            continue
+        rels = payload.get("models") or []
+        mtypes = payload.get("model_types") or ["xgboost"] * len(rels)
+        w = payload.get("weights")
+        if not rels:
+            continue
+        models = [load_model(base / rel, mtype) for rel, mtype in zip(rels, mtypes)]
+        out[str(q_name)] = (models, w)
+    return out
+
+
+def predict_quantile_lcb(
+    quantile_ensembles: dict[str, tuple[list, list[float] | None]],
+    features: pd.DataFrame,
+    *,
+    feature_cols: list[str] | None = None,
+    lcb_risk_aversion: float = 0.5,
+) -> pd.DataFrame:
+    """Predict q10/q50/q90 and compute a lower-confidence-bound return score."""
+    q10 = q50 = q90 = None
+    if "q10" in quantile_ensembles:
+        m, w = quantile_ensembles["q10"]
+        q10 = predict_ensemble_raw(m, w, features, feature_cols=feature_cols).astype(float)
+    if "q50" in quantile_ensembles:
+        m, w = quantile_ensembles["q50"]
+        q50 = predict_ensemble_raw(m, w, features, feature_cols=feature_cols).astype(float)
+    if "q90" in quantile_ensembles:
+        m, w = quantile_ensembles["q90"]
+        q90 = predict_ensemble_raw(m, w, features, feature_cols=feature_cols).astype(float)
+
+    if q50 is None:
+        raise ValueError("Quantile ensemble must include q50")
+    if q10 is None:
+        q10 = q50.copy()
+    if q90 is None:
+        q90 = q50.copy()
+
+    # Enforce monotonic quantiles per-row for robustness.
+    stacked = np.vstack([q10.values, q50.values, q90.values]).T
+    sorted_q = np.sort(stacked, axis=1)
+    q10v = pd.Series(sorted_q[:, 0], index=features.index, name="pred_return_q10")
+    q50v = pd.Series(sorted_q[:, 1], index=features.index, name="pred_return_q50")
+    q90v = pd.Series(sorted_q[:, 2], index=features.index, name="pred_return_q90")
+
+    spread = (q90v - q10v).clip(lower=0.0)
+    lam = max(0.0, float(lcb_risk_aversion))
+    lcb = q50v - lam * spread
+
+    return pd.DataFrame(
+        {
+            "pred_return_q10": q10v,
+            "pred_return_q50": q50v,
+            "pred_return_q90": q90v,
+            "pred_return_lcb": lcb,
+            "pred_quantile_spread": spread,
+        },
+        index=features.index,
+    )
+
+
 def load_bundle(manifest_path: str | Path) -> dict[str, object]:
     mp = Path(manifest_path)
     manifest = json.loads(mp.read_text(encoding="utf-8"))
@@ -573,11 +679,11 @@ def load_bundle(manifest_path: str | Path) -> dict[str, object]:
     mtype = manifest.get("type")
 
     if mtype == "xgboost_ensemble_v1":
-        models, weights = load_ensemble(mp)
+        models, weights, _peak = load_ensemble(mp)
         return {"type": mtype, "ranker": None, "regressor_models": models, "regressor_weights": weights, "metadata": None}
     
     if mtype == "mixed_ensemble_v1":
-        models, weights = load_ensemble(mp)
+        models, weights, _peak = load_ensemble(mp)
         return {"type": mtype, "ranker": None, "regressor_models": models, "regressor_weights": weights, "metadata": None}
 
     if mtype != "xgboost_dual_v1":
