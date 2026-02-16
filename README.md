@@ -53,13 +53,13 @@ flowchart TD
 
   %% ---------- Daily Pipeline ----------
   subgraph DAILY[Daily Trading Pipeline - stock_screener/pipeline/daily.py]
-    D0[Load Config + runtime budget] --> D1[Fetch universes<br/>US: NasdaqTrader<br/>TSX/TSXV: TSX API]
+    D0[Load Config and runtime budget] --> D1[Fetch universes<br/>US: NasdaqTrader<br/>TSX/TSXV: TSX API]
     D1 --> D2[Fetch FX USDCAD and prices via yfinance<br/>fundamentals and macro]
-    D2 --> D3[Compute features in CAD<br/>technical + regime + macro + fundamentals]
+    D2 --> D3[Compute features in CAD<br/>technical, regime, macro, fundamentals]
     D3 --> D4{USE_ML and model present?}
 
-    D4 -- Yes --> D5[Load manifest + metrics + target encodings<br/>validate feature schema hash/parity]
-    D5 --> D6[Predict ensemble return + uncertainty<br/>optional: regime-gated specialists<br/>optional: quantile LCB<br/>optional: peak-day model]
+    D4 -- Yes --> D5[Load manifest, metrics, target encodings<br/>validate feature schema hash/parity]
+    D5 --> D6[Predict ensemble return and uncertainty<br/>optional: regime-gated specialists<br/>optional: quantile LCB<br/>optional: peak-day model]
     D6 --> D7[Calibrate predictions]
     D4 -- No --> D8[Baseline factor scoring path]
     D7 --> D9
@@ -68,39 +68,39 @@ flowchart TD
     D9[Score universe<br/>liquidity/price/vol filters<br/>sector-neutral selection<br/>entry filters] --> D10[Dynamic portfolio size from confidence/return/IC]
     D10 --> D11[Initial weights<br/>inverse-vol or correlation-aware]
     D11 --> D12[Portfolio optimization<br/>unified optimizer OR sequential constraints]
-    D12 --> D13[Exposure controls<br/>regime scalar + vol targeting + drawdown scalar]
+    D12 --> D13[Exposure controls<br/>regime scalar, vol targeting, drawdown scalar]
     D13 --> D14[Reward-policy overlay<br/>adaptive exposure/conviction/exit-tightness]
     D14 --> D15[PortfolioManager<br/>apply exits, rebalance hysteresis,<br/>build BUY/SELL/HOLD plan]
-    D15 --> D16[Persist state JSON + reward logs]
+    D15 --> D16[Persist state JSON and reward logs]
     D16 --> D17[Render reports<br/>daily_report.txt, daily_email.html,<br/>portfolio_weights.csv, trade_actions.json]
   end
 
   %% ---------- Training Pipeline ----------
   subgraph TRAIN[Model Training Pipeline - stock_screener/modeling/train.py]
-    M0[Load Config] --> M1[Build universe + fetch data (prices/fx/fundamentals/macro)]
-    M1 --> M2[Compute training features + labels<br/>(cost-aware, market-relative/peak options)]
-    M2 --> M3[Time splits + holdout + CV]
-    M3 --> M4[Train ensemble models<br/>XGBoost + LightGBM]
+    M0[Load Config] --> M1[Build universe and fetch data<br/>prices, fx, fundamentals, macro]
+    M1 --> M2[Compute training features and labels<br/>cost-aware, market-relative, peak options]
+    M2 --> M3[Time splits, holdout, CV]
+    M3 --> M4[Train ensemble models<br/>XGBoost and LightGBM]
     M4 --> M5[Train regime specialists<br/>bull/neutral/bear]
     M5 --> M6[Train quantile models q10/q50/q90<br/>and peak-timing model]
     M6 --> M7[Evaluate: IC/top-N, realistic backtest,<br/>walk-forward robustness, turnover/cost metrics]
     M7 --> M8[Promotion gates]
-    M8 -->|pass| M9[Save models + manifest.json + metrics.json]
+    M8 -->|pass| M9[Save models, manifest.json, metrics.json]
     M8 -->|fail & enforce| M10[Block promotion]
   end
 
   %% ---------- Eval ----------
   subgraph EVAL[Model Evaluation - cli eval-model]
-    E0[Load current model + data] --> E1[Compute ranker/regressor metrics]
-    E1 --> E2[Log IC + top-N summaries]
+    E0[Load current model and data] --> E1[Compute ranker/regressor metrics]
+    E1 --> E2[Log IC and top-N summaries]
   end
 
   %% ---------- Workflow/Artifact Loop ----------
-  M9 --> A1[Upload model artifact + cache]
+  M9 --> A1[Upload model artifact and cache]
   A1 --> A2[Daily workflow fetches latest trained artifact]
   A2 --> D4
 
-  D17 --> A3[Upload daily artifact + send email]
+  D17 --> A3[Upload daily artifact and send email]
   D16 --> A4[screener_portfolio_state.json cached]
   A4 --> D0
 ```
