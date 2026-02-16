@@ -187,14 +187,37 @@ def evaluate_model_promotion_gates(
     if thresholds:
         thr.update(thresholds)
 
-    return_per_day = float(realistic_metrics.get("return_per_day", float("nan")))
-    cost_adj_sharpe = float(
-        realistic_metrics.get("cost_adjusted_sharpe", realistic_metrics.get("sharpe_ratio", float("nan")))
+    wf_agg = walk_forward_results.get("aggregate", {}) if isinstance(walk_forward_results, dict) else {}
+
+    def _metric_with_wf_mean(metric_name: str, fallback: float) -> float:
+        maybe = wf_agg.get(metric_name, {})
+        if isinstance(maybe, dict):
+            mean_val = maybe.get("mean")
+            if mean_val is not None and np.isfinite(float(mean_val)):
+                return float(mean_val)
+        return float(fallback)
+
+    return_per_day = _metric_with_wf_mean(
+        "return_per_day",
+        realistic_metrics.get("return_per_day", float("nan")),
     )
-    max_dd = float(realistic_metrics.get("max_drawdown", float("nan")))
+    cost_adj_sharpe = _metric_with_wf_mean(
+        "cost_adjusted_sharpe",
+        realistic_metrics.get("cost_adjusted_sharpe", realistic_metrics.get("sharpe_ratio", float("nan"))),
+    )
+    max_dd = _metric_with_wf_mean(
+        "max_drawdown",
+        realistic_metrics.get("max_drawdown", float("nan")),
+    )
     consistency = float(walk_forward_results.get("consistency", float("nan")))
-    turnover_eff = float(realistic_metrics.get("turnover_efficiency", float("nan")))
-    avg_turnover = float(realistic_metrics.get("avg_turnover", float("nan")))
+    turnover_eff = _metric_with_wf_mean(
+        "turnover_efficiency",
+        realistic_metrics.get("turnover_efficiency", float("nan")),
+    )
+    avg_turnover = _metric_with_wf_mean(
+        "avg_turnover",
+        realistic_metrics.get("avg_turnover", float("nan")),
+    )
     n_periods = int(walk_forward_results.get("n_periods", 0))
 
     gates = [

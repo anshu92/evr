@@ -222,23 +222,49 @@ def compute_regime_gate_weights(
         return pd.DataFrame(columns=list(REGIME_NAMES), index=features.index, dtype=float)
 
     idx = features.index
-    trend = pd.to_numeric(features.get(trend_col), errors="coerce").reindex(idx)
-    vol_regime = pd.to_numeric(features.get(vol_col), errors="coerce").reindex(idx)
-    breadth = pd.to_numeric(features.get(breadth_col), errors="coerce").reindex(idx)
+
+    def _get_col(name: str, default: float) -> pd.Series:
+        if name in features.columns:
+            s = pd.to_numeric(features[name], errors="coerce").reindex(idx)
+        else:
+            s = pd.Series(default, index=idx, dtype=float)
+        return s.astype(float)
+
+    trend = _get_col(trend_col, 0.0)
+    vol_regime = _get_col(vol_col, 1.0)
+    breadth = _get_col(breadth_col, 0.5)
 
     # Conservative fallbacks: no signal => neutral regime.
     trend = trend.fillna(0.0)
     vol_regime = vol_regime.fillna(1.0)
     breadth = breadth.fillna(0.5)
 
-    # Normalize heterogeneous inputs to comparable, bounded scales.
-    trend_score = np.tanh((trend / 0.04).clip(-4.0, 4.0))  # typical 20d trend range
-    breadth_score = ((breadth - 0.5) / 0.20).clip(-2.0, 2.0)  # 0.3-0.7 ~ actionable
-    vol_stress = ((vol_regime - 1.0) / 0.5).clip(-2.0, 2.0)  # >0 high-vol stress
+    # Scale-adaptive normalization works for both raw and already-normalized inputs.
+    def _robust_std(s: pd.Series, fallback: float) -> float:
+        sd = float(s.std(ddof=0))
+        if not np.isfinite(sd) or sd <= 1e-8:
+            sd = float(fallback)
+        return sd
+
+    trend_scale = _robust_std(trend, 0.04)
+    breadth_scale = _robust_std(breadth, 0.20)
+    vol_scale = _robust_std(vol_regime, 0.50)
+
+    trend_score = np.tanh(((trend - float(trend.median())) / trend_scale).clip(-4.0, 4.0))
+    breadth_score = np.tanh(((breadth - float(breadth.median())) / breadth_scale).clip(-4.0, 4.0))
+    vol_stress = ((vol_regime - float(vol_regime.median())) / vol_scale).clip(-2.0, 2.0)  # >0 high-vol stress
 
     bull_logit = (1.20 * trend_score) + (0.90 * breadth_score) - (0.60 * vol_stress)
     bear_logit = (-1.20 * trend_score) - (0.90 * breadth_score) + (0.80 * vol_stress)
-    neutral_logit = 0.60 - (0.90 * trend_score.abs()) - (0.70 * breadth_score.abs()) - (0.40 * vol_stress.abs())
+    composite = (0.70 * trend_score) + (0.50 * breadth_score) - (0.40 * vol_stress)
+    neutral_boost = (1.0 - composite.abs().clip(0.0, 1.0))
+    neutral_logit = (
+        0.65
+        - (0.70 * trend_score.abs())
+        - (0.55 * breadth_score.abs())
+        - (0.35 * vol_stress.abs())
+        + (0.85 * neutral_boost)
+    )
 
     logits = pd.DataFrame(
         {"bull": bull_logit, "neutral": neutral_logit, "bear": bear_logit},

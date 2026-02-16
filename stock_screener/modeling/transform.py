@@ -7,7 +7,21 @@ import pandas as pd
 from stock_screener.modeling.model import FEATURE_COLUMNS
 
 
-_EXCLUDE_DEFAULT = {"sector_hash", "industry_hash", "is_tsx"}
+_EXCLUDE_DEFAULT = {
+    "sector_hash",
+    "industry_hash",
+    "is_tsx",
+    # Regime and macro features are date-level signals, not cross-sectional.
+    # Cross-sectional z-scoring (per date) destroys their information.
+    "market_vol_regime",
+    "market_trend_20d",
+    "market_breadth",
+    "market_momentum_accel",
+    "vix",
+    "treasury_10y",
+    "treasury_13w",
+    "yield_curve_slope",
+}
 
 
 def winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:

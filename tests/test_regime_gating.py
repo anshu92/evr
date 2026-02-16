@@ -45,3 +45,18 @@ def test_predict_regime_gated_blends_experts_and_base():
     assert np.isclose(float(out.loc["y", "pred_return"]), -0.14, atol=1e-8)
     assert out.loc["x", "regime"] == "bull"
     assert out.loc["y", "regime"] == "bear"
+
+
+def test_regime_gate_weights_handle_zscored_regime_inputs_with_neutral_coverage():
+    # Simulate normalized regime columns (mean ~0), as seen after feature transforms.
+    features = pd.DataFrame(
+        {
+            "market_trend_20d": [0.02, -0.03, 0.00, 0.01],
+            "market_vol_regime": [0.01, -0.02, 0.00, 0.02],
+            "market_breadth": [0.03, -0.04, 0.00, 0.01],
+        },
+        index=["a", "b", "c", "d"],
+    )
+    gates = compute_regime_gate_weights(features)
+    dominant = gates.idxmax(axis=1)
+    assert (dominant == "neutral").sum() >= 1

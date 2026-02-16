@@ -210,15 +210,15 @@ class Config:
     # Runtime and rebalancing controls
     strict_feature_parity: bool = True
     max_daily_runtime_minutes: int = 12
-    turnover_penalty_bps: float = 10.0
-    min_rebalance_weight_delta: float = 0.01
-    min_trade_notional_cad: float = 10.0
+    turnover_penalty_bps: float = 15.0
+    min_rebalance_weight_delta: float = 0.015
+    min_trade_notional_cad: float = 15.0
     dynamic_no_trade_band_enabled: bool = True
-    dynamic_no_trade_uncertainty_weight: float = 0.8
-    dynamic_no_trade_liquidity_weight: float = 0.6
-    dynamic_no_trade_vol_regime_weight: float = 0.5
-    dynamic_no_trade_multiplier_min: float = 0.75
-    dynamic_no_trade_multiplier_max: float = 2.5
+    dynamic_no_trade_uncertainty_weight: float = 1.2
+    dynamic_no_trade_liquidity_weight: float = 0.8
+    dynamic_no_trade_vol_regime_weight: float = 0.8
+    dynamic_no_trade_multiplier_min: float = 1.0
+    dynamic_no_trade_multiplier_max: float = 3.0
 
     # Model promotion gates (statistical + business)
     promotion_gates_enabled: bool = True
@@ -446,15 +446,15 @@ class Config:
             reward_verified_label_weight=_get_float("REWARD_VERIFIED_LABEL_WEIGHT", 2.0),
             strict_feature_parity=_get_bool("STRICT_FEATURE_PARITY", True),
             max_daily_runtime_minutes=_get_int("MAX_DAILY_RUNTIME_MINUTES", 12) or 12,
-            turnover_penalty_bps=_get_float("TURNOVER_PENALTY_BPS", 10.0),
-            min_rebalance_weight_delta=_get_float("MIN_REBALANCE_WEIGHT_DELTA", 0.01),
-            min_trade_notional_cad=_get_float("MIN_TRADE_NOTIONAL_CAD", 10.0),
+            turnover_penalty_bps=_get_float("TURNOVER_PENALTY_BPS", 15.0),
+            min_rebalance_weight_delta=_get_float("MIN_REBALANCE_WEIGHT_DELTA", 0.015),
+            min_trade_notional_cad=_get_float("MIN_TRADE_NOTIONAL_CAD", 15.0),
             dynamic_no_trade_band_enabled=_get_bool("DYNAMIC_NO_TRADE_BAND_ENABLED", True),
-            dynamic_no_trade_uncertainty_weight=_get_float("DYNAMIC_NO_TRADE_UNCERTAINTY_WEIGHT", 0.8),
-            dynamic_no_trade_liquidity_weight=_get_float("DYNAMIC_NO_TRADE_LIQUIDITY_WEIGHT", 0.6),
-            dynamic_no_trade_vol_regime_weight=_get_float("DYNAMIC_NO_TRADE_VOL_REGIME_WEIGHT", 0.5),
-            dynamic_no_trade_multiplier_min=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MIN", 0.75),
-            dynamic_no_trade_multiplier_max=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MAX", 2.5),
+            dynamic_no_trade_uncertainty_weight=_get_float("DYNAMIC_NO_TRADE_UNCERTAINTY_WEIGHT", 1.2),
+            dynamic_no_trade_liquidity_weight=_get_float("DYNAMIC_NO_TRADE_LIQUIDITY_WEIGHT", 0.8),
+            dynamic_no_trade_vol_regime_weight=_get_float("DYNAMIC_NO_TRADE_VOL_REGIME_WEIGHT", 0.8),
+            dynamic_no_trade_multiplier_min=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MIN", 1.0),
+            dynamic_no_trade_multiplier_max=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MAX", 3.0),
             promotion_gates_enabled=_get_bool("PROMOTION_GATES_ENABLED", True),
             enforce_promotion_gates=_get_bool("ENFORCE_PROMOTION_GATES", True),
             promotion_min_return_per_day=_get_float("PROMOTION_MIN_RETURN_PER_DAY", 0.0002),
