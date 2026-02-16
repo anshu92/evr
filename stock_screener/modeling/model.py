@@ -195,12 +195,118 @@ TECHNICAL_FEATURES_ONLY = [
 ]
 
 FEATURE_SCHEMA_VERSION = "1"
+REGIME_NAMES = ("bull", "neutral", "bear")
 
 
 def compute_feature_schema_hash(feature_cols: list[str]) -> str:
     """Stable hash for a feature schema ordering."""
     joined = "\n".join(feature_cols).encode("utf-8")
     return hashlib.sha256(joined).hexdigest()
+
+
+def compute_regime_gate_weights(
+    features: pd.DataFrame,
+    *,
+    trend_col: str = "market_trend_20d",
+    vol_col: str = "market_vol_regime",
+    breadth_col: str = "market_breadth",
+) -> pd.DataFrame:
+    """Compute soft regime gate weights (bull/neutral/bear) per row.
+
+    The gate combines trend, breadth, and volatility regime:
+      - Bull: positive trend, broad participation, lower vol stress
+      - Bear: negative trend, weak breadth, elevated vol stress
+      - Neutral: low-magnitude mixed signals
+    """
+    if features.empty:
+        return pd.DataFrame(columns=list(REGIME_NAMES), index=features.index, dtype=float)
+
+    idx = features.index
+    trend = pd.to_numeric(features.get(trend_col), errors="coerce").reindex(idx)
+    vol_regime = pd.to_numeric(features.get(vol_col), errors="coerce").reindex(idx)
+    breadth = pd.to_numeric(features.get(breadth_col), errors="coerce").reindex(idx)
+
+    # Conservative fallbacks: no signal => neutral regime.
+    trend = trend.fillna(0.0)
+    vol_regime = vol_regime.fillna(1.0)
+    breadth = breadth.fillna(0.5)
+
+    # Normalize heterogeneous inputs to comparable, bounded scales.
+    trend_score = np.tanh((trend / 0.04).clip(-4.0, 4.0))  # typical 20d trend range
+    breadth_score = ((breadth - 0.5) / 0.20).clip(-2.0, 2.0)  # 0.3-0.7 ~ actionable
+    vol_stress = ((vol_regime - 1.0) / 0.5).clip(-2.0, 2.0)  # >0 high-vol stress
+
+    bull_logit = (1.20 * trend_score) + (0.90 * breadth_score) - (0.60 * vol_stress)
+    bear_logit = (-1.20 * trend_score) - (0.90 * breadth_score) + (0.80 * vol_stress)
+    neutral_logit = 0.60 - (0.90 * trend_score.abs()) - (0.70 * breadth_score.abs()) - (0.40 * vol_stress.abs())
+
+    logits = pd.DataFrame(
+        {"bull": bull_logit, "neutral": neutral_logit, "bear": bear_logit},
+        index=idx,
+        dtype=float,
+    )
+    logits = logits.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Stable softmax.
+    arr = logits.values.astype(float)
+    arr = arr - np.max(arr, axis=1, keepdims=True)
+    exp_arr = np.exp(arr)
+    denom = np.sum(exp_arr, axis=1, keepdims=True)
+    denom[denom <= 0] = 1.0
+    probs = exp_arr / denom
+    return pd.DataFrame(probs, index=idx, columns=list(REGIME_NAMES), dtype=float)
+
+
+def infer_regime_label(features: pd.DataFrame) -> pd.Series:
+    """Return the dominant regime label per row."""
+    gates = compute_regime_gate_weights(features)
+    if gates.empty:
+        return pd.Series(index=features.index, dtype="object", name="regime")
+    return gates.idxmax(axis=1).astype(str).rename("regime")
+
+
+def predict_regime_gated(
+    base_pred: pd.Series,
+    *,
+    regime_preds: dict[str, pd.Series] | None,
+    gate_weights: pd.DataFrame,
+    base_blend: float = 0.25,
+) -> pd.DataFrame:
+    """Blend base and specialist predictions using soft regime gates."""
+    base = pd.to_numeric(base_pred, errors="coerce").astype(float)
+    idx = base.index
+
+    gates = gate_weights.reindex(idx).copy()
+    for name in REGIME_NAMES:
+        if name not in gates.columns:
+            gates[name] = 0.0
+    gates = gates[list(REGIME_NAMES)].fillna(0.0).clip(lower=0.0)
+    row_sum = gates.sum(axis=1).replace(0.0, np.nan)
+    gates = gates.div(row_sum, axis=0).fillna(pd.DataFrame({"bull": 0.0, "neutral": 1.0, "bear": 0.0}, index=idx))
+
+    regime_preds = regime_preds or {}
+    expert_mix = pd.Series(0.0, index=idx, dtype=float)
+    for regime_name in REGIME_NAMES:
+        rp = regime_preds.get(regime_name)
+        if rp is None:
+            rp_use = base
+        else:
+            rp_use = pd.to_numeric(rp, errors="coerce").reindex(idx).fillna(base)
+        expert_mix = expert_mix + (gates[regime_name] * rp_use)
+
+    b = float(np.clip(base_blend, 0.0, 1.0))
+    blended = (b * base) + ((1.0 - b) * expert_mix)
+
+    out = pd.DataFrame(index=idx)
+    out["pred_return"] = blended
+    out["pred_return_base"] = base
+    out["pred_return_regime_mix"] = expert_mix
+    out["regime"] = gates.idxmax(axis=1)
+    out["regime_confidence"] = gates.max(axis=1)
+    out["regime_gate_bull"] = gates["bull"]
+    out["regime_gate_neutral"] = gates["neutral"]
+    out["regime_gate_bear"] = gates["bear"]
+    return out
 
 
 def _require_xgb() -> None:
@@ -510,6 +616,7 @@ def save_ensemble(
     weights: list[float] | None = None,
     peak_model_path: str | None = None,
     quantile_models: dict[str, dict[str, Any]] | None = None,
+    regime_experts: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """Save ensemble manifest with model paths, types, and peak model."""
     p = Path(manifest_path)
@@ -521,6 +628,7 @@ def save_ensemble(
         "weights": weights,
         "peak_model": peak_model_path,  # Optional peak timing model
         "quantile_models": quantile_models or {},
+        "regime_experts": regime_experts or {},
     }
     p.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -620,6 +728,30 @@ def load_quantile_ensembles(manifest_path: str | Path) -> dict[str, tuple[list, 
             continue
         models = [load_model(base / rel, mtype) for rel, mtype in zip(rels, mtypes)]
         out[str(q_name)] = (models, w)
+    return out
+
+
+def load_regime_ensembles(manifest_path: str | Path) -> dict[str, tuple[list, list[float] | None]]:
+    """Load optional regime specialist ensembles from a manifest."""
+    mp = Path(manifest_path)
+    manifest = json.loads(mp.read_text(encoding="utf-8"))
+    base = mp.parent
+    out: dict[str, tuple[list, list[float] | None]] = {}
+    payload = manifest.get("regime_experts") or {}
+    if not isinstance(payload, dict):
+        return out
+
+    for regime_name in REGIME_NAMES:
+        spec = payload.get(regime_name)
+        if not isinstance(spec, dict):
+            continue
+        rels = spec.get("models") or []
+        mtypes = spec.get("model_types") or ["xgboost"] * len(rels)
+        weights = spec.get("weights")
+        if not rels:
+            continue
+        models = [load_model(base / rel, mtype) for rel, mtype in zip(rels, mtypes)]
+        out[str(regime_name)] = (models, weights)
     return out
 
 

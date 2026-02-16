@@ -166,6 +166,105 @@ def aggregate_walk_forward_results(period_results: list[dict]) -> dict[str, obje
     }
 
 
+def evaluate_model_promotion_gates(
+    *,
+    realistic_metrics: dict[str, object] | None,
+    walk_forward_results: dict[str, object] | None,
+    thresholds: dict[str, float | int] | None = None,
+) -> dict[str, object]:
+    """Evaluate statistical/business gates required for model promotion."""
+    realistic_metrics = realistic_metrics or {}
+    walk_forward_results = walk_forward_results or {}
+    thr = {
+        "min_return_per_day": 0.0002,
+        "min_cost_adjusted_sharpe": 0.5,
+        "max_drawdown": -0.25,
+        "min_consistency": 0.55,
+        "min_turnover_efficiency": 0.20,
+        "max_avg_turnover": 0.80,
+        "min_periods": 2,
+    }
+    if thresholds:
+        thr.update(thresholds)
+
+    return_per_day = float(realistic_metrics.get("return_per_day", float("nan")))
+    cost_adj_sharpe = float(
+        realistic_metrics.get("cost_adjusted_sharpe", realistic_metrics.get("sharpe_ratio", float("nan")))
+    )
+    max_dd = float(realistic_metrics.get("max_drawdown", float("nan")))
+    consistency = float(walk_forward_results.get("consistency", float("nan")))
+    turnover_eff = float(realistic_metrics.get("turnover_efficiency", float("nan")))
+    avg_turnover = float(realistic_metrics.get("avg_turnover", float("nan")))
+    n_periods = int(walk_forward_results.get("n_periods", 0))
+
+    gates = [
+        {
+            "name": "net_return_per_day",
+            "operator": ">=",
+            "actual": return_per_day,
+            "threshold": float(thr["min_return_per_day"]),
+            "passed": bool(np.isfinite(return_per_day) and return_per_day >= float(thr["min_return_per_day"])),
+        },
+        {
+            "name": "cost_adjusted_sharpe",
+            "operator": ">=",
+            "actual": cost_adj_sharpe,
+            "threshold": float(thr["min_cost_adjusted_sharpe"]),
+            "passed": bool(np.isfinite(cost_adj_sharpe) and cost_adj_sharpe >= float(thr["min_cost_adjusted_sharpe"])),
+        },
+        {
+            "name": "max_drawdown",
+            "operator": ">=",
+            "actual": max_dd,
+            "threshold": float(thr["max_drawdown"]),
+            "passed": bool(np.isfinite(max_dd) and max_dd >= float(thr["max_drawdown"])),
+        },
+        {
+            "name": "consistency_positive_sharpe_periods",
+            "operator": ">=",
+            "actual": consistency,
+            "threshold": float(thr["min_consistency"]),
+            "passed": bool(np.isfinite(consistency) and consistency >= float(thr["min_consistency"])),
+        },
+        {
+            "name": "turnover_efficiency",
+            "operator": ">=",
+            "actual": turnover_eff,
+            "threshold": float(thr["min_turnover_efficiency"]),
+            "passed": bool(np.isfinite(turnover_eff) and turnover_eff >= float(thr["min_turnover_efficiency"])),
+        },
+        {
+            "name": "avg_turnover_cap",
+            "operator": "<=",
+            "actual": avg_turnover,
+            "threshold": float(thr["max_avg_turnover"]),
+            "passed": bool(np.isfinite(avg_turnover) and avg_turnover <= float(thr["max_avg_turnover"])),
+        },
+        {
+            "name": "walk_forward_period_count",
+            "operator": ">=",
+            "actual": float(n_periods),
+            "threshold": float(thr["min_periods"]),
+            "passed": bool(n_periods >= int(thr["min_periods"])),
+        },
+    ]
+    passed = all(g["passed"] for g in gates)
+    return {
+        "passed": passed,
+        "gates": gates,
+        "thresholds": thr,
+        "summary": {
+            "return_per_day": return_per_day,
+            "cost_adjusted_sharpe": cost_adj_sharpe,
+            "max_drawdown": max_dd,
+            "consistency": consistency,
+            "turnover_efficiency": turnover_eff,
+            "avg_turnover": avg_turnover,
+            "n_periods": n_periods,
+        },
+    }
+
+
 def compute_daily_rank_ic(
     df: pd.DataFrame,
     *,

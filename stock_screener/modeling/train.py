@@ -42,6 +42,7 @@ from stock_screener.modeling.eval import (
     compute_portfolio_metrics,
     simulate_realistic_portfolio,
     aggregate_walk_forward_results,
+    evaluate_model_promotion_gates,
 )
 from stock_screener.modeling.model import (
     FEATURE_SCHEMA_VERSION,
@@ -49,10 +50,12 @@ from stock_screener.modeling.model import (
     TECHNICAL_FEATURES_ONLY,
     build_model,
     build_lgbm_model,
+    compute_regime_gate_weights,
     compute_feature_schema_hash,
     load_bundle,
     load_model,
     predict_ensemble,
+    predict_regime_gated,
     predict_score,
     save_ensemble,
     save_model,
@@ -1240,7 +1243,97 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 i + 1, n_lgbm,
             )
 
+    # ---------------------------------------------------------------------
+    # PR-04: Regime specialist experts (bull / neutral / bear)
+    # ---------------------------------------------------------------------
+    regime_expert_manifest: dict[str, dict[str, object]] = {}
+    regime_expert_stats: dict[str, dict[str, object]] = {}
+    regime_gating_summary: dict[str, object] = {"enabled": False}
+    regime_enabled = bool(getattr(cfg, "regime_specialist_enabled", True))
+    regime_base_blend = float(getattr(cfg, "regime_gating_base_blend", 0.25))
+    regime_min_samples = max(200, int(getattr(cfg, "regime_specialist_min_samples", 1200)))
+    if regime_enabled:
+        try:
+            train_regime = compute_regime_gate_weights(train_df).idxmax(axis=1)
+            val_regime = compute_regime_gate_weights(val_df).idxmax(axis=1) if not val_df.empty else pd.Series(dtype=str)
+            trained_experts = 0
+            for regime_name in ("bull", "neutral", "bear"):
+                tr_mask = train_regime == regime_name
+                n_train_reg = int(tr_mask.sum())
+                n_val_reg = int((val_regime == regime_name).sum()) if not val_df.empty else 0
+                regime_expert_stats[regime_name] = {
+                    "n_train": n_train_reg,
+                    "n_val": n_val_reg,
+                    "trained": False,
+                }
+                if n_train_reg < regime_min_samples:
+                    logger.info(
+                        "Skipping %s expert: insufficient samples (%d < %d)",
+                        regime_name, n_train_reg, regime_min_samples,
+                    )
+                    continue
+
+                m_reg = build_model(random_state=700 + trained_experts * 17)
+                # Conservative specialist config to stay within CI budget.
+                m_reg.set_params(
+                    max_depth=best_regressor_params.get("max_depth", 5),
+                    learning_rate=best_regressor_params.get("learning_rate", 0.04),
+                    min_child_weight=best_regressor_params.get("min_child_weight", 8),
+                    subsample=best_regressor_params.get("subsample", 0.75),
+                    colsample_bytree=best_regressor_params.get("colsample_bytree", 0.75),
+                    reg_lambda=best_regressor_params.get("reg_lambda", 2.0),
+                    n_estimators=260,
+                    early_stopping_rounds=25,
+                )
+
+                tr_x = train_df.loc[tr_mask, selected_features]
+                tr_y = train_df.loc[tr_mask, label_col].astype(float)
+                tr_w = sample_weights[tr_mask.values]
+                val_mask = (val_regime == regime_name) if not val_df.empty else pd.Series(dtype=bool)
+
+                if not val_df.empty and int(val_mask.sum()) >= 120:
+                    va_x = val_df.loc[val_mask, selected_features]
+                    va_y = val_df.loc[val_mask, label_col].astype(float)
+                    m_reg.fit(
+                        tr_x,
+                        tr_y,
+                        sample_weight=tr_w,
+                        eval_set=[(va_x, va_y)],
+                        verbose=False,
+                    )
+                else:
+                    m_reg.fit(
+                        tr_x,
+                        tr_y,
+                        sample_weight=tr_w,
+                    )
+
+                rel = f"regime_{regime_name}_xgb.json"
+                save_model(m_reg, model_dir / rel)
+                regime_expert_manifest[regime_name] = {
+                    "models": [rel],
+                    "model_types": ["xgboost"],
+                    "weights": None,
+                }
+                regime_expert_stats[regime_name]["trained"] = True
+                trained_experts += 1
+                logger.info(
+                    "Trained regime expert '%s' on %d samples (val=%d)",
+                    regime_name, n_train_reg, n_val_reg,
+                )
+
+            regime_gating_summary = {
+                "enabled": trained_experts > 0,
+                "base_blend": regime_base_blend,
+                "min_samples": regime_min_samples,
+                "trained_experts": trained_experts,
+            }
+        except Exception as e:
+            logger.warning("Regime specialist training failed; continuing with base ensemble: %s", e)
+            regime_gating_summary = {"enabled": False, "error": str(e)}
+
     reg_holdout_preds: list[float] = []
+    reg_holdout_base_preds: list[float] = []
     model_ics: list[float] = []  # Track IC per model for adaptive weighting
     
     if not holdout_df.empty:
@@ -1307,10 +1400,66 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             del model_pred, model
         
         reg_holdout_preds = preds.tolist()
+        reg_holdout_base_preds = reg_holdout_preds.copy()
+
+        # Apply regime-gated specialist blend on holdout predictions.
+        if regime_expert_manifest:
+            try:
+                base_series = pd.Series(reg_holdout_base_preds, index=holdout_df.index, dtype=float)
+                gate_weights = compute_regime_gate_weights(holdout_df)
+                regime_preds: dict[str, pd.Series] = {}
+                for regime_name, payload in regime_expert_manifest.items():
+                    rels = payload.get("models") or []
+                    mtypes = payload.get("model_types") or ["xgboost"] * len(rels)
+                    if not rels:
+                        continue
+                    r_models = [load_model(model_dir / rel, mtype) for rel, mtype in zip(rels, mtypes)]
+                    regime_preds[regime_name] = predict_ensemble(
+                        r_models,
+                        payload.get("weights"),
+                        holdout_df,
+                        feature_cols=selected_features,
+                    )
+
+                gated = predict_regime_gated(
+                    base_series,
+                    regime_preds=regime_preds,
+                    gate_weights=gate_weights,
+                    base_blend=regime_base_blend,
+                )
+                gated_series = gated["pred_return"]
+                base_ic = float(_rank_ic_for_preds(holdout_df, base_series).get("summary", {}).get("mean_ic", float("nan")))
+                gated_ic = float(_rank_ic_for_preds(holdout_df, gated_series).get("summary", {}).get("mean_ic", float("nan")))
+                reg_holdout_preds = gated_series.tolist()
+                regime_gating_summary.update(
+                    {
+                        "enabled": True,
+                        "holdout_base_ic": base_ic,
+                        "holdout_gated_ic": gated_ic,
+                        "holdout_ic_delta": gated_ic - base_ic if np.isfinite(base_ic) and np.isfinite(gated_ic) else float("nan"),
+                    }
+                )
+                logger.info(
+                    "Regime-gated holdout IC: base=%.4f gated=%.4f delta=%.4f",
+                    base_ic, gated_ic, regime_gating_summary.get("holdout_ic_delta", float("nan")),
+                )
+            except Exception as e:
+                logger.warning("Regime gating on holdout failed; using base predictions: %s", e)
         gc.collect()
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
+    reg_holdout_base_metrics = None
+    reg_holdout_base_topn = None
+    if reg_holdout_base_preds:
+        reg_holdout_base_metrics = _rank_ic_for_preds(
+            holdout_df,
+            pd.Series(reg_holdout_base_preds, index=holdout_df.index),
+        )
+        reg_holdout_base_topn = _topn_for_preds(
+            holdout_df,
+            pd.Series(reg_holdout_base_preds, index=holdout_df.index),
+        )
 
     # Log holdout IC for quality monitoring (skip full train IC — too expensive)
     holdout_ic = reg_holdout_metrics.get("summary", {}).get("mean_ic", 0.0)
@@ -1320,6 +1469,17 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_models = []
     for rel, mtype in zip(reg_rel_paths, model_types):
         reg_models.append(load_model(model_dir / rel, mtype))
+    regime_models_for_wf: dict[str, tuple[list, list[float] | None]] = {}
+    for regime_name, payload in regime_expert_manifest.items():
+        rels = payload.get("models") or []
+        mtypes = payload.get("model_types") or ["xgboost"] * len(rels)
+        if not rels:
+            continue
+        try:
+            models = [load_model(model_dir / rel, mtype) for rel, mtype in zip(rels, mtypes)]
+            regime_models_for_wf[regime_name] = (models, payload.get("weights"))
+        except Exception as e:
+            logger.warning("Could not load regime expert '%s' for walk-forward: %s", regime_name, e)
 
     # =========================================================================
     # QUANTILE MODELS: Predict q10/q50/q90 for uncertainty-aware LCB ranking
@@ -1681,6 +1841,26 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 if pred_std > 0:
                     model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
                 period_preds += model_pred * weights[i]
+
+            # Apply regime-gated specialist blend in walk-forward too.
+            if regime_models_for_wf:
+                base_series = pd.Series(period_preds, index=period_test_df.index, dtype=float)
+                gate_weights = compute_regime_gate_weights(period_test_df)
+                regime_preds: dict[str, pd.Series] = {}
+                for regime_name, (r_models, r_weights) in regime_models_for_wf.items():
+                    regime_preds[regime_name] = predict_ensemble(
+                        r_models,
+                        r_weights,
+                        period_test_df,
+                        feature_cols=selected_features,
+                    )
+                period_gated = predict_regime_gated(
+                    base_series,
+                    regime_preds=regime_preds,
+                    gate_weights=gate_weights,
+                    base_blend=regime_base_blend,
+                )
+                period_preds = period_gated["pred_return"].values.astype(float)
             
             # Evaluate with realistic simulation
             period_test_df = period_test_df.copy()
@@ -1732,6 +1912,28 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 consistency * 100,
             )
 
+    promotion_thresholds = {
+        "min_return_per_day": float(getattr(cfg, "promotion_min_return_per_day", 0.0002)),
+        "min_cost_adjusted_sharpe": float(getattr(cfg, "promotion_min_cost_adjusted_sharpe", 0.5)),
+        "max_drawdown": float(getattr(cfg, "promotion_max_drawdown", -0.25)),
+        "min_consistency": float(getattr(cfg, "promotion_min_consistency", 0.55)),
+        "min_turnover_efficiency": float(getattr(cfg, "promotion_min_turnover_efficiency", 0.20)),
+        "max_avg_turnover": float(getattr(cfg, "promotion_max_avg_turnover", 0.80)),
+        "min_periods": int(getattr(cfg, "promotion_min_periods", 2)),
+    }
+    promotion_gate_report = evaluate_model_promotion_gates(
+        realistic_metrics=realistic_metrics,
+        walk_forward_results=walk_forward_results,
+        thresholds=promotion_thresholds,
+    )
+    logger.info(
+        "Promotion gates: passed=%s (return/day=%.5f, sharpe=%.3f, consistency=%.1f%%)",
+        promotion_gate_report["passed"],
+        promotion_gate_report.get("summary", {}).get("return_per_day", float("nan")),
+        promotion_gate_report.get("summary", {}).get("cost_adjusted_sharpe", float("nan")),
+        promotion_gate_report.get("summary", {}).get("consistency", 0.0) * 100.0,
+    )
+
     # Compute final sector/industry encodings for inference
     # These are the mean target values per category from ALL training data
     sector_encodings = {}
@@ -1778,6 +1980,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "lcb_risk_aversion": float(getattr(cfg, "lcb_risk_aversion", 0.5)),
             "n_xgb_models": n_xgb,
             "n_lgbm_models": n_lgbm,
+            "regime_specialist_enabled": regime_enabled,
+            "regime_gating_base_blend": regime_base_blend,
+            "regime_specialist_min_samples": regime_min_samples,
         },
         "feature_columns": selected_features,  # Features used in final models (after selection)
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -1800,6 +2005,8 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "topn": {"top_n": int(top_n), "cost_bps": float(cost_bps)},
             "holdout": reg_holdout_metrics["summary"],
             "holdout_topn": reg_holdout_topn["summary"],
+            "holdout_base": reg_holdout_base_metrics["summary"] if isinstance(reg_holdout_base_metrics, dict) else None,
+            "holdout_topn_base": reg_holdout_base_topn["summary"] if isinstance(reg_holdout_base_topn, dict) else None,
         },
         "date_range": {
             "start": str(pd.to_datetime(panel["date"]).min().date()),
@@ -1812,9 +2019,15 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "portfolio_metrics": portfolio_metrics,
         "realistic_portfolio_metrics": realistic_metrics,  # 5-day hold simulation
         "walk_forward_validation": walk_forward_results,  # Multi-period robustness
+        "promotion_gates": promotion_gate_report,
         "feature_importance": feature_importance,
         "feature_ic": feature_ic,  # Per-feature IC for adaptive selection
         "model_ics": model_ics,  # Per-model IC for ensemble weighting
+        "regime_specialists": {
+            "manifest": regime_expert_manifest,
+            "training_stats": regime_expert_stats,
+            "gating": regime_gating_summary,
+        },
         "quantile_models": {
             "label_column": quantile_label_col,
             "available": sorted(list(quantile_manifest.keys())),
@@ -1841,6 +2054,16 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     metadata_rel = "metrics.json"
     write_json(model_dir / metadata_rel, metadata)
 
+    promotion_enabled = bool(getattr(cfg, "promotion_gates_enabled", True))
+    enforce_promotion = bool(getattr(cfg, "enforce_promotion_gates", True))
+    if promotion_enabled and not promotion_gate_report.get("passed", False):
+        failed = [g["name"] for g in promotion_gate_report.get("gates", []) if not g.get("passed")]
+        logger.warning("Model failed promotion gates: %s", failed)
+        if enforce_promotion:
+            raise RuntimeError(
+                "Model promotion blocked by gates: " + ", ".join(failed)
+            )
+
     # Save the ensemble manifest with model types and peak model
     save_ensemble(
         cfg.model_path, 
@@ -1849,6 +2072,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         weights=None,
         peak_model_path=peak_model_path,
         quantile_models=quantile_manifest if quantile_manifest else None,
+        regime_experts=regime_expert_manifest if regime_expert_manifest else None,
     )
     logger.info("Saved model bundle manifest to %s", cfg.model_path)
     return TrainResult(n_samples=int(len(panel)), n_tickers=int(panel["ticker"].nunique()), horizon_days=horizon)

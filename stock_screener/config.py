@@ -61,6 +61,9 @@ class Config:
     optuna_timeout_seconds: int = 90
     ensemble_xgb_count: int = 3  # XGBoost models (fast)
     ensemble_lgbm_count: int = 2  # LightGBM models (slower but diverse)
+    regime_specialist_enabled: bool = True  # Train/use bull/neutral/bear specialist experts
+    regime_specialist_min_samples: int = 1200  # Min train rows per regime expert
+    regime_gating_base_blend: float = 0.25  # Blend of base model in regime-gated signal
     
     # Portfolio optimization
     use_correlation_weights: bool = False  # Requires scipy; set True to enable
@@ -210,6 +213,23 @@ class Config:
     turnover_penalty_bps: float = 10.0
     min_rebalance_weight_delta: float = 0.01
     min_trade_notional_cad: float = 10.0
+    dynamic_no_trade_band_enabled: bool = True
+    dynamic_no_trade_uncertainty_weight: float = 0.8
+    dynamic_no_trade_liquidity_weight: float = 0.6
+    dynamic_no_trade_vol_regime_weight: float = 0.5
+    dynamic_no_trade_multiplier_min: float = 0.75
+    dynamic_no_trade_multiplier_max: float = 2.5
+
+    # Model promotion gates (statistical + business)
+    promotion_gates_enabled: bool = True
+    enforce_promotion_gates: bool = True
+    promotion_min_return_per_day: float = 0.0002
+    promotion_min_cost_adjusted_sharpe: float = 0.5
+    promotion_max_drawdown: float = -0.25
+    promotion_min_consistency: float = 0.55
+    promotion_min_turnover_efficiency: float = 0.20
+    promotion_max_avg_turnover: float = 0.80
+    promotion_min_periods: int = 2
 
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
@@ -295,6 +315,9 @@ class Config:
             optuna_timeout_seconds=_get_int("OPTUNA_TIMEOUT_SECONDS", 90) or 90,
             ensemble_xgb_count=_get_int("ENSEMBLE_XGB_COUNT", 3) or 3,
             ensemble_lgbm_count=_get_int("ENSEMBLE_LGBM_COUNT", 2) or 2,
+            regime_specialist_enabled=_get_bool("REGIME_SPECIALIST_ENABLED", True),
+            regime_specialist_min_samples=_get_int("REGIME_SPECIALIST_MIN_SAMPLES", 1200) or 1200,
+            regime_gating_base_blend=_get_float("REGIME_GATING_BASE_BLEND", 0.25),
             use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             unified_optimizer_enabled=_get_bool("UNIFIED_OPTIMIZER_ENABLED", True),
@@ -426,6 +449,21 @@ class Config:
             turnover_penalty_bps=_get_float("TURNOVER_PENALTY_BPS", 10.0),
             min_rebalance_weight_delta=_get_float("MIN_REBALANCE_WEIGHT_DELTA", 0.01),
             min_trade_notional_cad=_get_float("MIN_TRADE_NOTIONAL_CAD", 10.0),
+            dynamic_no_trade_band_enabled=_get_bool("DYNAMIC_NO_TRADE_BAND_ENABLED", True),
+            dynamic_no_trade_uncertainty_weight=_get_float("DYNAMIC_NO_TRADE_UNCERTAINTY_WEIGHT", 0.8),
+            dynamic_no_trade_liquidity_weight=_get_float("DYNAMIC_NO_TRADE_LIQUIDITY_WEIGHT", 0.6),
+            dynamic_no_trade_vol_regime_weight=_get_float("DYNAMIC_NO_TRADE_VOL_REGIME_WEIGHT", 0.5),
+            dynamic_no_trade_multiplier_min=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MIN", 0.75),
+            dynamic_no_trade_multiplier_max=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MAX", 2.5),
+            promotion_gates_enabled=_get_bool("PROMOTION_GATES_ENABLED", True),
+            enforce_promotion_gates=_get_bool("ENFORCE_PROMOTION_GATES", True),
+            promotion_min_return_per_day=_get_float("PROMOTION_MIN_RETURN_PER_DAY", 0.0002),
+            promotion_min_cost_adjusted_sharpe=_get_float("PROMOTION_MIN_COST_ADJUSTED_SHARPE", 0.5),
+            promotion_max_drawdown=_get_float("PROMOTION_MAX_DRAWDOWN", -0.25),
+            promotion_min_consistency=_get_float("PROMOTION_MIN_CONSISTENCY", 0.55),
+            promotion_min_turnover_efficiency=_get_float("PROMOTION_MIN_TURNOVER_EFFICIENCY", 0.20),
+            promotion_max_avg_turnover=_get_float("PROMOTION_MAX_AVG_TURNOVER", 0.80),
+            promotion_min_periods=_get_int("PROMOTION_MIN_PERIODS", 2) or 2,
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(

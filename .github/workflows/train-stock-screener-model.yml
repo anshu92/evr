@@ -73,7 +73,22 @@ jobs:
           # 2 XGB + 2 LightGBM = 4 diverse models (good quality/speed trade-off)
           ENSEMBLE_XGB_COUNT: "2"
           ENSEMBLE_LGBM_COUNT: "2"
+          # PR-04: Regime specialists + gating
+          REGIME_SPECIALIST_ENABLED: "1"
+          REGIME_SPECIALIST_MIN_SAMPLES: "1200"
+          REGIME_GATING_BASE_BLEND: "0.25"
+          # PR-06: Promotion gates (block deployment if failed)
+          PROMOTION_GATES_ENABLED: "1"
+          ENFORCE_PROMOTION_GATES: "1"
+          PROMOTION_MIN_RETURN_PER_DAY: "0.0002"
+          PROMOTION_MIN_COST_ADJUSTED_SHARPE: "0.5"
+          PROMOTION_MAX_DRAWDOWN: "-0.25"
+          PROMOTION_MIN_CONSISTENCY: "0.55"
+          PROMOTION_MIN_TURNOVER_EFFICIENCY: "0.20"
+          PROMOTION_MAX_AVG_TURNOVER: "0.80"
+          PROMOTION_MIN_PERIODS: "2"
         run: |
+          rm -rf models/ensemble
           python -m stock_screener.cli train-model --log-level INFO
 
       - name: Upload trained model artifact
@@ -84,4 +99,3 @@ jobs:
           path: |
             models/ensemble/
           retention-days: 90
-

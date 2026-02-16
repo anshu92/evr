@@ -23,6 +23,8 @@ from stock_screener.utils import Universe, ensure_dir, read_json, write_json, su
 # Suppress known external library warnings
 suppress_external_warnings()
 from stock_screener.modeling.model import (
+    compute_regime_gate_weights,
+    load_regime_ensembles,
     load_ensemble,
     load_model,
     load_quantile_ensembles,
@@ -30,6 +32,7 @@ from stock_screener.modeling.model import (
     predict_ensemble,
     predict_ensemble_with_uncertainty,
     predict_peak_days,
+    predict_regime_gated,
     predict_quantile_lcb,
     compute_feature_schema_hash,
 )
@@ -203,10 +206,18 @@ def _apply_rebalance_controls(
     target_weights: pd.DataFrame,
     *,
     state,
+    screened: pd.DataFrame,
     prices_cad: pd.Series,
+    market_vol_regime: float | None,
     min_rebalance_weight_delta: float,
     min_trade_notional_cad: float,
     turnover_penalty_bps: float,
+    dynamic_band_enabled: bool,
+    uncertainty_weight: float,
+    liquidity_weight: float,
+    vol_regime_weight: float,
+    band_mult_min: float,
+    band_mult_max: float,
     logger,
 ) -> pd.DataFrame:
     if target_weights.empty:
@@ -215,6 +226,12 @@ def _apply_rebalance_controls(
     min_delta = max(0.0, float(min_rebalance_weight_delta))
     min_notional = max(1.0, float(min_trade_notional_cad))
     penalty_bps = max(0.0, float(turnover_penalty_bps))
+    dyn_enabled = bool(dynamic_band_enabled)
+    dyn_u_w = max(0.0, float(uncertainty_weight))
+    dyn_l_w = max(0.0, float(liquidity_weight))
+    dyn_v_w = max(0.0, float(vol_regime_weight))
+    dyn_min = max(0.2, float(band_mult_min))
+    dyn_max = max(dyn_min, float(band_mult_max))
 
     open_values: dict[str, float] = {}
     open_total = 0.0
@@ -236,30 +253,67 @@ def _apply_rebalance_controls(
     adjusted = target_weights.copy()
     effective_weights: dict[str, float] = {}
     skipped_small = 0
+    dyn_multipliers: list[float] = []
+
+    ticker_unct = pd.Series(0.5, index=adjusted.index.astype(str), dtype=float)
+    ticker_illiq = pd.Series(0.5, index=adjusted.index.astype(str), dtype=float)
+    if dyn_enabled and screened is not None and not screened.empty:
+        idx = pd.Index(adjusted.index.astype(str))
+        if "pred_uncertainty" in screened.columns:
+            u = pd.to_numeric(screened["pred_uncertainty"], errors="coerce")
+            u_pct = u.rank(pct=True, na_option="keep").reindex(idx).fillna(0.5).clip(0.0, 1.0)
+            ticker_unct = u_pct
+        if "avg_dollar_volume_cad" in screened.columns:
+            adv = pd.to_numeric(screened["avg_dollar_volume_cad"], errors="coerce")
+            liq_pct = adv.rank(pct=True, na_option="keep").reindex(idx).fillna(0.5).clip(0.0, 1.0)
+            ticker_illiq = (1.0 - liq_pct).clip(0.0, 1.0)
+
+    vol_stress = 0.0
+    if dyn_enabled and market_vol_regime is not None and pd.notna(market_vol_regime):
+        vol_stress = float(max(0.0, min(1.0, (float(market_vol_regime) - 1.0) / 0.8)))
+
     for t in set(adjusted.index.astype(str)).union(current_weights.keys()):
         tgt_w = float(adjusted.loc[t, "weight"]) if t in adjusted.index and "weight" in adjusted.columns else 0.0
         cur_w = float(current_weights.get(t, 0.0))
         delta = abs(tgt_w - cur_w)
+        dyn_mult = 1.0
+        if dyn_enabled:
+            u_s = float(ticker_unct.get(t, 0.5))
+            l_s = float(ticker_illiq.get(t, 0.5))
+            dyn_mult = 1.0 + (dyn_u_w * u_s) + (dyn_l_w * l_s) + (dyn_v_w * vol_stress)
+            dyn_mult = float(max(dyn_min, min(dyn_max, dyn_mult)))
+        dyn_multipliers.append(dyn_mult)
+
+        delta_threshold = min_delta * dyn_mult
+        notional_threshold = min_notional * dyn_mult
         trade_notional = delta * equity
 
-        if delta < min_delta or trade_notional < min_notional:
+        if delta < delta_threshold or trade_notional < notional_threshold:
             effective = cur_w
             skipped_small += 1
         else:
             # Transaction-cost-aware shrinkage of turnover-heavy moves.
-            turnover_penalty = penalty_bps * 1e-4 * delta
+            turnover_penalty = penalty_bps * dyn_mult * 1e-4 * delta
             effective = max(0.0, tgt_w - turnover_penalty)
 
         # Avoid initiating tiny new positions.
-        if cur_w <= 0 and effective * equity < min_notional:
+        if cur_w <= 0 and effective * equity < notional_threshold:
             effective = 0.0
         effective_weights[t] = effective
 
     if skipped_small > 0:
-        logger.info(
-            "Rebalance hysteresis kept %d small-delta/notional changes",
-            skipped_small,
-        )
+        if dyn_enabled and dyn_multipliers:
+            logger.info(
+                "Rebalance hysteresis kept %d small changes (dynamic band x%.2f avg, vol_regime=%s)",
+                skipped_small,
+                float(pd.Series(dyn_multipliers, dtype=float).mean()),
+                f"{float(market_vol_regime):.2f}" if market_vol_regime is not None and pd.notna(market_vol_regime) else "n/a",
+            )
+        else:
+            logger.info(
+                "Rebalance hysteresis kept %d small-delta/notional changes",
+                skipped_small,
+            )
 
     for t, w in effective_weights.items():
         if t not in adjusted.index:
@@ -398,17 +452,70 @@ def run_daily(cfg: Config, logger) -> None:
             if mp.name.lower() == "manifest.json":
                 models, weights, peak_model = load_ensemble(mp)
                 quantile_ensembles = {}
+                regime_ensembles = {}
                 if bool(getattr(cfg, "quantile_models_enabled", True)):
                     try:
                         quantile_ensembles = load_quantile_ensembles(mp)
                     except Exception as qe:
                         logger.warning("Could not load quantile ensembles: %s", qe)
+                if bool(getattr(cfg, "regime_specialist_enabled", True)):
+                    try:
+                        regime_ensembles = load_regime_ensembles(mp)
+                    except Exception as re:
+                        logger.warning("Could not load regime specialists: %s", re)
                 if models:
                     # Use uncertainty-aware predictions with selected features
                     pred_df = predict_ensemble_with_uncertainty(
                         models, weights, features_ml, feature_cols=selected_features
                     )
                     raw_preds = pred_df["pred_return"]
+                    regime_gate_used = False
+
+                    if regime_ensembles:
+                        try:
+                            gate_weights = compute_regime_gate_weights(features_ml)
+                            regime_preds: dict[str, pd.Series] = {}
+                            for regime_name, (r_models, r_weights) in regime_ensembles.items():
+                                regime_preds[regime_name] = predict_ensemble(
+                                    r_models,
+                                    r_weights,
+                                    features_ml,
+                                    feature_cols=selected_features,
+                                )
+                            gate_blend = float(getattr(cfg, "regime_gating_base_blend", 0.25))
+                            gated_df = predict_regime_gated(
+                                raw_preds,
+                                regime_preds=regime_preds,
+                                gate_weights=gate_weights,
+                                base_blend=gate_blend,
+                            )
+                            raw_preds = gated_df["pred_return"]
+                            for c in (
+                                "regime",
+                                "regime_confidence",
+                                "regime_gate_bull",
+                                "regime_gate_neutral",
+                                "regime_gate_bear",
+                                "pred_return_regime_mix",
+                                "pred_return_base",
+                            ):
+                                features[c] = gated_df[c]
+                            run_meta["regime_gating"] = {
+                                "enabled": True,
+                                "n_experts": len(regime_ensembles),
+                                "base_blend": gate_blend,
+                                "dominant_regime": str(gated_df["regime"].mode().iloc[0]) if len(gated_df) else "neutral",
+                                "mean_confidence": float(gated_df["regime_confidence"].mean()) if len(gated_df) else float("nan"),
+                            }
+                            regime_gate_used = True
+                            logger.info(
+                                "Applied regime specialist gating: experts=%d, dominant=%s, confidence=%.3f",
+                                len(regime_ensembles),
+                                run_meta["regime_gating"]["dominant_regime"],
+                                run_meta["regime_gating"]["mean_confidence"],
+                            )
+                        except Exception as ge:
+                            logger.warning("Regime specialist gating failed; falling back to base ensemble: %s", ge)
                     
                     # Apply prediction calibration if available
                     calibration_map = model_metadata.get("prediction_calibration") if model_metadata else None
@@ -425,7 +532,8 @@ def run_daily(cfg: Config, logger) -> None:
                     
                     features["pred_uncertainty"] = pred_df["pred_uncertainty"]
                     features["pred_confidence"] = pred_df["pred_confidence"]
-                    features["pred_return_base"] = features["pred_return"]
+                    if "pred_return_base" not in features.columns:
+                        features["pred_return_base"] = features["pred_return"]
 
                     # Optional quantile + LCB override.
                     if quantile_ensembles:
@@ -438,18 +546,29 @@ def run_daily(cfg: Config, logger) -> None:
                         )
                         for c in q_df.columns:
                             features[c] = q_df[c]
-                        # Use LCB as primary alpha to reduce downside surprises.
-                        features["pred_return"] = q_df["pred_return_lcb"]
+
+                        # If regime specialists are active, keep their alpha signal and use quantiles
+                        # for uncertainty only. Otherwise, preserve existing LCB-as-primary behavior.
+                        if not regime_gate_used:
+                            features["pred_return"] = q_df["pred_return_lcb"]
+
                         # Quantile spread is a more interpretable uncertainty proxy than model disagreement.
                         features["pred_uncertainty"] = q_df["pred_quantile_spread"]
                         features["pred_confidence"] = 1.0 / (
                             1.0 + features["pred_uncertainty"].fillna(features["pred_uncertainty"].median()).clip(lower=0.0)
                         )
-                        logger.info(
-                            "Using quantile LCB signal: lambda=%.2f, spread mean=%.4f",
-                            lcb_lambda,
-                            float(features["pred_quantile_spread"].mean()),
-                        )
+                        if regime_gate_used:
+                            logger.info(
+                                "Quantile spread attached (regime-gated alpha retained): lambda=%.2f, spread mean=%.4f",
+                                lcb_lambda,
+                                float(features["pred_quantile_spread"].mean()),
+                            )
+                        else:
+                            logger.info(
+                                "Using quantile LCB signal: lambda=%.2f, spread mean=%.4f",
+                                lcb_lambda,
+                                float(features["pred_quantile_spread"].mean()),
+                            )
                     
                     # Predict peak timing (days until optimal sell)
                     max_horizon = model_metadata.get("max_horizon_days", 10) if model_metadata else 10
@@ -1087,10 +1206,18 @@ def run_daily(cfg: Config, logger) -> None:
     target_weights = _apply_rebalance_controls(
         target_weights,
         state=state,
+        screened=screened,
         prices_cad=prices_cad,
+        market_vol_regime=market_vol_regime,
         min_rebalance_weight_delta=getattr(cfg, "min_rebalance_weight_delta", 0.01),
         min_trade_notional_cad=getattr(cfg, "min_trade_notional_cad", 10.0),
         turnover_penalty_bps=getattr(cfg, "turnover_penalty_bps", 10.0),
+        dynamic_band_enabled=getattr(cfg, "dynamic_no_trade_band_enabled", True),
+        uncertainty_weight=getattr(cfg, "dynamic_no_trade_uncertainty_weight", 0.8),
+        liquidity_weight=getattr(cfg, "dynamic_no_trade_liquidity_weight", 0.6),
+        vol_regime_weight=getattr(cfg, "dynamic_no_trade_vol_regime_weight", 0.5),
+        band_mult_min=getattr(cfg, "dynamic_no_trade_multiplier_min", 0.75),
+        band_mult_max=getattr(cfg, "dynamic_no_trade_multiplier_max", 2.5),
         logger=logger,
     )
 
