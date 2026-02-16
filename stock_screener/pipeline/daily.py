@@ -141,6 +141,32 @@ def compute_dynamic_portfolio_size(
     return dynamic_size
 
 
+def _extract_model_holdout_ic(model_metadata: dict[str, Any] | None) -> float | None:
+    """Extract holdout IC from current or legacy model metadata layouts."""
+    if not isinstance(model_metadata, dict):
+        return None
+
+    raw_ic = None
+    reg_payload = model_metadata.get("regressor")
+    if isinstance(reg_payload, dict):
+        reg_holdout = reg_payload.get("holdout")
+        if isinstance(reg_holdout, dict):
+            raw_ic = reg_holdout.get("mean_ic")
+
+    if raw_ic is None:
+        legacy_holdout = model_metadata.get("holdout")
+        if isinstance(legacy_holdout, dict):
+            raw_ic = legacy_holdout.get("mean_ic")
+
+    try:
+        model_ic = float(raw_ic)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(model_ic):
+        return None
+    return model_ic
+
+
 def _check_runtime_budget(started_utc: datetime, cfg: Config, logger, stage: str) -> None:
     max_minutes = max(1, int(getattr(cfg, "max_daily_runtime_minutes", 12)))
     elapsed_minutes = (datetime.now(tz=timezone.utc) - started_utc).total_seconds() / 60.0
@@ -266,8 +292,16 @@ def _apply_rebalance_controls(
             if top.empty:
                 return top
             top_w = float(top["weight"].iloc[0])
-            if top_w <= 0 or (top_w * equity) < max(1.0, min_notional):
+            top_notional = top_w * equity
+            if top_w <= 0 or top_notional < 1.0:
                 return target_weights.iloc[0:0].copy()
+            if top_notional < min_notional:
+                logger.warning(
+                    "Rebalance cold start: top allocation %.2f CAD is below min trade notional %.2f; "
+                    "keeping a seed target to avoid zero-exposure lockout.",
+                    top_notional,
+                    min_notional,
+                )
             logger.info("Rebalance cold start: keeping top position to avoid empty portfolio.")
             return top
         total = float(cold["weight"].sum())
@@ -699,17 +733,15 @@ def run_daily(cfg: Config, logger) -> None:
     # No base size - portfolio can range from 1 to max based on opportunity quality
     if getattr(cfg, "dynamic_portfolio_sizing", True):
         # Extract model IC from metadata (used to calibrate aggressiveness)
-        model_ic = None
-        if run_meta.get("model", {}).get("metadata"):
-            holdout_metrics = run_meta["model"]["metadata"].get("holdout", {})
-            model_ic = holdout_metrics.get("mean_ic")
-            if model_ic is not None:
-                logger.info("Model holdout IC: %.4f (used for dynamic sizing)", model_ic)
+        model_meta = run_meta.get("model", {}).get("metadata")
+        model_ic = _extract_model_holdout_ic(model_meta)
+        if model_ic is not None:
+            logger.info("Model holdout IC: %.4f (used for dynamic sizing)", model_ic)
         
         effective_portfolio_size = compute_dynamic_portfolio_size(
             screened=screened,
             min_confidence=getattr(cfg, "dynamic_size_min_confidence", 0.5),
-            min_pred_return=getattr(cfg, "dynamic_size_min_pred_return", 0.03),
+            min_pred_return=getattr(cfg, "dynamic_size_min_pred_return", 0.01),
             max_positions=getattr(cfg, "dynamic_size_max_positions", 50),
             model_ic=model_ic,
             logger=logger,

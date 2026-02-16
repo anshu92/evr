@@ -112,3 +112,42 @@ def test_rebalance_controls_allow_cold_start_entries():
     )
     assert not out.empty
     assert float(out["weight"].sum()) > 0.0
+
+
+def test_rebalance_controls_keep_seed_target_below_min_notional():
+    logger = logging.getLogger("test")
+    state = PortfolioState(
+        cash_cad=427.49,
+        positions=[],
+        last_updated=datetime.now(tz=timezone.utc),
+    )
+    prices = pd.Series({"AAA": 100.0})
+    target = pd.DataFrame({"weight": [0.01975]}, index=["AAA"])
+    screened = pd.DataFrame(
+        {
+            "pred_uncertainty": [0.9],
+            "avg_dollar_volume_cad": [100_000.0],
+        },
+        index=["AAA"],
+    )
+
+    out = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=2.0,
+        min_rebalance_weight_delta=0.015,
+        min_trade_notional_cad=15.0,
+        turnover_penalty_bps=15.0,
+        dynamic_band_enabled=True,
+        uncertainty_weight=1.2,
+        liquidity_weight=0.8,
+        vol_regime_weight=0.8,
+        band_mult_min=1.0,
+        band_mult_max=3.0,
+        logger=logger,
+    )
+    assert not out.empty
+    assert "AAA" in out.index
+    assert float(out.loc["AAA", "weight"]) > 0.0

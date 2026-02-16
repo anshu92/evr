@@ -34,7 +34,7 @@ class Config:
     # - Quality score combining both metrics
     dynamic_portfolio_sizing: bool = True  # Enable fully dynamic portfolio sizing
     dynamic_size_min_confidence: float = 0.5  # Minimum confidence threshold
-    dynamic_size_min_pred_return: float = 0.03  # Minimum predicted return (3%)
+    dynamic_size_min_pred_return: float = 0.01  # Minimum predicted return (1%)
     dynamic_size_max_positions: int = 50  # Maximum positions (can be 1-50 based on quality)
 
     # ML model (optional)
@@ -294,7 +294,7 @@ class Config:
             weight_cap=_get_float("WEIGHT_CAP", 0.10),
             dynamic_portfolio_sizing=_get_bool("DYNAMIC_PORTFOLIO_SIZING", True),
             dynamic_size_min_confidence=_get_float("DYNAMIC_SIZE_MIN_CONFIDENCE", 0.5),
-            dynamic_size_min_pred_return=_get_float("DYNAMIC_SIZE_MIN_PRED_RETURN", 0.03),
+            dynamic_size_min_pred_return=_get_float("DYNAMIC_SIZE_MIN_PRED_RETURN", 0.01),
             dynamic_size_max_positions=_get_int("DYNAMIC_SIZE_MAX_POSITIONS", 50) or 50,
             use_ml=os.getenv("USE_ML", "0").strip() in {"1", "true", "True"},
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),

@@ -969,8 +969,20 @@ class PortfolioManager:
                     pass
                 
                 cost = float(px) * float(shares)
+                seed_notional_entry = False
                 if cost < self.min_trade_notional_cad:
-                    continue
+                    # Cold start exception: allow exactly one small seed entry
+                    # (>= 1 CAD) so the portfolio can recover from zero-exposure lockout.
+                    if len(open_tickers) == 0 and cost >= 1.0:
+                        seed_notional_entry = True
+                        self.logger.info(
+                            "Seed entry for %s below min_trade_notional (cost=%.2f < %.2f) to avoid empty portfolio.",
+                            t,
+                            cost,
+                            self.min_trade_notional_cad,
+                        )
+                    else:
+                        continue
                 state.cash_cad = float(state.cash_cad) - float(cost)
                 pos = Position(
                     ticker=t,
@@ -996,7 +1008,10 @@ class PortfolioManager:
                 
                 actions.append(
                     TradeAction(
-                        ticker=t, action="BUY", reason="TOP_RANKED", shares=float(shares), 
+                        ticker=t,
+                        action="BUY",
+                        reason="TOP_RANKED:SEED_NOTIONAL" if seed_notional_entry else "TOP_RANKED",
+                        shares=float(shares),
                         price_cad=px, days_held=0, pred_return=pred_ret, expected_sell_date=expected_sell
                     )
                 )

@@ -353,3 +353,47 @@ def test_holdings_days_held_reports_trading_days(monkeypatch, tmp_path):
     )
 
     assert int(plan.holdings.loc["AAPL", "days_held"]) == 1
+
+
+def test_cold_start_seed_buy_allowed_below_min_trade_notional(tmp_path):
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        min_trade_notional_cad=15.0,
+        min_rebalance_weight_delta=0.015,
+        logger=logger,
+    )
+
+    state = PortfolioState(cash_cad=427.49, positions=[], last_updated=now)
+    screened = pd.DataFrame(index=["AAA"])
+    weights = pd.DataFrame({"weight": [0.01975]}, index=["AAA"])
+    prices = pd.Series({"AAA": 100.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+    buys = [a for a in plan.actions if a.action == "BUY" and a.ticker == "AAA"]
+    assert len(buys) == 1
+    assert buys[0].reason == "TOP_RANKED:SEED_NOTIONAL"
+    assert 1.0 <= float(buys[0].shares * buys[0].price_cad) < 15.0
