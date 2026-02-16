@@ -562,6 +562,7 @@ def simulate_realistic_portfolio(
     cost_bps: float = 20.0,
     market_ret_col: str | None = None,
     rebalance_hysteresis: float = 0.15,
+    max_turnover_per_rebalance: float | None = None,
 ) -> dict[str, object]:
     """Simulate realistic portfolio with periodic rebalancing.
     
@@ -613,6 +614,14 @@ def simulate_realistic_portfolio(
     hold_days = max(1, int(hold_days))
     cost = float(cost_bps) * 1e-4
     hysteresis = max(0.0, float(rebalance_hysteresis))
+    turnover_cap = None
+    if max_turnover_per_rebalance is not None:
+        try:
+            tcap = float(max_turnover_per_rebalance)
+            if np.isfinite(tcap):
+                turnover_cap = float(np.clip(tcap, 0.0, 1.0))
+        except (TypeError, ValueError):
+            turnover_cap = None
 
     portfolio_returns: list[dict[str, float]] = []
     market_returns_list: list[float] = []
@@ -646,6 +655,31 @@ def simulate_realistic_portfolio(
             new_holdings = set(selected)
         else:
             new_holdings = set(ranked_tickers[:n])
+
+        # Optional trading constraint: cap one-step turnover.
+        if current_holdings and turnover_cap is not None and turnover_cap < 1.0:
+            max_replacements = int(np.floor(turnover_cap * n))
+            min_retain = max(0, n - max_replacements)
+            if min_retain > 0:
+                full_rank_lookup = {t: i for i, t in enumerate(ranked_tickers)}
+                retained_ranked = [t for t in current_holdings if t in full_rank_lookup]
+                retained_ranked.sort(key=lambda t: full_rank_lookup[t])
+                retained_unranked = [t for t in current_holdings if t not in full_rank_lookup]
+                keep = retained_ranked[:min_retain]
+                if len(keep) < min_retain and retained_unranked:
+                    keep.extend(retained_unranked[: (min_retain - len(keep))])
+                capped_selection = list(dict.fromkeys(keep))
+                for t in ranked_tickers:
+                    if len(capped_selection) >= n:
+                        break
+                    if t not in capped_selection:
+                        capped_selection.append(t)
+                for t in new_holdings:
+                    if len(capped_selection) >= n:
+                        break
+                    if t not in capped_selection:
+                        capped_selection.append(t)
+                new_holdings = set(capped_selection[:n])
 
         top = day_data[day_data[ticker_col].isin(new_holdings)]
         if top.empty:

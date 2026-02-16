@@ -1859,6 +1859,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         0.0,
         float(getattr(cfg, "promotion_rebalance_hysteresis", 0.15)),
     )
+    promotion_max_turnover_per_rebalance = float(
+        np.clip(
+            float(getattr(cfg, "promotion_max_turnover_per_rebalance", 0.75)),
+            0.0,
+            1.0,
+        )
+    )
     prediction_recalibration = {
         "enabled": False,
         "method": "linear",
@@ -2171,6 +2178,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 cost_bps=sim_cost_bps,
                 market_ret_col="market_ret" if "market_ret" in period_sim.columns else None,
                 rebalance_hysteresis=promotion_rebalance_hysteresis,
+                max_turnover_per_rebalance=promotion_max_turnover_per_rebalance,
             )
             summary = dict(sim_out.get("summary", {}))
             summary["period_id"] = period_name
@@ -2415,6 +2423,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             cost_bps=sim_cost_bps,
             market_ret_col="market_ret" if "market_ret" in holdout_with_preds.columns else None,
             rebalance_hysteresis=promotion_rebalance_hysteresis,
+            max_turnover_per_rebalance=promotion_max_turnover_per_rebalance,
         )
         realistic_metrics = realistic_result.get("summary", {})
         
@@ -2508,6 +2517,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 cost_bps=0.0 if "future_ret_net" in period_test_df.columns else 20.0,
                 market_ret_col="market_ret" if "market_ret" in period_test_df.columns else None,
                 rebalance_hysteresis=promotion_rebalance_hysteresis,
+                max_turnover_per_rebalance=promotion_max_turnover_per_rebalance,
             )
             
             period_summary = period_result.get("summary", {})
@@ -2518,12 +2528,13 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             period_metrics.append(period_summary)
             
             logger.info(
-                "  Period %d (%s to %s): Sharpe=%.2f, Alpha=%.1f%%",
+                "  Period %d (%s to %s): Sharpe=%.2f, Alpha=%.1f%%, Turnover=%.0f%%",
                 period.period_id,
                 period.test_start.strftime("%Y-%m"),
                 period.test_end.strftime("%Y-%m"),
                 period_summary.get("sharpe_ratio", 0),
                 period_summary.get("alpha_ann", 0) * 100,
+                period_summary.get("avg_turnover", 0) * 100,
             )
         
         if period_metrics:
@@ -2616,6 +2627,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "apply_rank_calibration": promotion_apply_rank_calibration,
             "promotion_use_quantile_lcb": promotion_use_quantile_lcb,
             "promotion_rebalance_hysteresis": promotion_rebalance_hysteresis,
+            "promotion_max_turnover_per_rebalance": promotion_max_turnover_per_rebalance,
         },
         "feature_columns": selected_features,  # Features used in final models (after selection)
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
@@ -2693,6 +2705,16 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     if promotion_enabled and not promotion_gate_report.get("passed", False):
         failed = [g["name"] for g in promotion_gate_report.get("gates", []) if not g.get("passed")]
         logger.warning("Model failed promotion gates: %s", failed)
+        for gate in promotion_gate_report.get("gates", []):
+            if gate.get("passed"):
+                continue
+            logger.warning(
+                "  Gate '%s' failed: actual=%.6f %s threshold=%.6f",
+                gate.get("name"),
+                float(gate.get("actual", float("nan"))),
+                gate.get("operator", "?"),
+                float(gate.get("threshold", float("nan"))),
+            )
         if enforce_promotion:
             raise RuntimeError(
                 "Model promotion blocked by gates: " + ", ".join(failed)

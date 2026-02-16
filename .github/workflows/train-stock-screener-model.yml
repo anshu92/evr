@@ -88,6 +88,10 @@ jobs:
           PROMOTION_MIN_CONSISTENCY: "0.55"
           PROMOTION_MIN_TURNOVER_EFFICIENCY: "0.20"
           PROMOTION_MAX_AVG_TURNOVER: "0.80"
+          # Reduce unnecessary rebalance churn in promotion simulation.
+          PROMOTION_REBALANCE_HYSTERESIS: ${{ vars.PROMOTION_REBALANCE_HYSTERESIS || '0.35' }}
+          # Cap one-step turnover during promotion simulation.
+          PROMOTION_MAX_TURNOVER_PER_REBALANCE: ${{ vars.PROMOTION_MAX_TURNOVER_PER_REBALANCE || '0.75' }}
           PROMOTION_MIN_PERIODS: "2"
           PROMOTION_MAX_CALIBRATION_ERROR: ${{ vars.PROMOTION_MAX_CALIBRATION_ERROR || '0.010' }}
           PROMOTION_MIN_CALIBRATION_SLOPE: ${{ vars.PROMOTION_MIN_CALIBRATION_SLOPE || '0.25' }}
