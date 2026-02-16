@@ -1407,137 +1407,170 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
 
     reg_holdout_preds: list[float] = []
     reg_holdout_base_preds: list[float] = []
+    reg_val_preds: list[float] = []
+    reg_val_base_preds: list[float] = []
     model_ics: list[float] = []  # Track IC per model for adaptive weighting
-    
-    if not holdout_df.empty:
-        # First pass: compute IC for each model to determine weights
+
+    weight_eval_df = val_df if not val_df.empty else holdout_df
+    if not weight_eval_df.empty:
+        # First pass: compute IC for each model to determine ensemble weights on validation data.
         for rel, mtype in zip(reg_rel_paths, model_types):
             model = load_model(model_dir / rel, mtype)
             if mtype == "xgboost":
-                model_pred = model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
+                model_pred = model.predict(xgb.DMatrix(weight_eval_df[selected_features])).astype(float)
             else:  # lightgbm
-                model_pred = model.predict(holdout_df[selected_features]).astype(float)
-            
-            # Compute IC for this model
-            model_metrics = _rank_ic_for_preds(holdout_df, pd.Series(model_pred, index=holdout_df.index))
+                model_pred = model.predict(weight_eval_df[selected_features]).astype(float)
+
+            model_metrics = _rank_ic_for_preds(weight_eval_df, pd.Series(model_pred, index=weight_eval_df.index))
             model_ic = model_metrics.get("summary", {}).get("mean_ic", 0.0)
             model_ics.append(max(model_ic, 0.0))  # Floor at 0 (don't reward negative IC)
             del model_pred, model
-        
         gc.collect()
-        
-        # Compute weights from ICs
-        if sum(model_ics) > 0:
-            weights = np.array(model_ics) / sum(model_ics)
-            logger.info(f"IC-weighted ensemble: model ICs={[f'{ic:.4f}' for ic in model_ics]}, weights={[f'{w:.3f}' for w in weights]}")
-        else:
-            weights = np.ones(len(model_ics)) / len(model_ics)
-            logger.warning("All model ICs <= 0, using equal weighting")
+    else:
+        model_ics = [1.0] * len(reg_rel_paths)
 
-        # Blend with reward-based online IC weights (if reward log has per-model data)
-        blend_alpha = getattr(cfg, "reward_ic_blend_alpha", 0.5)
-        try:
-            online_ic_result = compute_online_ic(reward_log, window=getattr(cfg, "reward_ic_window", 20))
-            per_model_ics_online = online_ic_result.get("per_model_ics")
-            if per_model_ics_online and len(per_model_ics_online) == len(model_ics):
-                weights_list = compute_ensemble_reward_weights(
-                    per_model_ics_online,
-                    holdout_weights=weights.tolist(),
-                    blend_alpha=blend_alpha,
-                )
-                weights = np.array(weights_list)
-                logger.info(
-                    "Blended ensemble weights with reward IC (alpha=%.2f): %s",
-                    blend_alpha, [f"{w:.3f}" for w in weights],
-                )
-        except Exception as e:
-            logger.debug("Could not blend reward IC weights: %s", e)
+    if sum(model_ics) > 0:
+        weights = np.array(model_ics) / sum(model_ics)
+        logger.info(
+            "IC-weighted ensemble (validation): model ICs=%s, weights=%s",
+            [f"{ic:.4f}" for ic in model_ics],
+            [f"{w:.3f}" for w in weights],
+        )
+    else:
+        weights = np.ones(len(reg_rel_paths)) / max(1, len(reg_rel_paths))
+        logger.warning("All model ICs <= 0, using equal weighting")
 
-        # Second pass: compute weighted predictions (memory efficient)
-        # IMPORTANT: Standardize predictions before combining to handle scale mismatch
-        # XGBRanker outputs ranking scores (~0-10) while LightGBM outputs alpha (~-0.5 to +0.5)
-        preds = np.zeros(len(holdout_df), dtype=float)
+    # Blend with reward-based online IC weights (if reward log has per-model data)
+    blend_alpha = getattr(cfg, "reward_ic_blend_alpha", 0.5)
+    try:
+        online_ic_result = compute_online_ic(reward_log, window=getattr(cfg, "reward_ic_window", 20))
+        per_model_ics_online = online_ic_result.get("per_model_ics")
+        if per_model_ics_online and len(per_model_ics_online) == len(model_ics):
+            weights_list = compute_ensemble_reward_weights(
+                per_model_ics_online,
+                holdout_weights=weights.tolist(),
+                blend_alpha=blend_alpha,
+            )
+            weights = np.array(weights_list)
+            logger.info(
+                "Blended ensemble weights with reward IC (alpha=%.2f): %s",
+                blend_alpha,
+                [f"{w:.3f}" for w in weights],
+            )
+    except Exception as e:
+        logger.debug("Could not blend reward IC weights: %s", e)
+
+    def _predict_weighted_ensemble(df: pd.DataFrame) -> pd.Series:
+        """Predict weighted ensemble scores with per-model standardization."""
+        if df.empty:
+            return pd.Series(dtype=float, index=df.index)
+        preds = np.zeros(len(df), dtype=float)
         for i, (rel, mtype) in enumerate(zip(reg_rel_paths, model_types)):
             model = load_model(model_dir / rel, mtype)
             if mtype == "xgboost":
-                model_pred = model.predict(xgb.DMatrix(holdout_df[selected_features])).astype(float)
+                model_pred = model.predict(xgb.DMatrix(df[selected_features])).astype(float)
             else:  # lightgbm
-                model_pred = model.predict(holdout_df[selected_features]).astype(float)
-            
-            # Standardize to z-scores before combining (handles scale mismatch)
+                model_pred = model.predict(df[selected_features]).astype(float)
             pred_std = float(np.nanstd(model_pred))
             if pred_std > 0:
                 model_pred = (model_pred - np.nanmean(model_pred)) / pred_std
-            
-            preds += model_pred * weights[i]
+            preds += model_pred * float(weights[i])
             del model_pred, model
-        
-        reg_holdout_preds = preds.tolist()
-        reg_holdout_base_preds = reg_holdout_preds.copy()
+        return pd.Series(preds, index=df.index, dtype=float)
 
-        # Apply regime-gated specialist blend on holdout predictions.
-        if regime_expert_manifest:
-            try:
-                base_series = pd.Series(reg_holdout_base_preds, index=holdout_df.index, dtype=float)
-                gate_weights = compute_regime_gate_weights(holdout_df)
-                regime_preds: dict[str, pd.Series] = {}
-                for regime_name, payload in regime_expert_manifest.items():
-                    rels = payload.get("models") or []
-                    mtypes = payload.get("model_types") or ["xgboost"] * len(rels)
-                    if not rels:
-                        continue
-                    r_models = [load_model(model_dir / rel, mtype) for rel, mtype in zip(rels, mtypes)]
-                    regime_preds[regime_name] = predict_ensemble(
-                        r_models,
-                        payload.get("weights"),
-                        holdout_df,
-                        feature_cols=selected_features,
-                    )
+    # Load regime specialist models once for validation/holdout routing decisions.
+    regime_models_for_wf: dict[str, tuple[list, list[float] | None]] = {}
+    for regime_name, payload in regime_expert_manifest.items():
+        rels = payload.get("models") or []
+        mtypes = payload.get("model_types") or ["xgboost"] * len(rels)
+        if not rels:
+            continue
+        try:
+            models = [load_model(model_dir / rel, mtype) for rel, mtype in zip(rels, mtypes)]
+            regime_models_for_wf[regime_name] = (models, payload.get("weights"))
+        except Exception as e:
+            logger.warning("Could not load regime expert '%s' for walk-forward: %s", regime_name, e)
 
-                gated = predict_regime_gated(
-                    base_series,
-                    regime_preds=regime_preds,
-                    gate_weights=gate_weights,
-                    base_blend=regime_base_blend,
-                )
-                gated_series = gated["pred_return"]
-                base_ic = float(_rank_ic_for_preds(holdout_df, base_series).get("summary", {}).get("mean_ic", float("nan")))
-                gated_ic = float(_rank_ic_for_preds(holdout_df, gated_series).get("summary", {}).get("mean_ic", float("nan")))
-                holdout_ic_delta = (
-                    gated_ic - base_ic if np.isfinite(base_ic) and np.isfinite(gated_ic) else float("nan")
-                )
-                deploy_regime_gating = bool(
-                    np.isfinite(gated_ic) and (
-                        not np.isfinite(base_ic) or gated_ic >= (base_ic - 1e-6)
-                    )
-                )
-                regime_gating_summary.update(
-                    {
-                        "enabled": True,
-                        "deployed": deploy_regime_gating,
-                        "holdout_base_ic": base_ic,
-                        "holdout_gated_ic": gated_ic,
-                        "holdout_ic_delta": holdout_ic_delta,
-                    }
-                )
-                logger.info(
-                    "Regime-gated holdout IC: base=%.4f gated=%.4f delta=%.4f",
-                    base_ic,
-                    gated_ic,
-                    holdout_ic_delta,
-                )
-                if deploy_regime_gating:
-                    reg_holdout_preds = gated_series.tolist()
-                    regime_gating_deploy_enabled = True
-                else:
-                    reg_holdout_preds = reg_holdout_base_preds.copy()
-                    logger.info(
-                        "Regime gating disabled for deployment (holdout delta=%.4f); using base ensemble predictions",
-                        holdout_ic_delta,
-                    )
-            except Exception as e:
-                logger.warning("Regime gating on holdout failed; using base predictions: %s", e)
-        gc.collect()
+    def _apply_regime_gating(df: pd.DataFrame, base_series: pd.Series) -> pd.Series:
+        if df.empty or not regime_models_for_wf:
+            return pd.Series(base_series, index=df.index, dtype=float)
+        gate_weights = compute_regime_gate_weights(df)
+        regime_preds: dict[str, pd.Series] = {}
+        for regime_name, (r_models, r_weights) in regime_models_for_wf.items():
+            regime_preds[regime_name] = predict_ensemble(
+                r_models,
+                r_weights,
+                df,
+                feature_cols=selected_features,
+            )
+        gated = predict_regime_gated(
+            pd.Series(base_series, index=df.index, dtype=float),
+            regime_preds=regime_preds,
+            gate_weights=gate_weights,
+            base_blend=regime_base_blend,
+        )
+        return gated["pred_return"].reindex(df.index).astype(float)
+
+    # Base (ungated) ensemble predictions for validation/holdout.
+    reg_val_base_series = _predict_weighted_ensemble(val_df)
+    reg_holdout_base_series = _predict_weighted_ensemble(holdout_df)
+    reg_val_base_preds = reg_val_base_series.tolist()
+    reg_holdout_base_preds = reg_holdout_base_series.tolist()
+    reg_val_preds = reg_val_base_preds.copy()
+    reg_holdout_preds = reg_holdout_base_preds.copy()
+
+    # Decide regime deployment from split-wise validation periods (not holdout).
+    regime_period_deltas: list[float] = []
+    if regime_models_for_wf:
+        for split in splits:
+            period_df = _subset_by_dates(split.val_dates)
+            if period_df.empty or len(period_df) < 100:
+                continue
+            base_period = _predict_weighted_ensemble(period_df)
+            gated_period = _apply_regime_gating(period_df, base_period)
+            base_ic = float(_rank_ic_for_preds(period_df, base_period).get("summary", {}).get("mean_ic", float("nan")))
+            gated_ic = float(_rank_ic_for_preds(period_df, gated_period).get("summary", {}).get("mean_ic", float("nan")))
+            if np.isfinite(base_ic) and np.isfinite(gated_ic):
+                regime_period_deltas.append(gated_ic - base_ic)
+
+        if regime_period_deltas:
+            deltas = np.array(regime_period_deltas, dtype=float)
+            nonneg_rate = float(np.mean(deltas >= 0.0))
+            median_delta = float(np.median(deltas))
+            mean_delta = float(np.mean(deltas))
+            regime_gating_deploy_enabled = bool((median_delta > 0.0) or (median_delta >= 0.0 and nonneg_rate >= 0.67))
+            regime_gating_summary.update(
+                {
+                    "enabled": True,
+                    "deployed": regime_gating_deploy_enabled,
+                    "decision_periods": int(len(deltas)),
+                    "decision_mean_delta": mean_delta,
+                    "decision_median_delta": median_delta,
+                    "decision_nonnegative_rate": nonneg_rate,
+                }
+            )
+            logger.info(
+                "Regime deployment decision (validation periods): deploy=%s mean_delta=%.4f median_delta=%.4f nonneg=%.1f%%",
+                regime_gating_deploy_enabled,
+                mean_delta,
+                median_delta,
+                nonneg_rate * 100.0,
+            )
+        else:
+            regime_gating_summary.update(
+                {
+                    "enabled": True,
+                    "deployed": False,
+                    "decision_reason": "insufficient_validation_periods",
+                }
+            )
+            logger.info("Regime deployment decision: insufficient validation periods; using base ensemble")
+
+    if regime_gating_deploy_enabled:
+        reg_val_preds = _apply_regime_gating(val_df, reg_val_base_series).tolist()
+        reg_holdout_preds = _apply_regime_gating(holdout_df, reg_holdout_base_series).tolist()
+
+    gc.collect()
 
     reg_holdout_metrics = _rank_ic_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
     reg_holdout_topn = _topn_for_preds(holdout_df, pd.Series(reg_holdout_preds, index=holdout_df.index))
@@ -1561,17 +1594,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     reg_models = []
     for rel, mtype in zip(reg_rel_paths, model_types):
         reg_models.append(load_model(model_dir / rel, mtype))
-    regime_models_for_wf: dict[str, tuple[list, list[float] | None]] = {}
-    for regime_name, payload in regime_expert_manifest.items():
-        rels = payload.get("models") or []
-        mtypes = payload.get("model_types") or ["xgboost"] * len(rels)
-        if not rels:
-            continue
-        try:
-            models = [load_model(model_dir / rel, mtype) for rel, mtype in zip(rels, mtypes)]
-            regime_models_for_wf[regime_name] = (models, payload.get("weights"))
-        except Exception as e:
-            logger.warning("Could not load regime expert '%s' for walk-forward: %s", regime_name, e)
 
     # =========================================================================
     # QUANTILE MODELS: Predict q10/q50/q90 for uncertainty-aware LCB ranking
@@ -1662,10 +1684,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             )
     elif quantile_enabled and lgb is None:
         logger.warning("Quantile models enabled but LightGBM unavailable; skipping quantile training.")
-
-    quantile_lcb_holdout_ic = float("nan")
-    if isinstance(quantile_metrics.get("lcb"), dict):
-        quantile_lcb_holdout_ic = float(quantile_metrics["lcb"].get("mean_ic", float("nan")))
 
     quantile_models_for_eval: dict[str, tuple[list, list[float] | None]] = {}
     if quantile_manifest:
@@ -1825,6 +1843,18 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     # Enhanced metrics including calibration and portfolio stats
     calibration_metrics = {}
     portfolio_metrics = {}
+    promotion_thresholds = {
+        "min_return_per_day": float(getattr(cfg, "promotion_min_return_per_day", 0.0002)),
+        "min_cost_adjusted_sharpe": float(getattr(cfg, "promotion_min_cost_adjusted_sharpe", 0.5)),
+        "max_drawdown": float(getattr(cfg, "promotion_max_drawdown", -0.25)),
+        "min_consistency": float(getattr(cfg, "promotion_min_consistency", 0.55)),
+        "min_turnover_efficiency": float(getattr(cfg, "promotion_min_turnover_efficiency", 0.20)),
+        "max_avg_turnover": float(getattr(cfg, "promotion_max_avg_turnover", 0.80)),
+        "min_periods": int(getattr(cfg, "promotion_min_periods", 2)),
+        "max_calibration_error": float(getattr(cfg, "promotion_max_calibration_error", float("inf"))),
+        "min_calibration_slope": float(getattr(cfg, "promotion_min_calibration_slope", float("-inf"))),
+        "max_pbo_proxy": float(getattr(cfg, "promotion_max_pbo_proxy", float("inf"))),
+    }
     prediction_recalibration = {
         "enabled": False,
         "method": "linear",
@@ -1834,24 +1864,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     }
     promotion_holdout_preds = pd.Series(dtype=float)
     promotion_use_quantile_lcb_cfg = os.getenv("PROMOTION_USE_QUANTILE_LCB", "1").strip() in {"1", "true", "True"}
-    base_holdout_ic = float(reg_holdout_metrics.get("summary", {}).get("mean_ic", float("nan")))
-    quantile_lcb_improves_holdout = bool(
-        np.isfinite(quantile_lcb_holdout_ic)
-        and quantile_lcb_holdout_ic > 0.0
-        and (not np.isfinite(base_holdout_ic) or quantile_lcb_holdout_ic >= base_holdout_ic)
-    )
-    promotion_use_quantile_lcb = bool(
-        promotion_use_quantile_lcb_cfg
-        and quantile_models_for_eval
-        and quantile_lcb_improves_holdout
-    )
-    if promotion_use_quantile_lcb_cfg and not promotion_use_quantile_lcb:
-        logger.info(
-            "Promotion eval: disabling quantile LCB (base_ic=%.4f, lcb_ic=%.4f); using calibrated base predictions",
-            base_holdout_ic,
-            quantile_lcb_holdout_ic,
-        )
-
     promotion_calibration_target = calibration_col or label_col
     _promotion_calib_series = (
         train_df[promotion_calibration_target].dropna()
@@ -1861,6 +1873,179 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     promotion_calibration_map = build_calibration_map(_promotion_calib_series, n_quantiles=20)
     promotion_apply_linear_recalibration = bool(getattr(cfg, "apply_prediction_recalibration", True))
     promotion_apply_rank_calibration = bool(promotion_calibration_map and promotion_calibration_map.get("values"))
+
+    # Build split OOF periods for transform selection (never tune on holdout).
+    def _build_split_oof_predictions(split_train_df: pd.DataFrame, split_val_df: pd.DataFrame, seed: int) -> pd.Series:
+        """Train a lightweight split model and predict its validation slice."""
+        if split_train_df.empty or split_val_df.empty:
+            return pd.Series(dtype=float, index=split_val_df.index)
+        try:
+            if use_ranking:
+                split_tr = split_train_df.sort_values("date")
+                split_groups = split_tr.groupby("date").size().values
+                split_rank_labels = split_tr.groupby("date")[label_col].transform(
+                    lambda x: returns_to_grades(x, n_grades=5)
+                ).astype(int)
+                split_model = xgb.XGBRanker(
+                    n_estimators=260,
+                    learning_rate=best_regressor_params.get("learning_rate", 0.04),
+                    max_depth=best_regressor_params.get("max_depth", 5),
+                    min_child_weight=best_regressor_params.get("min_child_weight", 8),
+                    subsample=best_regressor_params.get("subsample", 0.75),
+                    colsample_bytree=best_regressor_params.get("colsample_bytree", 0.75),
+                    reg_lambda=best_regressor_params.get("reg_lambda", 2.0),
+                    objective=xgb_rank_objective,
+                    eval_metric="ndcg@30",
+                    n_jobs=0,
+                    random_state=seed,
+                )
+                split_model.fit(
+                    split_tr[selected_features],
+                    split_rank_labels,
+                    group=split_groups,
+                )
+                split_pred = split_model.predict(split_val_df[selected_features]).astype(float)
+            else:
+                split_model = build_model(random_state=seed)
+                split_model.set_params(**best_regressor_params, n_estimators=260, early_stopping_rounds=None)
+                split_model.fit(
+                    split_train_df[selected_features],
+                    split_train_df[label_col].astype(float),
+                )
+                split_pred = split_model.predict(split_val_df[selected_features]).astype(float)
+            split_std = float(np.nanstd(split_pred))
+            if split_std > 0:
+                split_pred = (split_pred - np.nanmean(split_pred)) / split_std
+            return pd.Series(split_pred, index=split_val_df.index, dtype=float)
+        except Exception as e:
+            logger.warning("Promotion eval split-OOF model failed; using ensemble fallback: %s", e)
+            return _predict_weighted_ensemble(split_val_df).reindex(split_val_df.index).astype(float)
+
+    promotion_eval_periods: list[tuple[str, pd.DataFrame, pd.Series]] = []
+    for idx, split in enumerate(splits, start=1):
+        split_train_df = _subset_by_dates(split.train_dates)
+        period_df = _subset_by_dates(split.val_dates)
+        if period_df.empty or len(period_df) < 100:
+            continue
+        period_base = _build_split_oof_predictions(split_train_df, period_df, seed=600 + idx)
+        promotion_eval_periods.append((f"split_{idx}", period_df, period_base))
+
+    if not promotion_eval_periods and not val_df.empty and reg_val_preds:
+        promotion_eval_periods.append(
+            ("val_fallback", val_df, pd.Series(reg_val_preds, index=val_df.index, dtype=float))
+        )
+    if promotion_eval_periods:
+        logger.info("Promotion scoring selection: using %d split OOF periods", len(promotion_eval_periods))
+
+    promotion_eval_df = (
+        pd.concat([p[1] for p in promotion_eval_periods], axis=0)
+        if promotion_eval_periods
+        else pd.DataFrame()
+    )
+    promotion_eval_base_preds = (
+        pd.concat([p[2].reindex(p[1].index).astype(float) for p in promotion_eval_periods], axis=0)
+        if promotion_eval_periods
+        else pd.Series(dtype=float)
+    )
+    promotion_eval_targets = (
+        pd.concat(
+            [
+                (
+                    p[1][promotion_calibration_target]
+                    if promotion_calibration_target in p[1].columns
+                    else p[1][label_col]
+                )
+                for p in promotion_eval_periods
+            ],
+            axis=0,
+        )
+        if promotion_eval_periods
+        else pd.Series(dtype=float)
+    )
+
+    # Fit optional linear recalibration on split OOF predictions (never on holdout).
+    if (
+        bool(getattr(cfg, "prediction_recalibration_enabled", True))
+        and promotion_apply_linear_recalibration
+        and not promotion_eval_base_preds.empty
+    ):
+        calib_df = pd.DataFrame({"pred": promotion_eval_base_preds, "real": promotion_eval_targets}).dropna()
+        if len(calib_df) >= 30 and float(calib_df["pred"].std(ddof=0)) > 0:
+            try:
+                slope, intercept = np.polyfit(
+                    calib_df["pred"].values.astype(float),
+                    calib_df["real"].values.astype(float),
+                    1,
+                )
+                slope = float(np.clip(slope, -5.0, 5.0))
+                intercept = float(np.clip(intercept, -1.0, 1.0))
+                prediction_recalibration = {
+                    "enabled": True,
+                    "method": "linear",
+                    "slope": slope,
+                    "intercept": intercept,
+                    "n_samples": int(len(calib_df)),
+                }
+                logger.info(
+                    "Fitted prediction recalibration on split OOF: y=%.4f*x + %.4f (n=%d)",
+                    slope,
+                    intercept,
+                    len(calib_df),
+                )
+            except Exception as e:
+                logger.warning("Prediction recalibration fit failed on split OOF; disabled: %s", e)
+        else:
+            promotion_apply_linear_recalibration = False
+
+    # Decide if quantile LCB should be a transform candidate using split-period IC.
+    base_eval_ic = float("nan")
+    quantile_lcb_eval_ic = float("nan")
+    if not promotion_eval_df.empty and not promotion_eval_base_preds.empty:
+        base_eval_ic = float(
+            _rank_ic_for_preds(
+                promotion_eval_df,
+                promotion_eval_base_preds.reindex(promotion_eval_df.index),
+            ).get("summary", {}).get("mean_ic", float("nan"))
+        )
+    if quantile_models_for_eval and promotion_eval_periods:
+        lcb_chunks: list[pd.Series] = []
+        for _, period_df, _ in promotion_eval_periods:
+            try:
+                q_df = predict_quantile_lcb(
+                    quantile_models_for_eval,
+                    period_df[selected_features],
+                    feature_cols=selected_features,
+                    lcb_risk_aversion=float(getattr(cfg, "lcb_risk_aversion", 0.5)),
+                )
+                lcb_chunks.append(q_df["pred_return_lcb"].reindex(period_df.index).astype(float))
+            except Exception as e:
+                logger.warning("Promotion eval: quantile LCB unavailable for split period: %s", e)
+                lcb_chunks = []
+                break
+        if lcb_chunks and not promotion_eval_df.empty:
+            lcb_eval_preds = pd.concat(lcb_chunks, axis=0)
+            quantile_lcb_eval_ic = float(
+                _rank_ic_for_preds(
+                    promotion_eval_df,
+                    lcb_eval_preds.reindex(promotion_eval_df.index),
+                ).get("summary", {}).get("mean_ic", float("nan"))
+            )
+    quantile_lcb_improves_eval = bool(
+        np.isfinite(quantile_lcb_eval_ic)
+        and quantile_lcb_eval_ic > 0.0
+        and (not np.isfinite(base_eval_ic) or quantile_lcb_eval_ic >= base_eval_ic)
+    )
+    promotion_use_quantile_lcb = bool(
+        promotion_use_quantile_lcb_cfg
+        and quantile_models_for_eval
+        and quantile_lcb_improves_eval
+    )
+    if promotion_use_quantile_lcb_cfg and not promotion_use_quantile_lcb:
+        logger.info(
+            "Promotion eval: disabling quantile LCB (split_base_ic=%.4f, split_lcb_ic=%.4f); using calibrated base predictions",
+            base_eval_ic,
+            quantile_lcb_eval_ic,
+        )
 
     def _prepare_promotion_predictions(
         frame: pd.DataFrame,
@@ -1923,189 +2108,225 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 logger.warning("Promotion eval: quantile LCB fallback to calibrated base (reason: %s)", e)
 
         return scored
-    
+
+    selected_candidate_name = "raw"
+    selected_candidate_gate_report: dict[str, object] | None = None
+    selected_candidate_eval_metrics: dict[str, float] = {}
+
+    def _safe_metric(value: object, fallback: float = float("-inf")) -> float:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return val if np.isfinite(val) else fallback
+
+    def _evaluate_transform_candidate(
+        *,
+        name: str,
+        apply_linear: bool,
+        apply_rank: bool,
+        apply_lcb: bool,
+    ) -> dict[str, object]:
+        pred_chunks: list[pd.Series] = []
+        target_chunks: list[pd.Series] = []
+        period_summaries: list[dict[str, object]] = []
+
+        for period_name, period_df, period_base_pred in promotion_eval_periods:
+            period_pred = _prepare_promotion_predictions(
+                period_df,
+                period_base_pred,
+                apply_linear_recalibration=apply_linear,
+                apply_rank_calibration=apply_rank,
+                apply_quantile_lcb=apply_lcb,
+            ).reindex(period_df.index).astype(float)
+
+            pred_chunks.append(period_pred)
+            target_chunks.append(
+                period_df[promotion_calibration_target]
+                if promotion_calibration_target in period_df.columns
+                else period_df[label_col]
+            )
+
+            period_sim = period_df.copy()
+            period_sim["pred_return"] = period_pred.values
+            period_sim["ticker"] = (
+                period_sim.index
+                if "ticker" not in period_sim.columns
+                else period_sim["ticker"]
+            )
+            sim_label_col = "future_ret_net" if "future_ret_net" in period_sim.columns else "future_ret"
+            sim_cost_bps = 0.0 if sim_label_col == "future_ret_net" else 20.0
+            sim_out = simulate_realistic_portfolio(
+                period_sim.reset_index(drop=True),
+                date_col="date",
+                ticker_col="ticker",
+                label_col=sim_label_col,
+                pred_col="pred_return",
+                top_n=top_n,
+                hold_days=horizon,
+                cost_bps=sim_cost_bps,
+                market_ret_col="market_ret" if "market_ret" in period_sim.columns else None,
+            )
+            summary = dict(sim_out.get("summary", {}))
+            summary["period_id"] = period_name
+            period_summaries.append(summary)
+
+        if pred_chunks:
+            eval_preds = pd.concat(pred_chunks, axis=0)
+            eval_targets = pd.concat(target_chunks, axis=0)
+        else:
+            eval_preds = pd.Series(dtype=float)
+            eval_targets = pd.Series(dtype=float)
+
+        calibration_payload = compute_calibration(eval_preds, eval_targets, n_bins=10)
+        calibration_payload_for_gates = {
+            "calibration_error": float(calibration_payload.get("calibration_error", float("nan"))),
+            "calibration_slope": float(calibration_payload.get("calibration_slope", float("nan"))),
+        }
+        wf_payload = aggregate_walk_forward_results(period_summaries)
+        realistic_payload = period_summaries[-1] if period_summaries else {}
+        gate_report = evaluate_model_promotion_gates(
+            realistic_metrics=realistic_payload,
+            walk_forward_results=wf_payload,
+            calibration_metrics=calibration_payload_for_gates,
+            thresholds=promotion_thresholds,
+        )
+        eval_ic = float("nan")
+        if not promotion_eval_df.empty and not eval_preds.empty:
+            eval_ic = float(
+                _rank_ic_for_preds(
+                    promotion_eval_df,
+                    eval_preds.reindex(promotion_eval_df.index),
+                ).get("summary", {}).get("mean_ic", float("nan"))
+            )
+        return {
+            "name": name,
+            "apply_linear": apply_linear,
+            "apply_rank": apply_rank,
+            "apply_lcb": apply_lcb,
+            "gate_report": gate_report,
+            "calibration_metrics": calibration_payload_for_gates,
+            "mean_ic": eval_ic,
+        }
+
+    def _candidate_score(payload: dict[str, object]) -> tuple[float, ...]:
+        gate = payload.get("gate_report", {})
+        gates = gate.get("gates", []) if isinstance(gate, dict) else []
+        failed_count = float(sum(1 for g in gates if not g.get("passed", False)))
+        summary = gate.get("summary", {}) if isinstance(gate, dict) else {}
+        calibration_payload = payload.get("calibration_metrics", {})
+        return (
+            1.0 if bool(gate.get("passed", False)) else 0.0,
+            -failed_count,
+            _safe_metric(summary.get("return_per_day")),
+            _safe_metric(summary.get("cost_adjusted_sharpe")),
+            _safe_metric(summary.get("consistency")),
+            -_safe_metric(summary.get("pbo_proxy"), fallback=float("inf")),
+            _safe_metric(calibration_payload.get("calibration_slope")),
+            -_safe_metric(calibration_payload.get("calibration_error"), fallback=float("inf")),
+            _safe_metric(payload.get("mean_ic")),
+        )
+
+    linear_candidate_enabled = bool(
+        promotion_apply_linear_recalibration
+        and isinstance(prediction_recalibration, dict)
+        and bool(prediction_recalibration.get("enabled", False))
+    )
+    rank_candidate_enabled = bool(
+        promotion_apply_rank_calibration
+        and promotion_calibration_map
+        and promotion_calibration_map.get("values")
+    )
+    lcb_candidate_enabled = bool(promotion_use_quantile_lcb and quantile_models_for_eval)
+
+    if not promotion_eval_periods:
+        logger.warning("Promotion scoring selection: no split validation periods available; using raw base predictions.")
+        promotion_apply_linear_recalibration = False
+        promotion_apply_rank_calibration = False
+        promotion_use_quantile_lcb = False
+    else:
+        candidate_specs: list[dict[str, object]] = [
+            {"name": "raw", "linear": False, "rank": False, "lcb": False},
+        ]
+        if linear_candidate_enabled:
+            candidate_specs.append({"name": "linear_recalibrated", "linear": True, "rank": False, "lcb": False})
+        if rank_candidate_enabled:
+            candidate_specs.append({"name": "rank_calibrated", "linear": False, "rank": True, "lcb": False})
+        if linear_candidate_enabled and rank_candidate_enabled:
+            candidate_specs.append({"name": "linear_plus_rank", "linear": True, "rank": True, "lcb": False})
+        if lcb_candidate_enabled:
+            candidate_specs.append({"name": "quantile_lcb", "linear": False, "rank": False, "lcb": True})
+
+        candidate_results: list[dict[str, object]] = []
+        for spec in candidate_specs:
+            try:
+                candidate_results.append(
+                    _evaluate_transform_candidate(
+                        name=str(spec["name"]),
+                        apply_linear=bool(spec["linear"]),
+                        apply_rank=bool(spec["rank"]),
+                        apply_lcb=bool(spec["lcb"]),
+                    )
+                )
+            except Exception as e:
+                logger.warning("Promotion scoring candidate '%s' failed: %s", spec["name"], e)
+
+        if candidate_results:
+            selected = max(candidate_results, key=_candidate_score)
+            selected_candidate_name = str(selected.get("name", "raw"))
+            selected_candidate_gate_report = selected.get("gate_report")
+            selected_candidate_eval_metrics = selected.get("calibration_metrics", {})
+            promotion_apply_linear_recalibration = bool(selected.get("apply_linear", False))
+            promotion_apply_rank_calibration = bool(selected.get("apply_rank", False))
+            promotion_use_quantile_lcb = bool(selected.get("apply_lcb", False))
+            logger.info(
+                "Promotion scoring selection (split OOF): strategy=%s linear=%s rank_cal=%s lcb=%s "
+                "(gates_passed=%s, return/day=%.5f, sharpe=%.3f, slope=%.3f, mse=%.6f)",
+                selected_candidate_name,
+                promotion_apply_linear_recalibration,
+                promotion_apply_rank_calibration,
+                promotion_use_quantile_lcb,
+                bool((selected_candidate_gate_report or {}).get("passed", False)),
+                _safe_metric((selected_candidate_gate_report or {}).get("summary", {}).get("return_per_day"), float("nan")),
+                _safe_metric((selected_candidate_gate_report or {}).get("summary", {}).get("cost_adjusted_sharpe"), float("nan")),
+                _safe_metric(selected_candidate_eval_metrics.get("calibration_slope"), float("nan")),
+                _safe_metric(selected_candidate_eval_metrics.get("calibration_error"), float("nan")),
+            )
+        else:
+            logger.warning("Promotion scoring selection failed for all candidates; using raw base predictions.")
+            promotion_apply_linear_recalibration = False
+            promotion_apply_rank_calibration = False
+            promotion_use_quantile_lcb = False
+
+    if (
+        isinstance(prediction_recalibration, dict)
+        and bool(prediction_recalibration.get("enabled", False))
+        and not promotion_apply_linear_recalibration
+    ):
+        prediction_recalibration = {
+            **prediction_recalibration,
+            "enabled": False,
+            "disabled_for_promotion": True,
+        }
+    if not promotion_apply_rank_calibration and isinstance(promotion_calibration_map, dict):
+        promotion_calibration_map = {
+            **promotion_calibration_map,
+            "enabled": False,
+            "values": [],
+            "quantiles": [],
+        }
+
     if not holdout_df.empty and len(reg_holdout_preds) > 0:
-        holdout_pred_series = pd.Series(reg_holdout_preds, index=holdout_df.index)
-        holdout_true_series = holdout_df[label_col]
-
-        # Optional post-model linear recalibration for inference.
-        # This keeps rank ordering mostly intact while correcting scale/bias.
-        if bool(getattr(cfg, "prediction_recalibration_enabled", True)):
-            calib_df = pd.DataFrame({"pred": holdout_pred_series, "real": holdout_true_series}).dropna()
-            if len(calib_df) >= 30 and float(calib_df["pred"].std(ddof=0)) > 0:
-                try:
-                    slope, intercept = np.polyfit(
-                        calib_df["pred"].values.astype(float),
-                        calib_df["real"].values.astype(float),
-                        1,
-                    )
-                    slope = float(np.clip(slope, -5.0, 5.0))
-                    intercept = float(np.clip(intercept, -1.0, 1.0))
-                    prediction_recalibration = {
-                        "enabled": True,
-                        "method": "linear",
-                        "slope": slope,
-                        "intercept": intercept,
-                        "n_samples": int(len(calib_df)),
-                    }
-                    logger.info(
-                        "Fitted prediction recalibration: y=%.4f*x + %.4f (n=%d)",
-                        slope,
-                        intercept,
-                        len(calib_df),
-                    )
-                except Exception as e:
-                    logger.warning("Prediction recalibration fit failed; disabled: %s", e)
-
+        holdout_pred_series = pd.Series(reg_holdout_preds, index=holdout_df.index, dtype=float)
+        promotion_holdout_preds = _prepare_promotion_predictions(
+            holdout_df,
+            holdout_pred_series,
+        )
         holdout_calibration_series = (
             holdout_df[promotion_calibration_target]
             if promotion_calibration_target in holdout_df.columns
-            else holdout_true_series
+            else holdout_df[label_col]
         )
-        min_calib_slope_thr = float(getattr(cfg, "promotion_min_calibration_slope", float("-inf")))
-
-        def _slope_pass(value: float) -> bool:
-            if not np.isfinite(min_calib_slope_thr):
-                return True
-            return bool(np.isfinite(value) and value >= min_calib_slope_thr)
-
-        def _candidate_metrics(preds: pd.Series) -> dict[str, float]:
-            rank_payload = _rank_ic_for_preds(holdout_df, preds).get("summary", {})
-            calibration_payload = compute_calibration(preds, holdout_calibration_series, n_bins=10)
-            return {
-                "holdout_ic": float(rank_payload.get("mean_ic", float("nan"))),
-                "calibration_error": float(calibration_payload.get("calibration_error", float("nan"))),
-                "calibration_slope": float(calibration_payload.get("calibration_slope", float("nan"))),
-            }
-
-        def _candidate_score(metrics: dict[str, float]) -> tuple[float, float, float, float]:
-            slope = float(metrics.get("calibration_slope", float("nan")))
-            ic = float(metrics.get("holdout_ic", float("nan")))
-            cal_error = float(metrics.get("calibration_error", float("nan")))
-            return (
-                1.0 if _slope_pass(slope) else 0.0,
-                slope if np.isfinite(slope) else float("-inf"),
-                ic if np.isfinite(ic) else float("-inf"),
-                -cal_error if np.isfinite(cal_error) else float("-inf"),
-            )
-
-        raw_candidate = _prepare_promotion_predictions(
-            holdout_df,
-            holdout_pred_series,
-            apply_linear_recalibration=False,
-            apply_rank_calibration=False,
-            apply_quantile_lcb=False,
-        )
-        selected_candidate_name = "raw"
-        selected_candidate_preds = raw_candidate
-        selected_candidate_metrics = _candidate_metrics(selected_candidate_preds)
-        ic_drop_tolerance = 0.002
-
-        linear_candidate_enabled = bool(
-            promotion_apply_linear_recalibration
-            and isinstance(prediction_recalibration, dict)
-            and bool(prediction_recalibration.get("enabled", False))
-        )
-        if not linear_candidate_enabled:
-            promotion_apply_linear_recalibration = False
-        if linear_candidate_enabled:
-            linear_candidate = _prepare_promotion_predictions(
-                holdout_df,
-                holdout_pred_series,
-                apply_linear_recalibration=True,
-                apply_rank_calibration=False,
-                apply_quantile_lcb=False,
-            )
-            linear_metrics = _candidate_metrics(linear_candidate)
-            selected_ic = float(selected_candidate_metrics.get("holdout_ic", float("nan")))
-            linear_ic = float(linear_metrics.get("holdout_ic", float("nan")))
-            if (
-                not (np.isfinite(selected_ic) and np.isfinite(linear_ic) and linear_ic < selected_ic - ic_drop_tolerance)
-                and _candidate_score(linear_metrics) > _candidate_score(selected_candidate_metrics)
-            ):
-                selected_candidate_name = "linear_recalibrated"
-                selected_candidate_preds = linear_candidate
-                selected_candidate_metrics = linear_metrics
-            else:
-                promotion_apply_linear_recalibration = False
-
-        rank_candidate_enabled = bool(
-            promotion_apply_rank_calibration
-            and promotion_calibration_map
-            and promotion_calibration_map.get("values")
-        )
-        if rank_candidate_enabled:
-            rank_candidate = _prepare_promotion_predictions(
-                holdout_df,
-                holdout_pred_series,
-                apply_linear_recalibration=promotion_apply_linear_recalibration,
-                apply_rank_calibration=True,
-                apply_quantile_lcb=False,
-            )
-            rank_metrics = _candidate_metrics(rank_candidate)
-            selected_ic = float(selected_candidate_metrics.get("holdout_ic", float("nan")))
-            rank_ic = float(rank_metrics.get("holdout_ic", float("nan")))
-            if (
-                not (np.isfinite(selected_ic) and np.isfinite(rank_ic) and rank_ic < selected_ic - ic_drop_tolerance)
-                and _candidate_score(rank_metrics) > _candidate_score(selected_candidate_metrics)
-            ):
-                selected_candidate_name = "rank_calibrated"
-                selected_candidate_preds = rank_candidate
-                selected_candidate_metrics = rank_metrics
-            else:
-                promotion_apply_rank_calibration = False
-                if isinstance(promotion_calibration_map, dict):
-                    promotion_calibration_map = {
-                        **promotion_calibration_map,
-                        "enabled": False,
-                        "values": [],
-                        "quantiles": [],
-                    }
-
-        if promotion_use_quantile_lcb and quantile_models_for_eval:
-            lcb_candidate = _prepare_promotion_predictions(
-                holdout_df,
-                holdout_pred_series,
-                apply_linear_recalibration=promotion_apply_linear_recalibration,
-                apply_rank_calibration=promotion_apply_rank_calibration,
-                apply_quantile_lcb=True,
-            )
-            lcb_metrics = _candidate_metrics(lcb_candidate)
-            selected_ic = float(selected_candidate_metrics.get("holdout_ic", float("nan")))
-            lcb_ic = float(lcb_metrics.get("holdout_ic", float("nan")))
-            if (
-                not (np.isfinite(selected_ic) and np.isfinite(lcb_ic) and lcb_ic < selected_ic - ic_drop_tolerance)
-                and _candidate_score(lcb_metrics) > _candidate_score(selected_candidate_metrics)
-            ):
-                selected_candidate_name = "quantile_lcb"
-                selected_candidate_preds = lcb_candidate
-                selected_candidate_metrics = lcb_metrics
-            else:
-                promotion_use_quantile_lcb = False
-
-        if (
-            isinstance(prediction_recalibration, dict)
-            and bool(prediction_recalibration.get("enabled", False))
-            and not promotion_apply_linear_recalibration
-        ):
-            prediction_recalibration = {
-                **prediction_recalibration,
-                "enabled": False,
-                "disabled_for_promotion": True,
-            }
-
-        promotion_holdout_preds = selected_candidate_preds
-        logger.info(
-            "Promotion scoring selection: strategy=%s linear=%s rank_cal=%s lcb=%s (holdout_ic=%.4f, slope=%.3f, mse=%.6f)",
-            selected_candidate_name,
-            promotion_apply_linear_recalibration,
-            promotion_apply_rank_calibration,
-            promotion_use_quantile_lcb,
-            float(selected_candidate_metrics.get("holdout_ic", float("nan"))),
-            float(selected_candidate_metrics.get("calibration_slope", float("nan"))),
-            float(selected_candidate_metrics.get("calibration_error", float("nan"))),
-        )
-
         calibration_result = compute_calibration(
             promotion_holdout_preds,
             holdout_calibration_series,
@@ -2119,9 +2340,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "calibration_intercept": calibration_result.get("calibration_intercept", float("nan")),
             "n_deciles": len(calibration_result["by_decile"]) if isinstance(calibration_result["by_decile"], pd.DataFrame) else 0,
             "calibration_target_column": promotion_calibration_target,
+            "selection_strategy": selected_candidate_name,
         }
         logger.info(
-            "Calibration (promotion scoring): mse=%.6f ece=%.6f slope=%.3f brier=%.4f",
+            "Calibration (promotion scoring, holdout): mse=%.6f ece=%.6f slope=%.3f brier=%.4f",
             calibration_result["calibration_error"],
             calibration_metrics["expected_calibration_error"],
             calibration_metrics["calibration_slope"],
@@ -2312,18 +2534,6 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 consistency * 100,
             )
 
-    promotion_thresholds = {
-        "min_return_per_day": float(getattr(cfg, "promotion_min_return_per_day", 0.0002)),
-        "min_cost_adjusted_sharpe": float(getattr(cfg, "promotion_min_cost_adjusted_sharpe", 0.5)),
-        "max_drawdown": float(getattr(cfg, "promotion_max_drawdown", -0.25)),
-        "min_consistency": float(getattr(cfg, "promotion_min_consistency", 0.55)),
-        "min_turnover_efficiency": float(getattr(cfg, "promotion_min_turnover_efficiency", 0.20)),
-        "max_avg_turnover": float(getattr(cfg, "promotion_max_avg_turnover", 0.80)),
-        "min_periods": int(getattr(cfg, "promotion_min_periods", 2)),
-        "max_calibration_error": float(getattr(cfg, "promotion_max_calibration_error", float("inf"))),
-        "min_calibration_slope": float(getattr(cfg, "promotion_min_calibration_slope", float("-inf"))),
-        "max_pbo_proxy": float(getattr(cfg, "promotion_max_pbo_proxy", float("inf"))),
-    }
     promotion_gate_report = evaluate_model_promotion_gates(
         realistic_metrics=realistic_metrics,
         walk_forward_results=walk_forward_results,
