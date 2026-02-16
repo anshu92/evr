@@ -250,6 +250,37 @@ def _apply_rebalance_controls(
         return target_weights
 
     current_weights = {t: v / equity for t, v in open_values.items() if v > 0}
+
+    # Cold start: no open holdings means there is no turnover to suppress.
+    # Keep only entries that clear minimum trade notional, then normalize.
+    if not current_weights:
+        cold = target_weights.copy()
+        if "weight" not in cold.columns:
+            return cold
+        cold = cold[cold["weight"].fillna(0.0) > 0.0].copy()
+        if cold.empty:
+            return cold
+        cold = cold[(cold["weight"].astype(float) * equity) >= min_notional].copy()
+        if cold.empty:
+            top = target_weights.sort_values("weight", ascending=False).head(1).copy()
+            if top.empty:
+                return top
+            top_w = float(top["weight"].iloc[0])
+            if top_w <= 0 or (top_w * equity) < max(1.0, min_notional):
+                return target_weights.iloc[0:0].copy()
+            logger.info("Rebalance cold start: keeping top position to avoid empty portfolio.")
+            return top
+        total = float(cold["weight"].sum())
+        if total > 1.0:
+            cold["weight"] = cold["weight"] / total
+        logger.info(
+            "Rebalance cold start: bypassed hysteresis, kept %d entries (equity=%.2f, min_notional=%.2f)",
+            len(cold),
+            equity,
+            min_notional,
+        )
+        return cold.sort_values("weight", ascending=False)
+
     adjusted = target_weights.copy()
     effective_weights: dict[str, float] = {}
     skipped_small = 0
@@ -321,6 +352,19 @@ def _apply_rebalance_controls(
         adjusted.loc[t, "weight"] = w
 
     adjusted = adjusted[adjusted["weight"].fillna(0.0) > 0.0].copy()
+    if adjusted.empty:
+        # Safety fallback: do not allow hysteresis to wipe all exposure.
+        fallback = target_weights.copy()
+        if "weight" in fallback.columns:
+            fallback = fallback[fallback["weight"].fillna(0.0) > 0.0].copy()
+            fallback = fallback[(fallback["weight"].astype(float) * equity) >= min_notional].copy()
+            if not fallback.empty:
+                logger.warning(
+                    "Rebalance controls removed all targets; falling back to %d feasible target entries",
+                    len(fallback),
+                )
+                return fallback.sort_values("weight", ascending=False)
+
     total = float(adjusted["weight"].sum()) if not adjusted.empty else 0.0
     if total > 1.0:
         adjusted["weight"] = adjusted["weight"] / total
