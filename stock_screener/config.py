@@ -239,6 +239,7 @@ class Config:
     promotion_max_calibration_error: float = float("inf")
     promotion_min_calibration_slope: float = float("-inf")
     promotion_max_pbo_proxy: float = float("inf")
+    promotion_rebalance_hysteresis: float = 0.15
 
     # FX
     fx_ticker: str = "USDCAD=X"  # USD->CAD
@@ -482,6 +483,7 @@ class Config:
             promotion_max_calibration_error=_get_float("PROMOTION_MAX_CALIBRATION_ERROR", float("inf")),
             promotion_min_calibration_slope=_get_float("PROMOTION_MIN_CALIBRATION_SLOPE", float("-inf")),
             promotion_max_pbo_proxy=_get_float("PROMOTION_MAX_PBO_PROXY", float("inf")),
+            promotion_rebalance_hysteresis=_get_float("PROMOTION_REBALANCE_HYSTERESIS", 0.15),
             fx_ticker=_get_str("FX_TICKER", "USDCAD=X"),
             base_currency=_get_str("BASE_CURRENCY", "CAD"),
             tsx_directory_url=_get_str(

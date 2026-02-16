@@ -561,6 +561,7 @@ def simulate_realistic_portfolio(
     hold_days: int = 5,
     cost_bps: float = 20.0,
     market_ret_col: str | None = None,
+    rebalance_hysteresis: float = 0.15,
 ) -> dict[str, object]:
     """Simulate realistic portfolio with periodic rebalancing.
     
@@ -568,7 +569,8 @@ def simulate_realistic_portfolio(
     1. Rebalances every `hold_days` trading days
     2. Tracks actual positions held between rebalances
     3. Applies transaction costs only on trades (not daily)
-    4. Computes realistic turnover metrics
+    4. Applies rank-buffer hysteresis to reduce unnecessary churn
+    5. Computes realistic turnover metrics
     """
     if df.empty:
         return {
@@ -610,6 +612,7 @@ def simulate_realistic_portfolio(
     n = max(1, int(top_n))
     hold_days = max(1, int(hold_days))
     cost = float(cost_bps) * 1e-4
+    hysteresis = max(0.0, float(rebalance_hysteresis))
 
     portfolio_returns: list[dict[str, float]] = []
     market_returns_list: list[float] = []
@@ -625,11 +628,29 @@ def simulate_realistic_portfolio(
         if day_data.empty:
             continue
 
-        top = day_data.head(n)
+        ranked_tickers = day_data[ticker_col].tolist()
+        if not ranked_tickers:
+            continue
+
+        if current_holdings and hysteresis > 0.0:
+            buffer_n = max(n, int(np.ceil(n * (1.0 + hysteresis))))
+            rank_lookup = {t: i for i, t in enumerate(ranked_tickers[:buffer_n])}
+            retained = [t for t in current_holdings if t in rank_lookup]
+            retained.sort(key=lambda t: rank_lookup[t])
+            selected = list(retained[:n])
+            for t in ranked_tickers:
+                if len(selected) >= n:
+                    break
+                if t not in selected:
+                    selected.append(t)
+            new_holdings = set(selected)
+        else:
+            new_holdings = set(ranked_tickers[:n])
+
+        top = day_data[day_data[ticker_col].isin(new_holdings)]
         if top.empty:
             continue
 
-        new_holdings = set(top[ticker_col].tolist())
         day_cost = cost
         if current_holdings:
             overlap = len(current_holdings & new_holdings)

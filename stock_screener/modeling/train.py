@@ -1855,6 +1855,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         "min_calibration_slope": float(getattr(cfg, "promotion_min_calibration_slope", float("-inf"))),
         "max_pbo_proxy": float(getattr(cfg, "promotion_max_pbo_proxy", float("inf"))),
     }
+    promotion_rebalance_hysteresis = max(
+        0.0,
+        float(getattr(cfg, "promotion_rebalance_hysteresis", 0.15)),
+    )
     prediction_recalibration = {
         "enabled": False,
         "method": "linear",
@@ -2166,6 +2170,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 hold_days=horizon,
                 cost_bps=sim_cost_bps,
                 market_ret_col="market_ret" if "market_ret" in period_sim.columns else None,
+                rebalance_hysteresis=promotion_rebalance_hysteresis,
             )
             summary = dict(sim_out.get("summary", {}))
             summary["period_id"] = period_name
@@ -2409,6 +2414,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             hold_days=horizon,  # Hold for prediction horizon
             cost_bps=sim_cost_bps,
             market_ret_col="market_ret" if "market_ret" in holdout_with_preds.columns else None,
+            rebalance_hysteresis=promotion_rebalance_hysteresis,
         )
         realistic_metrics = realistic_result.get("summary", {})
         
@@ -2501,6 +2507,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 hold_days=horizon,
                 cost_bps=0.0 if "future_ret_net" in period_test_df.columns else 20.0,
                 market_ret_col="market_ret" if "market_ret" in period_test_df.columns else None,
+                rebalance_hysteresis=promotion_rebalance_hysteresis,
             )
             
             period_summary = period_result.get("summary", {})
@@ -2608,6 +2615,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "apply_prediction_recalibration": promotion_apply_linear_recalibration,
             "apply_rank_calibration": promotion_apply_rank_calibration,
             "promotion_use_quantile_lcb": promotion_use_quantile_lcb,
+            "promotion_rebalance_hysteresis": promotion_rebalance_hysteresis,
         },
         "feature_columns": selected_features,  # Features used in final models (after selection)
         "feature_schema_version": FEATURE_SCHEMA_VERSION,

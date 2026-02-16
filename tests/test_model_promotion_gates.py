@@ -191,3 +191,47 @@ def test_simulate_realistic_portfolio_uses_entry_horizon_return():
     assert len(daily) == 4
     expected_daily = (1.21 ** 0.5) - 1.0
     assert daily["return"].tolist() == pytest.approx([expected_daily] * 4, abs=1e-9)
+
+
+def test_simulate_realistic_portfolio_hysteresis_reduces_turnover():
+    dates = pd.to_datetime(
+        [
+            "2026-01-01", "2026-01-02",
+            "2026-01-03", "2026-01-04",
+            "2026-01-05", "2026-01-06",
+        ]
+    )
+    rows = []
+    for d in dates:
+        if d in {pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")}:
+            ranks = [("A", 1.0), ("B", 0.9), ("C", 0.8), ("D", 0.7)]
+        else:
+            ranks = [("C", 1.0), ("D", 0.9), ("A", 0.8), ("B", 0.7)]
+        for t, p in ranks:
+            rows.append({"date": d, "ticker": t, "future_ret": 0.05, "pred": p})
+    df = pd.DataFrame(rows)
+
+    no_hyst = simulate_realistic_portfolio(
+        df,
+        date_col="date",
+        ticker_col="ticker",
+        label_col="future_ret",
+        pred_col="pred",
+        top_n=2,
+        hold_days=2,
+        cost_bps=0.0,
+        rebalance_hysteresis=0.0,
+    )["summary"]["avg_turnover"]
+    with_hyst = simulate_realistic_portfolio(
+        df,
+        date_col="date",
+        ticker_col="ticker",
+        label_col="future_ret",
+        pred_col="pred",
+        top_n=2,
+        hold_days=2,
+        cost_bps=0.0,
+        rebalance_hysteresis=1.0,
+    )["summary"]["avg_turnover"]
+
+    assert float(with_hyst) < float(no_hyst)
