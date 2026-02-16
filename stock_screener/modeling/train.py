@@ -693,6 +693,25 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
     for base_col in ("future_ret", "future_alpha", "peak_return", "peak_alpha"):
         if base_col in panel.columns:
             panel[f"{base_col}_net"] = apply_cost_to_label(panel[base_col], panel["est_trade_cost_bps"])
+
+    def _attach_per_day_targets(frame: pd.DataFrame) -> None:
+        """Create net return/day targets aligned to expected holding period."""
+        horizon_days = max(1, int(horizon))
+        default_days = pd.Series(float(horizon_days), index=frame.index, dtype=float)
+        peak_days = pd.to_numeric(frame.get("days_to_peak", default_days), errors="coerce")
+        peak_days = peak_days.clip(lower=1.0).fillna(float(horizon_days))
+        hold_days_by_base = {
+            "future_ret": default_days,
+            "future_alpha": default_days,
+            "peak_return": peak_days,
+            "peak_alpha": peak_days,
+        }
+        for base_col, hold_days in hold_days_by_base.items():
+            net_col = f"{base_col}_net"
+            if net_col in frame.columns:
+                frame[f"{net_col}_per_day"] = frame[net_col] / hold_days
+
+    _attach_per_day_targets(panel)
     logger.info(
         "Estimated trade costs (bps): mean=%.2f, p10=%.2f, p90=%.2f",
         float(panel["est_trade_cost_bps"].mean()),
@@ -727,9 +746,22 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         logger.info("Training on absolute returns.")
 
     # Cost-aware training target for model fitting/ranking; retain gross target for calibration/output units.
-    target_col = f"{target_col_gross}_net" if f"{target_col_gross}_net" in panel.columns else target_col_gross
+    target_col_net = f"{target_col_gross}_net" if f"{target_col_gross}_net" in panel.columns else target_col_gross
+    target_col = target_col_net
+    optimize_for_return_per_day = bool(getattr(cfg, "train_target_per_day", True))
+    per_day_target_col = f"{target_col_net}_per_day"
+    if optimize_for_return_per_day and per_day_target_col in panel.columns:
+        target_col = per_day_target_col
+
     calibration_col = target_col_gross
-    if target_col != target_col_gross:
+    if target_col == per_day_target_col:
+        logger.info(
+            "Using cost-aware per-day target %s (base=%s, gross calibration target=%s)",
+            target_col,
+            target_col_net,
+            target_col_gross,
+        )
+    elif target_col != target_col_gross:
         logger.info("Using cost-aware target %s (gross calibration target: %s)", target_col, target_col_gross)
 
     # Apply TARGET ENCODING for sector/industry (replaces useless hash encoding)
@@ -797,6 +829,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         for base_col in ("future_ret", "future_alpha", "peak_return", "peak_alpha"):
             if base_col in panel.columns:
                 panel[f"{base_col}_net"] = apply_cost_to_label(panel[base_col], panel["est_trade_cost_bps"])
+        _attach_per_day_targets(panel)
 
     logger.info(
         "Winsorized labels: horizon n_mad=3.0, peak n_mad=%.1f (target=%s)",
@@ -850,7 +883,12 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                     "mean_net_ret": float("nan"),
                     "std_net_ret": float("nan"),
                     "net_ret_ir": float("nan"),
+                    "mean_ret_per_day": float("nan"),
+                    "mean_net_ret_per_day": float("nan"),
+                    "ret_ir_per_day": float("nan"),
+                    "net_ret_ir_per_day": float("nan"),
                     "n_days": 0,
+                    "holding_days": max(1, int(horizon)),
                 }
             }
         temp = df.copy()
@@ -860,9 +898,24 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         return evaluate_topn_returns(
             temp, date_col="date", label_col=eval_label_col, pred_col="pred",
             top_n=top_n, cost_bps=eval_cost_bps,
+            holding_days=max(1, int(horizon)),
             market_ret_col="market_ret" if "market_ret" in temp.columns else None,
             beta_col="beta" if "beta" in temp.columns else None,
         )
+
+    cv_metric = str(getattr(cfg, "train_cv_metric", "mean_net_ret_per_day")).strip().lower()
+    if cv_metric not in {"mean_net_ret_per_day", "mean_net_ret"}:
+        logger.warning("Unsupported train CV metric '%s', falling back to mean_net_ret_per_day", cv_metric)
+        cv_metric = "mean_net_ret_per_day"
+
+    def _extract_cv_score(metrics: dict[str, object]) -> float:
+        summary = metrics.get("summary", {}) if isinstance(metrics, dict) else {}
+        score = summary.get(cv_metric, float("nan")) if isinstance(summary, dict) else float("nan")
+        if cv_metric == "mean_net_ret_per_day" and not np.isfinite(score):
+            score = summary.get("mean_net_ret", float("nan")) if isinstance(summary, dict) else float("nan")
+            if np.isfinite(score):
+                score = float(score) / max(1, int(horizon))
+        return float(score) if np.isfinite(score) else float("nan")
 
 
     # Hyperparameter tuning with Optuna (if available) or fallback to manual search
@@ -898,7 +951,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 )
                 preds = model.predict(val_df[feature_cols])
                 metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
-                scores.append(float(metrics["summary"]["mean_net_ret"]))
+                scores.append(_extract_cv_score(metrics))
             return float(np.nanmean(scores)) if scores else float("nan")
         
         study = optuna.create_study(direction="maximize")
@@ -940,7 +993,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 )
                 preds = model.predict(val_df[feature_cols])
                 metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
-                scores.append(float(metrics["summary"]["mean_net_ret"]))
+                scores.append(_extract_cv_score(metrics))
             return float(np.nanmean(scores)) if scores else float("nan")
 
         regressor_scores = {str(p): _eval_regressor_params(p) for p in regressor_candidates}
@@ -2022,7 +2075,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             "xgb_ranking_objective": xgb_rank_objective if use_ranking else None,
             "lgbm_ranking_objective": lgbm_rank_objective if use_ranking else None,
             "train_on_peak_return": use_peak_target,
+            "train_target_per_day": optimize_for_return_per_day,
+            "train_cv_metric": cv_metric,
             "target_column": label_col,
+            "target_column_net": target_col_net,
+            "target_column_per_day": per_day_target_col if per_day_target_col in panel.columns else None,
             "target_column_gross": target_col_gross,
             "calibration_column": calibration_col or label_col,
             "cost_model_base_bps": cost_base_bps,
@@ -2053,9 +2110,9 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         },
         "regressor": {
             "params": best_regressor_params,
-            "cv_metric": "mean_net_ret_topn",
+            "cv_metric": f"{cv_metric}_topn",
             "cv_scores_topn": regressor_scores,
-            "topn": {"top_n": int(top_n), "cost_bps": float(cost_bps)},
+            "topn": {"top_n": int(top_n), "cost_bps": float(cost_bps), "holding_days": int(max(1, horizon))},
             "holdout": reg_holdout_metrics["summary"],
             "holdout_topn": reg_holdout_topn["summary"],
             "holdout_base": reg_holdout_base_metrics["summary"] if isinstance(reg_holdout_base_metrics, dict) else None,
@@ -2212,6 +2269,7 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
             pred_col="pred",
             top_n=top_n,
             cost_bps=cost_bps,
+            holding_days=max(1, int(horizon)),
         )
         rank_payload["topn"] = topn_payload
         metrics["ranker"] = rank_payload
@@ -2229,6 +2287,7 @@ def evaluate_model(cfg: Config, logger) -> dict[str, object]:
             pred_col="pred",
             top_n=top_n,
             cost_bps=cost_bps,
+            holding_days=max(1, int(horizon)),
         )
         reg_payload["topn"] = topn_payload
         metrics["regressor"] = reg_payload

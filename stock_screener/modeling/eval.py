@@ -462,7 +462,8 @@ def summarize_rank_ic(daily_ic: pd.DataFrame) -> dict[str, float]:
     return {"mean_ic": mean_ic, "std_ic": std_ic, "ic_ir": ic_ir, "n_days": int(len(daily_ic))}
 
 
-def summarize_topn_returns(daily_ret: pd.DataFrame) -> dict[str, float]:
+def summarize_topn_returns(daily_ret: pd.DataFrame, *, holding_days: int = 1) -> dict[str, float]:
+    hold_days = max(1, int(holding_days))
     if daily_ret.empty:
         return {
             "mean_ret": float("nan"),
@@ -471,7 +472,12 @@ def summarize_topn_returns(daily_ret: pd.DataFrame) -> dict[str, float]:
             "mean_net_ret": float("nan"),
             "std_net_ret": float("nan"),
             "net_ret_ir": float("nan"),
+            "mean_ret_per_day": float("nan"),
+            "mean_net_ret_per_day": float("nan"),
+            "ret_ir_per_day": float("nan"),
+            "net_ret_ir_per_day": float("nan"),
             "n_days": 0,
+            "holding_days": hold_days,
         }
     mean_ret = float(daily_ret["mean_ret"].mean())
     std_ret = float(daily_ret["mean_ret"].std(ddof=0))
@@ -479,6 +485,10 @@ def summarize_topn_returns(daily_ret: pd.DataFrame) -> dict[str, float]:
     mean_net = float(daily_ret["net_ret"].mean())
     std_net = float(daily_ret["net_ret"].std(ddof=0))
     net_ir = float(mean_net / std_net) if std_net > 0 else float("nan")
+    mean_ret_per_day = float(mean_ret / hold_days)
+    mean_net_per_day = float(mean_net / hold_days)
+    ret_ir_per_day = float(ret_ir / hold_days) if np.isfinite(ret_ir) else float("nan")
+    net_ir_per_day = float(net_ir / hold_days) if np.isfinite(net_ir) else float("nan")
     return {
         "mean_ret": mean_ret,
         "std_ret": std_ret,
@@ -486,7 +496,12 @@ def summarize_topn_returns(daily_ret: pd.DataFrame) -> dict[str, float]:
         "mean_net_ret": mean_net,
         "std_net_ret": std_net,
         "net_ret_ir": net_ir,
+        "mean_ret_per_day": mean_ret_per_day,
+        "mean_net_ret_per_day": mean_net_per_day,
+        "ret_ir_per_day": ret_ir_per_day,
+        "net_ret_ir_per_day": net_ir_per_day,
         "n_days": int(len(daily_ret)),
+        "holding_days": hold_days,
     }
 
 
@@ -498,6 +513,7 @@ def evaluate_topn_returns(
     pred_col: str,
     top_n: int,
     cost_bps: float = 0.0,
+    holding_days: int = 1,
     market_ret_col: str | None = None,
     beta_col: str | None = None,
 ) -> dict[str, object]:
@@ -507,7 +523,7 @@ def evaluate_topn_returns(
         df, date_col=date_col, label_col=label_col, pred_col=pred_col, top_n=top_n, cost_bps=cost_bps,
         market_ret_col=market_ret_col, beta_col=beta_col,
     )
-    summary = summarize_topn_returns(daily)
+    summary = summarize_topn_returns(daily, holding_days=holding_days)
     return {"summary": summary, "daily": daily}
 
 

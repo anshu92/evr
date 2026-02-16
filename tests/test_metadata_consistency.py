@@ -41,7 +41,7 @@ def test_metadata_structure():
     metadata = {
         "regressor": {
             "params": {"max_depth": 6, "learning_rate": 0.03},
-            "cv_metric": "mean_net_ret_topn",
+            "cv_metric": "mean_net_ret_per_day_topn",
             "cv_scores_topn": {
                 "{'max_depth': 6}": 0.012,
                 "{'max_depth': 5}": 0.015,

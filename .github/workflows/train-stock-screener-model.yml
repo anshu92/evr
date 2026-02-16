@@ -79,7 +79,7 @@ jobs:
           REGIME_GATING_BASE_BLEND: "0.25"
           # PR-06: Promotion gates (block deployment if failed)
           PROMOTION_GATES_ENABLED: "1"
-          ENFORCE_PROMOTION_GATES: "1"
+          ENFORCE_PROMOTION_GATES: ${{ vars.ENFORCE_PROMOTION_GATES || '1' }}
           PROMOTION_MIN_RETURN_PER_DAY: "0.0002"
           PROMOTION_MIN_COST_ADJUSTED_SHARPE: "0.5"
           PROMOTION_MAX_DRAWDOWN: "-0.25"
@@ -87,9 +87,10 @@ jobs:
           PROMOTION_MIN_TURNOVER_EFFICIENCY: "0.20"
           PROMOTION_MAX_AVG_TURNOVER: "0.80"
           PROMOTION_MIN_PERIODS: "2"
-          PROMOTION_MAX_CALIBRATION_ERROR: "0.010"
-          PROMOTION_MIN_CALIBRATION_SLOPE: "0.25"
-          PROMOTION_MAX_PBO_PROXY: "0.45"
+          PROMOTION_MAX_CALIBRATION_ERROR: ${{ vars.PROMOTION_MAX_CALIBRATION_ERROR || '0.010' }}
+          PROMOTION_MIN_CALIBRATION_SLOPE: ${{ vars.PROMOTION_MIN_CALIBRATION_SLOPE || '0.25' }}
+          PROMOTION_MAX_PBO_PROXY: ${{ vars.PROMOTION_MAX_PBO_PROXY || '0.45' }}
+          PREDICTION_RECALIBRATION_ENABLED: ${{ vars.PREDICTION_RECALIBRATION_ENABLED || '1' }}
         run: |
           rm -rf models/ensemble
           python -m stock_screener.cli train-model --log-level INFO

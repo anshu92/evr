@@ -196,6 +196,7 @@ jobs:
           USE_ML: "1"
           MODEL_PATH: "models/ensemble/manifest.json"
           STRICT_FEATURE_PARITY: "1"
+          APPLY_PREDICTION_RECALIBRATION: ${{ vars.APPLY_PREDICTION_RECALIBRATION || '1' }}
           MAX_DAILY_RUNTIME_MINUTES: "12"
           TURNOVER_PENALTY_BPS: "15"
           MIN_REBALANCE_WEIGHT_DELTA: "0.015"
