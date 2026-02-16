@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from stock_screener.modeling.model import FEATURE_COLUMNS
@@ -26,8 +27,14 @@ _EXCLUDE_DEFAULT = {
 
 def winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:
     """Clip extreme values using MAD (Median Absolute Deviation)."""
-    median = series.median()
-    mad = (series - median).abs().median()
+    if series.empty:
+        return series
+    clean = series.dropna()
+    if clean.empty:
+        return series
+
+    median = clean.median()
+    mad = (clean - median).abs().median()
     if mad == 0 or pd.isna(mad):
         return series
     lower = median - n_mad * mad
@@ -37,9 +44,15 @@ def winsorize_mad(series: pd.Series, n_mad: float = 3.0) -> pd.Series:
 
 def zscore(series: pd.Series) -> pd.Series:
     """Z-score normalize a series."""
-    mu = series.mean()
-    sd = series.std()
-    if sd == 0 or pd.isna(sd):
+    if series.empty:
+        return series
+    clean = series.dropna()
+    if clean.empty:
+        return series
+
+    mu = float(clean.mean())
+    sd = float(clean.std())
+    if sd == 0 or not np.isfinite(sd):
         return series * 0.0
     return (series - mu) / sd
 

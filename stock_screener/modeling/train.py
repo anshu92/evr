@@ -539,31 +539,35 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
             if shift < n:
                 future_matrix[:-shift, d] = prices[shift:]
         
-        # Mark rows with all-NaN future FIRST
+        # Mark rows with no future observations.
         all_nan_mask = np.all(np.isnan(future_matrix), axis=1)
-        
-        # For rows with all NaN, temporarily fill with 0 to avoid nanargmax error
-        temp_matrix = future_matrix.copy()
-        temp_matrix[all_nan_mask, 0] = 0.0
-        
-        # Find argmax and max across the horizon dimension
-        peak_idx = np.nanargmax(temp_matrix, axis=1)
-        with np.errstate(all='ignore'):  # Suppress "All-NaN slice" warning
-            peak_price = np.nanmax(future_matrix, axis=1)
+
+        # Compute peak position/price only for rows that have at least one future value.
+        peak_idx = np.zeros(n, dtype=int)
+        peak_price = np.full(n, np.nan)
+        valid_rows = ~all_nan_mask
+        if np.any(valid_rows):
+            valid_future = future_matrix[valid_rows]
+            peak_idx[valid_rows] = np.nanargmax(valid_future, axis=1)
+            peak_price[valid_rows] = np.nanmax(valid_future, axis=1)
         
         # Convert to 1-indexed days (1 = tomorrow)
         peak_days = (peak_idx + 1).astype(float)
         peak_days[all_nan_mask] = np.nan
         
         # Compute peak returns
-        valid_price_mask = prices > 0
-        peak_returns = np.where(valid_price_mask, peak_price / prices - 1.0, np.nan)
-        peak_returns[all_nan_mask] = np.nan
+        peak_returns = np.full(n, np.nan)
+        valid_price_mask = (~all_nan_mask) & (prices > 0)
+        peak_returns[valid_price_mask] = (peak_price[valid_price_mask] / prices[valid_price_mask]) - 1.0
         
         return pd.DataFrame({"days_to_peak": peak_days, "peak_return": peak_returns}, index=group.index)
     
     # Apply vectorized function to each ticker group
-    peak_df = panel.groupby("ticker", group_keys=False).apply(_compute_peak_targets_vectorized)
+    peak_grouped = panel.groupby("ticker", group_keys=False)
+    try:
+        peak_df = peak_grouped.apply(_compute_peak_targets_vectorized, include_groups=False)
+    except TypeError:
+        peak_df = peak_grouped.apply(_compute_peak_targets_vectorized)
     panel["days_to_peak"] = peak_df["days_to_peak"]
     panel["peak_return"] = peak_df["peak_return"]
     logger.info("Computed peak detection targets: days_to_peak (1-%d), peak_return", max_horizon)
@@ -589,7 +593,11 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
         weights = mcap_valid / mcap_valid.sum()
         return (ret_valid * weights).sum()
     
-    market_returns = panel.groupby("date").apply(_compute_cap_weighted_return)
+    market_grouped = panel.groupby("date")
+    try:
+        market_returns = market_grouped.apply(_compute_cap_weighted_return, include_groups=False)
+    except TypeError:
+        market_returns = market_grouped.apply(_compute_cap_weighted_return)
     panel["market_ret"] = panel["date"].map(market_returns)
     logger.info("Using cap-weighted market benchmark (approximates SPY/TSX)")
     
@@ -923,6 +931,10 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 score = float(score) / max(1, int(horizon))
         return float(score) if np.isfinite(score) else float("nan")
 
+    def _mean_finite(values: list[float]) -> float:
+        finite_values = [float(v) for v in values if np.isfinite(v)]
+        return float(np.mean(finite_values)) if finite_values else float("nan")
+
 
     # Hyperparameter tuning with Optuna (if available) or fallback to manual search
     regressor_scores = {}  # Initialize to avoid UnboundLocalError
@@ -958,7 +970,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 preds = model.predict(val_df[feature_cols])
                 metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
                 scores.append(_extract_cv_score(metrics))
-            return float(np.nanmean(scores)) if scores else float("nan")
+            return _mean_finite(scores)
         
         study = optuna.create_study(direction="maximize")
         study.optimize(_optuna_objective, n_trials=n_trials, timeout=timeout, show_progress_bar=False)
@@ -1000,7 +1012,7 @@ def train_and_save(cfg: Config, logger) -> TrainResult:
                 preds = model.predict(val_df[feature_cols])
                 metrics = _topn_for_preds(val_df, pd.Series(preds, index=val_df.index))
                 scores.append(_extract_cv_score(metrics))
-            return float(np.nanmean(scores)) if scores else float("nan")
+            return _mean_finite(scores)
 
         regressor_scores = {str(p): _eval_regressor_params(p) for p in regressor_candidates}
         best_regressor_params = max(regressor_candidates, key=lambda p: regressor_scores.get(str(p), float("-inf")))
