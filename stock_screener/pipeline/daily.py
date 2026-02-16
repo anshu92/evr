@@ -13,7 +13,7 @@ from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.macro import fetch_macro_indicators
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.technical import compute_features, apply_target_encodings
-from stock_screener.optimization.risk_parity import compute_inverse_vol_weights, compute_correlation_aware_weights, apply_confidence_weighting, apply_volatility_targeting, apply_conviction_sizing, apply_liquidity_adjustment, apply_correlation_limits, apply_beta_adjustment, apply_min_position_filter, apply_max_position_cap, apply_regime_exposure
+from stock_screener.optimization.risk_parity import compute_inverse_vol_weights, compute_correlation_aware_weights, optimize_unified_portfolio, apply_confidence_weighting, apply_volatility_targeting, apply_conviction_sizing, apply_liquidity_adjustment, apply_correlation_limits, apply_beta_adjustment, apply_min_position_filter, apply_max_position_cap, apply_regime_exposure
 from stock_screener.reporting.render import render_reports
 from stock_screener.screening.screener import score_universe, select_sector_neutral, apply_entry_filters
 from stock_screener.universe.tsx import fetch_tsx_universe
@@ -575,106 +575,157 @@ def run_daily(cfg: Config, logger) -> None:
             alpha_col=alpha_col,
         )
     
-    # Apply confidence weighting if available
-    if "pred_confidence" in screened.columns:
-        confidence = screened["pred_confidence"]
-        target_weights = apply_confidence_weighting(
-            target_weights,
-            confidence,
-            cfg.confidence_weight_floor,
-            logger,
-        )
-    if "pred_uncertainty" in screened.columns:
-        target_weights = _apply_uncertainty_weighting(target_weights, screened, logger)
-    
-    # Apply conviction-based position sizing if enabled
-    conviction_sizing_enabled = getattr(cfg, "conviction_sizing", True)
-    if conviction_sizing_enabled:
-        target_weights = apply_conviction_sizing(
-            target_weights,
-            screened,
-            pred_col="pred_return",
-            confidence_col="pred_confidence",
-            vol_col="vol_60d_ann",
-            min_weight_scalar=getattr(cfg, "conviction_min_scalar", 0.5),
-            max_weight_scalar=getattr(cfg, "conviction_max_scalar", 2.0),
-            logger=logger,
-        )
-        run_meta["conviction_sizing"] = {"enabled": True}
-    
-    # Apply liquidity adjustment if enabled
-    liquidity_adj_enabled = getattr(cfg, "liquidity_adjustment", True)
-    if liquidity_adj_enabled:
-        target_weights = apply_liquidity_adjustment(
-            target_weights,
-            screened,
-            liquidity_col="avg_dollar_volume_cad",
-            min_liquidity=getattr(cfg, "min_liquidity_cad", 100_000),
-            target_liquidity=getattr(cfg, "target_liquidity_cad", 1_000_000),
-            max_position_pct_of_volume=getattr(cfg, "max_position_pct_of_volume", 0.05),
-            portfolio_value=cfg.portfolio_budget_cad,
-            logger=logger,
-        )
-        run_meta["liquidity_adjustment"] = {"enabled": True}
-    
-    # Apply correlation-based position limits if enabled
-    corr_limits_enabled = getattr(cfg, "correlation_limits", True)
-    if corr_limits_enabled:
-        target_weights = apply_correlation_limits(
-            target_weights,
-            prices,
-            max_corr_weight=getattr(cfg, "max_corr_weight", 0.25),
-            corr_threshold=getattr(cfg, "corr_threshold", 0.70),
-            lookback_days=60,
-            logger=logger,
-        )
-        run_meta["correlation_limits"] = {"enabled": True}
-    
-    # Apply beta adjustment if enabled
-    beta_adj_enabled = getattr(cfg, "beta_adjustment", True)
-    if beta_adj_enabled:
-        target_weights = apply_beta_adjustment(
-            target_weights,
-            screened,
-            beta_col="beta",
-            target_beta=getattr(cfg, "target_portfolio_beta", 1.0),
-            min_weight_scalar=getattr(cfg, "beta_min_scalar", 0.5),
-            max_weight_scalar=getattr(cfg, "beta_max_scalar", 1.5),
-            logger=logger,
-        )
-        run_meta["beta_adjustment"] = {"enabled": True}
-    
-    # Apply maximum position cap (final safety check)
-    max_pos_pct = getattr(cfg, "max_position_pct", 0.20)
-    if max_pos_pct and max_pos_pct < 1.0:
-        target_weights = apply_max_position_cap(
-            target_weights,
-            max_position_pct=max_pos_pct,
-            logger=logger,
-        )
-        run_meta["max_position_cap"] = {"max_pct": max_pos_pct}
-    
-    # Apply minimum position filter (remove dust positions)
-    min_pos_pct = getattr(cfg, "min_position_pct", 0.02)
-    if min_pos_pct and min_pos_pct > 0:
-        target_weights = apply_min_position_filter(
-            target_weights,
-            min_position_pct=min_pos_pct,
-            logger=logger,
-        )
-        run_meta["min_position_filter"] = {"min_pct": min_pos_pct}
+    # Optional single-pass constrained optimizer (replaces sequential transforms).
+    unified_opt_enabled = bool(getattr(cfg, "unified_optimizer_enabled", True))
+    state_for_optimizer = None
+    if unified_opt_enabled:
+        current_weights = None
+        try:
+            state_for_optimizer = load_portfolio_state(
+                cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad
+            )
+            px_now = features["last_close_cad"].astype(float) if "last_close_cad" in features.columns else pd.Series(dtype=float)
+            open_values = {}
+            open_total = 0.0
+            for p in state_for_optimizer.positions:
+                if p.status != "OPEN" or not p.ticker or p.shares <= 0:
+                    continue
+                px = float(px_now.get(p.ticker, float("nan")))
+                if pd.isna(px) or px <= 0:
+                    continue
+                val = float(px) * float(p.shares)
+                open_values[p.ticker] = val
+                open_total += val
+            equity = float(state_for_optimizer.cash_cad) + float(open_total)
+            if equity > 0 and open_values:
+                current_weights = pd.Series(
+                    {t: (v / equity) for t, v in open_values.items()},
+                    dtype=float,
+                )
+        except Exception as e:
+            logger.warning("Could not build current weights for unified optimizer: %s", e)
 
-    # Re-apply correlation limits after renormalizing filters/caps to preserve
-    # pair constraints in the final investable weights.
-    if corr_limits_enabled:
-        target_weights = apply_correlation_limits(
+        target_weights = optimize_unified_portfolio(
             target_weights,
-            prices,
+            features=screened,
+            prices=prices,
+            current_weights=current_weights,
+            alpha_col=alpha_col,
+            vol_col="vol_60d_ann",
+            beta_col="beta",
+            max_position_pct=getattr(cfg, "max_position_pct", 0.20),
             max_corr_weight=getattr(cfg, "max_corr_weight", 0.25),
             corr_threshold=getattr(cfg, "corr_threshold", 0.70),
+            target_beta=getattr(cfg, "target_portfolio_beta", 1.0),
+            beta_tolerance=getattr(cfg, "optimizer_beta_tolerance", 0.25),
+            risk_penalty=getattr(cfg, "optimizer_risk_penalty", 1.0),
+            turnover_penalty=getattr(cfg, "optimizer_turnover_penalty", 1.0),
+            cost_penalty=getattr(cfg, "optimizer_cost_penalty", 1.0),
             lookback_days=60,
+            allow_cash=True,
             logger=logger,
         )
+        run_meta["unified_optimizer"] = {
+            "enabled": True,
+            "risk_penalty": float(getattr(cfg, "optimizer_risk_penalty", 1.0)),
+            "turnover_penalty": float(getattr(cfg, "optimizer_turnover_penalty", 1.0)),
+            "cost_penalty": float(getattr(cfg, "optimizer_cost_penalty", 1.0)),
+            "beta_tolerance": float(getattr(cfg, "optimizer_beta_tolerance", 0.25)),
+        }
+    else:
+        # Legacy sequential transforms.
+        if "pred_confidence" in screened.columns:
+            confidence = screened["pred_confidence"]
+            target_weights = apply_confidence_weighting(
+                target_weights,
+                confidence,
+                cfg.confidence_weight_floor,
+                logger,
+            )
+        if "pred_uncertainty" in screened.columns:
+            target_weights = _apply_uncertainty_weighting(target_weights, screened, logger)
+        
+        conviction_sizing_enabled = getattr(cfg, "conviction_sizing", True)
+        if conviction_sizing_enabled:
+            target_weights = apply_conviction_sizing(
+                target_weights,
+                screened,
+                pred_col="pred_return",
+                confidence_col="pred_confidence",
+                vol_col="vol_60d_ann",
+                min_weight_scalar=getattr(cfg, "conviction_min_scalar", 0.5),
+                max_weight_scalar=getattr(cfg, "conviction_max_scalar", 2.0),
+                logger=logger,
+            )
+            run_meta["conviction_sizing"] = {"enabled": True}
+        
+        liquidity_adj_enabled = getattr(cfg, "liquidity_adjustment", True)
+        if liquidity_adj_enabled:
+            target_weights = apply_liquidity_adjustment(
+                target_weights,
+                screened,
+                liquidity_col="avg_dollar_volume_cad",
+                min_liquidity=getattr(cfg, "min_liquidity_cad", 100_000),
+                target_liquidity=getattr(cfg, "target_liquidity_cad", 1_000_000),
+                max_position_pct_of_volume=getattr(cfg, "max_position_pct_of_volume", 0.05),
+                portfolio_value=cfg.portfolio_budget_cad,
+                logger=logger,
+            )
+            run_meta["liquidity_adjustment"] = {"enabled": True}
+        
+        corr_limits_enabled = getattr(cfg, "correlation_limits", True)
+        if corr_limits_enabled:
+            target_weights = apply_correlation_limits(
+                target_weights,
+                prices,
+                max_corr_weight=getattr(cfg, "max_corr_weight", 0.25),
+                corr_threshold=getattr(cfg, "corr_threshold", 0.70),
+                lookback_days=60,
+                logger=logger,
+            )
+            run_meta["correlation_limits"] = {"enabled": True}
+        
+        beta_adj_enabled = getattr(cfg, "beta_adjustment", True)
+        if beta_adj_enabled:
+            target_weights = apply_beta_adjustment(
+                target_weights,
+                screened,
+                beta_col="beta",
+                target_beta=getattr(cfg, "target_portfolio_beta", 1.0),
+                min_weight_scalar=getattr(cfg, "beta_min_scalar", 0.5),
+                max_weight_scalar=getattr(cfg, "beta_max_scalar", 1.5),
+                logger=logger,
+            )
+            run_meta["beta_adjustment"] = {"enabled": True}
+        
+        max_pos_pct = getattr(cfg, "max_position_pct", 0.20)
+        if max_pos_pct and max_pos_pct < 1.0:
+            target_weights = apply_max_position_cap(
+                target_weights,
+                max_position_pct=max_pos_pct,
+                logger=logger,
+            )
+            run_meta["max_position_cap"] = {"max_pct": max_pos_pct}
+        
+        min_pos_pct = getattr(cfg, "min_position_pct", 0.02)
+        if min_pos_pct and min_pos_pct > 0:
+            target_weights = apply_min_position_filter(
+                target_weights,
+                min_position_pct=min_pos_pct,
+                logger=logger,
+            )
+            run_meta["min_position_filter"] = {"min_pct": min_pos_pct}
+
+        # Re-apply pair limits after any renormalization.
+        if corr_limits_enabled:
+            target_weights = apply_correlation_limits(
+                target_weights,
+                prices,
+                max_corr_weight=getattr(cfg, "max_corr_weight", 0.25),
+                corr_threshold=getattr(cfg, "corr_threshold", 0.70),
+                lookback_days=60,
+                logger=logger,
+            )
     
     # Apply regime-aware exposure scaling
     cash_from_regime = 0.0
@@ -718,7 +769,11 @@ def run_daily(cfg: Config, logger) -> None:
     prices_cad = features["last_close_cad"].astype(float)
     pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
     score = scored["score"].astype(float) if "score" in scored.columns else None
-    state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+    state = (
+        state_for_optimizer
+        if state_for_optimizer is not None
+        else load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+    )
     # Migration safeguard:
     # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,
     # without debiting cash on buys. If we now run with a small configured budget (e.g., 500 CAD), the cached

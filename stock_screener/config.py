@@ -65,6 +65,11 @@ class Config:
     # Portfolio optimization
     use_correlation_weights: bool = False  # Requires scipy; set True to enable
     confidence_weight_floor: float = 0.3
+    unified_optimizer_enabled: bool = True  # Single-pass constrained optimizer for final weights
+    optimizer_risk_penalty: float = 1.0
+    optimizer_turnover_penalty: float = 1.0
+    optimizer_cost_penalty: float = 1.0
+    optimizer_beta_tolerance: float = 0.25
     
     # Training target and objective
     use_market_relative_returns: bool = True  # Train on alpha (stock return - market return) instead of absolute returns
@@ -292,6 +297,11 @@ class Config:
             ensemble_lgbm_count=_get_int("ENSEMBLE_LGBM_COUNT", 2) or 2,
             use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
+            unified_optimizer_enabled=_get_bool("UNIFIED_OPTIMIZER_ENABLED", True),
+            optimizer_risk_penalty=_get_float("OPTIMIZER_RISK_PENALTY", 1.0),
+            optimizer_turnover_penalty=_get_float("OPTIMIZER_TURNOVER_PENALTY", 1.0),
+            optimizer_cost_penalty=_get_float("OPTIMIZER_COST_PENALTY", 1.0),
+            optimizer_beta_tolerance=_get_float("OPTIMIZER_BETA_TOLERANCE", 0.25),
             use_market_relative_returns=os.getenv("USE_MARKET_RELATIVE_RETURNS", "1").strip() in {"1", "true", "True"},
             use_ranking_objective=os.getenv("USE_RANKING_OBJECTIVE", "1").strip() in {"1", "true", "True"},
             xgb_ranking_objective=_get_str("XGB_RANKING_OBJECTIVE", "rank:pairwise"),

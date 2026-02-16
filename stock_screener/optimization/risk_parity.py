@@ -170,6 +170,290 @@ def compute_correlation_aware_weights(
         return compute_inverse_vol_weights(features, portfolio_size, weight_cap, logger)
 
 
+def _extract_close_prices(
+    prices: pd.DataFrame,
+    tickers: list[str],
+    *,
+    lookback_days: int,
+) -> pd.DataFrame:
+    """Extract close-price matrix for the requested tickers."""
+    if prices is None or prices.empty:
+        return pd.DataFrame(index=pd.Index([], dtype="datetime64[ns]"))
+    if isinstance(prices.columns, pd.MultiIndex):
+        cols = [(t, "Close") for t in tickers if (t, "Close") in prices.columns]
+        if not cols:
+            return pd.DataFrame(index=prices.index)
+        close = prices[cols].copy()
+        close.columns = [c[0] for c in close.columns]
+    else:
+        cols = [t for t in tickers if t in prices.columns]
+        if not cols:
+            return pd.DataFrame(index=prices.index)
+        close = prices[cols].copy()
+    close = close.tail(int(max(lookback_days, 10)))
+    return close
+
+
+def _estimate_cost_vector(
+    features: pd.DataFrame,
+    tickers: list[str],
+    *,
+    vol_col: str = "vol_60d_ann",
+) -> np.ndarray:
+    """Estimate per-name transaction cost in return units (fraction)."""
+    idx = pd.Index(tickers)
+    out = pd.Series(3e-4, index=idx, dtype=float)  # 3 bps baseline
+
+    est_col = "est_trade_cost_bps"
+    if est_col in features.columns:
+        est = pd.to_numeric(features[est_col], errors="coerce").reindex(idx).fillna(3.0).clip(lower=0.0)
+        out = est * 1e-4
+        return out.values.astype(float)
+
+    if "avg_dollar_volume_cad" in features.columns:
+        adv = pd.to_numeric(features["avg_dollar_volume_cad"], errors="coerce").reindex(idx)
+        liq_rank = adv.rank(pct=True, ascending=True)
+        illiq = (1.0 - liq_rank).fillna(0.5).clip(0.0, 1.0)
+        out = out + 1.5e-4 * illiq
+
+    if vol_col in features.columns:
+        vol = pd.to_numeric(features[vol_col], errors="coerce").reindex(idx)
+        vol_rank = vol.rank(pct=True, ascending=True).fillna(0.5).clip(0.0, 1.0)
+        out = out + 1.5e-4 * vol_rank
+
+    return out.values.astype(float)
+
+
+def optimize_unified_portfolio(
+    weights_df: pd.DataFrame,
+    features: pd.DataFrame,
+    prices: pd.DataFrame,
+    *,
+    current_weights: pd.Series | None = None,
+    alpha_col: str = "pred_return",
+    vol_col: str = "vol_60d_ann",
+    beta_col: str = "beta",
+    max_position_pct: float = 0.20,
+    max_corr_weight: float = 0.25,
+    corr_threshold: float = 0.70,
+    target_beta: float = 1.0,
+    beta_tolerance: float = 0.25,
+    risk_penalty: float = 1.0,
+    turnover_penalty: float = 1.0,
+    cost_penalty: float = 1.0,
+    lookback_days: int = 60,
+    allow_cash: bool = True,
+    logger=None,
+) -> pd.DataFrame:
+    """Single-pass constrained optimizer for portfolio weights.
+
+    Objective (minimize):
+      - alpha'w + risk_penalty * w'Σw
+      + turnover_penalty * ||w - w_prev||_1
+      + cost_penalty * c'|w - w_prev|
+
+    Hard constraints:
+      - 0 <= w_i <= max_position_pct
+      - sum(w) <= 1 (or =1 when allow_cash=False)
+      - w_i + w_j <= max_corr_weight for highly correlated pairs
+      - target_beta - tol <= beta'w <= target_beta + tol
+    """
+    result = weights_df.copy()
+    if result.empty or "weight" not in result.columns:
+        return result
+
+    tickers = [str(t) for t in result.index.tolist()]
+    n = len(tickers)
+    if n == 0:
+        return result
+
+    cap = max(0.0, float(max_position_pct))
+    if cap <= 0:
+        result["weight"] = 0.0
+        return result
+
+    # If scipy is unavailable, fall back to deterministic hard-constraint passes.
+    if not SCIPY_AVAILABLE:
+        if logger:
+            logger.warning("Unified optimizer skipped: scipy unavailable; using deterministic fallback.")
+        out = apply_max_position_cap(result, max_position_pct=cap, logger=logger)
+        out = apply_correlation_limits(
+            out,
+            prices,
+            max_corr_weight=max_corr_weight,
+            corr_threshold=corr_threshold,
+            lookback_days=lookback_days,
+            logger=logger,
+        )
+        return out.sort_values("weight", ascending=False)
+
+    base_w = pd.to_numeric(result["weight"], errors="coerce").reindex(result.index).fillna(0.0).clip(lower=0.0)
+    if float(base_w.sum()) <= 0:
+        base_w[:] = 1.0 / n
+    else:
+        base_w = base_w / float(base_w.sum())
+    base_w = base_w.clip(upper=cap)
+    if float(base_w.sum()) > 1.0:
+        base_w = base_w / float(base_w.sum())
+
+    if current_weights is not None and len(current_weights) > 0:
+        cur_w = pd.to_numeric(current_weights, errors="coerce").reindex(result.index).fillna(0.0).clip(lower=0.0)
+    else:
+        cur_w = base_w.copy()
+    if float(cur_w.sum()) > 1.0:
+        cur_w = cur_w / float(cur_w.sum())
+
+    x0 = cur_w.values.astype(float)
+
+    # Alpha vector.
+    if alpha_col in features.columns:
+        alpha = pd.to_numeric(features[alpha_col], errors="coerce").reindex(result.index).fillna(0.0)
+    else:
+        alpha = base_w.copy()
+    alpha_std = float(alpha.std(ddof=0))
+    if alpha_std > 0:
+        alpha = ((alpha - float(alpha.mean())) / alpha_std).clip(-4.0, 4.0)
+    alpha_vec = alpha.values.astype(float)
+
+    # Covariance and correlation estimates.
+    close_prices = _extract_close_prices(prices, tickers, lookback_days=lookback_days)
+    corr_matrix = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
+    cov = None
+    if not close_prices.empty and close_prices.shape[1] >= 2:
+        returns = close_prices.pct_change(fill_method=None).dropna(how="all")
+        returns = returns.replace([np.inf, -np.inf], np.nan).dropna(how="all")
+        if len(returns) >= 20:
+            cov_df = returns.cov() * 252.0
+            corr_matrix = returns.corr()
+            cov = cov_df.reindex(index=tickers, columns=tickers).fillna(0.0).values.astype(float)
+            corr_matrix = corr_matrix.reindex(index=tickers, columns=tickers).fillna(0.0)
+    if cov is None:
+        if vol_col in features.columns:
+            vol = pd.to_numeric(features[vol_col], errors="coerce").reindex(result.index).fillna(0.30).clip(0.05, 2.0)
+            var = np.square(vol.values.astype(float))
+        else:
+            var = np.full(n, 0.30 * 0.30, dtype=float)
+        cov = np.diag(var)
+    # Numerical regularization for SLSQP stability.
+    cov = cov + (1e-8 * np.eye(n))
+
+    # Cost vector in return units.
+    cost_vec = _estimate_cost_vector(features, tickers, vol_col=vol_col)
+
+    # Beta vector (defaults to target beta).
+    if beta_col in features.columns:
+        betas = pd.to_numeric(features[beta_col], errors="coerce").reindex(result.index).fillna(float(target_beta))
+    else:
+        betas = pd.Series(float(target_beta), index=result.index)
+    beta_vec = betas.values.astype(float)
+
+    # Correlation pair constraints.
+    corr_pairs: list[tuple[int, int]] = []
+    thr = float(corr_threshold)
+    for i in range(n):
+        for j in range(i + 1, n):
+            c = corr_matrix.iloc[i, j]
+            if np.isfinite(c) and c >= thr:
+                corr_pairs.append((i, j))
+
+    rp = max(0.0, float(risk_penalty))
+    tp = max(0.0, float(turnover_penalty))
+    cp = max(0.0, float(cost_penalty))
+    prev = cur_w.values.astype(float)
+
+    def objective(w: np.ndarray) -> float:
+        w = np.asarray(w, dtype=float)
+        port_ret = float(np.dot(alpha_vec, w))
+        risk = float(w @ cov @ w)
+        delta = w - prev
+        # Smooth L1 approximation keeps optimization stable.
+        abs_delta = np.sqrt(delta * delta + 1e-12)
+        turnover = float(abs_delta.sum())
+        trade_cost = float(np.dot(cost_vec, abs_delta))
+        return (-port_ret) + (rp * risk) + (tp * turnover) + (cp * trade_cost)
+
+    constraints: list[dict[str, object]] = []
+    if allow_cash:
+        constraints.append({"type": "ineq", "fun": lambda w: 1.0 - float(np.sum(w))})
+    else:
+        constraints.append({"type": "eq", "fun": lambda w: float(np.sum(w)) - 1.0})
+
+    max_pair = max(0.0, float(max_corr_weight))
+    if max_pair > 0:
+        for i, j in corr_pairs:
+            constraints.append(
+                {"type": "ineq", "fun": lambda w, i=i, j=j: max_pair - (float(w[i]) + float(w[j]))}
+            )
+
+    beta_tol = max(0.0, float(beta_tolerance))
+    beta_lo = float(target_beta) - beta_tol
+    beta_hi = float(target_beta) + beta_tol
+    constraints.append({"type": "ineq", "fun": lambda w: float(np.dot(w, beta_vec)) - beta_lo})
+    constraints.append({"type": "ineq", "fun": lambda w: beta_hi - float(np.dot(w, beta_vec))})
+
+    bounds = [(0.0, cap) for _ in range(n)]
+    res = minimize(
+        objective,
+        x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 300, "ftol": 1e-9},
+    )
+
+    if not res.success:
+        if logger:
+            logger.warning("Unified optimizer failed (%s). Falling back to deterministic constraints.", res.message)
+        out = apply_max_position_cap(result, max_position_pct=cap, logger=logger)
+        out = apply_correlation_limits(
+            out,
+            prices,
+            max_corr_weight=max_corr_weight,
+            corr_threshold=corr_threshold,
+            lookback_days=lookback_days,
+            logger=logger,
+        )
+        return out.sort_values("weight", ascending=False)
+
+    w_opt = np.asarray(res.x, dtype=float)
+    w_opt = np.clip(w_opt, 0.0, cap)
+    total = float(w_opt.sum())
+    if total > 1.0:
+        w_opt = w_opt / total
+        total = 1.0
+    if (not allow_cash) and total > 0:
+        w_opt = w_opt / total
+
+    # Numerical cleanup: enforce pair caps after solve.
+    if max_pair > 0 and corr_pairs:
+        for _ in range(10):
+            changed = False
+            for i, j in corr_pairs:
+                pair_sum = float(w_opt[i] + w_opt[j])
+                if pair_sum > max_pair + 1e-10:
+                    scale = max_pair / pair_sum
+                    w_opt[i] *= scale
+                    w_opt[j] *= scale
+                    changed = True
+            if not changed:
+                break
+        if float(w_opt.sum()) > 1.0:
+            w_opt = w_opt / float(w_opt.sum())
+
+    result["weight"] = pd.Series(w_opt, index=result.index).clip(lower=0.0, upper=cap)
+    if logger:
+        port_beta = float(np.dot(result["weight"].values.astype(float), beta_vec))
+        logger.info(
+            "Unified optimizer: n=%d, invested=%.1f%%, max_w=%.1f%%, corr_pairs=%d, beta=%.3f",
+            n,
+            float(result["weight"].sum()) * 100.0,
+            float(result["weight"].max()) * 100.0,
+            len(corr_pairs),
+            port_beta,
+        )
+    return result.sort_values("weight", ascending=False)
+
+
 def apply_confidence_weighting(
     weights_df: pd.DataFrame,
     confidence: pd.Series | None,
