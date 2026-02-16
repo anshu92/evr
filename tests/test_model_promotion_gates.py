@@ -1,4 +1,11 @@
-from stock_screener.modeling.eval import aggregate_walk_forward_results, evaluate_model_promotion_gates
+import pandas as pd
+import pytest
+
+from stock_screener.modeling.eval import (
+    aggregate_walk_forward_results,
+    evaluate_model_promotion_gates,
+    simulate_realistic_portfolio,
+)
 
 
 def test_model_promotion_gates_pass_when_all_thresholds_met():
@@ -128,3 +135,59 @@ def test_model_promotion_gates_optional_pbo_proxy_gate():
     assert out["passed"] is False
     failed = {g["name"] for g in out["gates"] if not g["passed"]}
     assert "pbo_proxy_cap" in failed
+
+
+def test_walk_forward_pbo_proxy_penalizes_unstable_paths():
+    robust = aggregate_walk_forward_results(
+        [
+            {"sharpe_ratio": 1.2, "return_per_day": 0.00060, "max_drawdown": -0.10},
+            {"sharpe_ratio": 1.1, "return_per_day": 0.00055, "max_drawdown": -0.11},
+            {"sharpe_ratio": 0.9, "return_per_day": 0.00050, "max_drawdown": -0.12},
+        ]
+    )
+    unstable = aggregate_walk_forward_results(
+        [
+            {"sharpe_ratio": 1.0, "return_per_day": 0.00100, "max_drawdown": -0.10},
+            {"sharpe_ratio": -0.5, "return_per_day": -0.00150, "max_drawdown": -0.40},
+            {"sharpe_ratio": 0.1, "return_per_day": 0.00020, "max_drawdown": -0.35},
+        ]
+    )
+    assert float(robust["pbo_proxy"]) < float(unstable["pbo_proxy"])
+
+
+def test_simulate_realistic_portfolio_uses_entry_horizon_return():
+    dates = pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"])
+    df = pd.DataFrame(
+        {
+            "date": list(dates) * 2,
+            "ticker": ["A"] * 4 + ["B"] * 4,
+            "future_ret": [
+                0.21,   # rebalance day 1, selected
+                -0.90,  # should NOT impact day 2 when holding from day 1
+                0.21,   # rebalance day 3, selected
+                -0.90,  # should NOT impact day 4 when holding from day 3
+                -0.10,
+                0.50,
+                -0.10,
+                0.50,
+            ],
+            "pred": [
+                10.0, 0.0, 10.0, 0.0,  # ticker A selected only on rebalance dates
+                1.0, 0.0, 1.0, 0.0,
+            ],
+        }
+    )
+    out = simulate_realistic_portfolio(
+        df,
+        date_col="date",
+        ticker_col="ticker",
+        label_col="future_ret",
+        pred_col="pred",
+        top_n=1,
+        hold_days=2,
+        cost_bps=0.0,
+    )
+    daily = out["daily"]
+    assert len(daily) == 4
+    expected_daily = (1.21 ** 0.5) - 1.0
+    assert daily["return"].tolist() == pytest.approx([expected_daily] * 4, abs=1e-9)

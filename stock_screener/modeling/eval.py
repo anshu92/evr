@@ -154,13 +154,18 @@ def aggregate_walk_forward_results(period_results: list[dict]) -> dict[str, obje
             }
     
     # Calculate consistency score (% of periods with positive Sharpe)
-    sharpe_values = [r.get("sharpe_ratio", float("nan")) for r in period_results]
-    sharpe_positive = sum(1 for s in sharpe_values if s and not np.isnan(s) and s > 0)
+    sharpe_values = [
+        float(r.get("sharpe_ratio"))
+        for r in period_results
+        if r.get("sharpe_ratio") is not None and np.isfinite(float(r.get("sharpe_ratio")))
+    ]
+    sharpe_positive = sum(1 for s in sharpe_values if s > 0.0)
     consistency = sharpe_positive / len(sharpe_values) if sharpe_values else 0.0
 
     # PBO-style robustness proxy:
     # - failure_rate: share of periods with non-positive Sharpe
-    # - instability_score: variability of return/day vs absolute mean
+    # - instability_score: variability of return/day, scaled robustly
+    # - drawdown_failure_rate: share of periods breaching -25% drawdown
     # Lower is better; 0.0 means robust.
     failure_rate = 1.0 - consistency
     return_day_values = [
@@ -173,18 +178,36 @@ def aggregate_walk_forward_results(period_results: list[dict]) -> dict[str, obje
         rp = np.array(return_day_values, dtype=float)
         mu_abs = abs(float(np.mean(rp)))
         sigma = float(np.std(rp))
-        instability_ratio = sigma / (mu_abs + 1e-8)
+        mad = float(np.median(np.abs(rp - float(np.median(rp))))) * 1.4826
+        scale = max(mu_abs, mad, 1e-6)
+        instability_ratio = sigma / scale
     if np.isfinite(instability_ratio):
-        instability_score = float(np.clip(1.0 - np.exp(-instability_ratio), 0.0, 1.0))
+        instability_score = float(np.clip(np.tanh(instability_ratio / 2.0), 0.0, 1.0))
     else:
         instability_score = 0.5
-    pbo_proxy = float(np.clip((0.6 * failure_rate) + (0.4 * instability_score), 0.0, 1.0))
+    drawdown_values = [
+        float(r.get("max_drawdown"))
+        for r in period_results
+        if r.get("max_drawdown") is not None and np.isfinite(float(r.get("max_drawdown")))
+    ]
+    if drawdown_values:
+        drawdown_failure_rate = float(np.mean(np.array(drawdown_values, dtype=float) < -0.25))
+    else:
+        drawdown_failure_rate = 0.5
+    pbo_proxy = float(
+        np.clip(
+            (0.5 * failure_rate) + (0.3 * instability_score) + (0.2 * drawdown_failure_rate),
+            0.0,
+            1.0,
+        )
+    )
 
     return {
         "n_periods": len(period_results),
         "consistency": consistency,  # % of periods with positive Sharpe
         "oos_failure_rate": failure_rate,
         "instability_ratio": instability_ratio,
+        "drawdown_failure_rate": drawdown_failure_rate,
         "pbo_proxy": pbo_proxy,
         "aggregate": aggregated,
         "per_period": period_results,
@@ -564,10 +587,11 @@ def simulate_realistic_portfolio(
     frame = df[[date_col, ticker_col, label_col, pred_col]].copy()
     if market_ret_col and market_ret_col in df.columns:
         frame[market_ret_col] = df[market_ret_col]
-    
+
     frame[date_col] = pd.to_datetime(frame[date_col]).dt.normalize()
     frame = frame.dropna(subset=[label_col, pred_col])
-    
+    frame = frame.sort_values([date_col, pred_col], ascending=[True, False])
+
     dates = sorted(frame[date_col].unique())
     if len(dates) < hold_days + 1:
         return {
@@ -583,65 +607,73 @@ def simulate_realistic_portfolio(
             "daily": pd.DataFrame(),
         }
     
-    # Rebalance dates (every hold_days)
-    rebalance_dates = dates[::hold_days]
-    
     n = max(1, int(top_n))
+    hold_days = max(1, int(hold_days))
     cost = float(cost_bps) * 1e-4
-    
-    portfolio_returns = []
-    market_returns_list = []
+
+    portfolio_returns: list[dict[str, float]] = []
+    market_returns_list: list[float] = []
     current_holdings = set()
     total_turnover = 0.0
+    n_turnover_events = 0
     n_rebalances = 0
     total_cost_paid = 0.0
-    
-    for i, date in enumerate(dates):
-        day_data = frame[frame[date_col] == date]
+
+    for rebalance_idx in range(0, len(dates), hold_days):
+        rebalance_date = dates[rebalance_idx]
+        day_data = frame[frame[date_col] == rebalance_date]
         if day_data.empty:
             continue
-        
-        # Check if rebalance day
-        if date in rebalance_dates:
-            # Select new top-N
-            new_holdings = set(
-                day_data.sort_values(pred_col, ascending=False)
-                .head(n)[ticker_col]
-                .tolist()
-            )
-            
-            # Calculate turnover (% of portfolio changed)
-            if current_holdings:
-                overlap = len(current_holdings & new_holdings)
-                turnover = 1.0 - (overlap / max(len(current_holdings), len(new_holdings)))
-                total_turnover += turnover
-                
-                # Apply transaction costs on changed positions
-                positions_changed = len(current_holdings - new_holdings) + len(new_holdings - current_holdings)
-                day_cost = cost * (positions_changed / n) if n > 0 else 0
-                total_cost_paid += day_cost
-            else:
-                day_cost = cost  # Initial entry
-                total_cost_paid += day_cost
-            
-            current_holdings = new_holdings
-            n_rebalances += 1
-        
-        # Calculate portfolio return for the day (equal-weighted current holdings)
+
+        top = day_data.head(n)
+        if top.empty:
+            continue
+
+        new_holdings = set(top[ticker_col].tolist())
+        day_cost = cost
         if current_holdings:
-            held_data = day_data[day_data[ticker_col].isin(current_holdings)]
-            if not held_data.empty:
-                day_return = float(held_data[label_col].mean())
-                
-                # Apply cost on rebalance day
-                if date in rebalance_dates and n_rebalances > 1:
-                    day_return -= day_cost
-                
-                portfolio_returns.append({"date": date, "return": day_return})
-                
-                if market_ret_col and market_ret_col in held_data.columns:
-                    market_returns_list.append(float(held_data[market_ret_col].mean()))
-    
+            overlap = len(current_holdings & new_holdings)
+            turnover = 1.0 - (overlap / max(len(current_holdings), len(new_holdings)))
+            total_turnover += turnover
+            n_turnover_events += 1
+
+            positions_changed = len(current_holdings - new_holdings) + len(new_holdings - current_holdings)
+            day_cost = cost * (positions_changed / n) if n > 0 else 0.0
+
+        total_cost_paid += day_cost
+        current_holdings = new_holdings
+        n_rebalances += 1
+
+        window_len = min(hold_days, len(dates) - rebalance_idx)
+        if window_len <= 0:
+            continue
+
+        label_values = pd.to_numeric(top[label_col], errors="coerce").to_numpy(dtype=float)
+        valid_label_mask = np.isfinite(label_values) & (label_values > -0.999999)
+        if not np.any(valid_label_mask):
+            continue
+        label_values = label_values[valid_label_mask]
+        daily_label_values = np.power(1.0 + label_values, 1.0 / float(window_len)) - 1.0
+        base_day_return = float(np.nanmean(daily_label_values))
+
+        market_day_return = float("nan")
+        if market_ret_col and market_ret_col in top.columns:
+            market_values = pd.to_numeric(top[market_ret_col], errors="coerce").to_numpy(dtype=float)
+            valid_market_mask = np.isfinite(market_values) & (market_values > -0.999999)
+            if np.any(valid_market_mask):
+                market_values = market_values[valid_market_mask]
+                market_daily_values = np.power(1.0 + market_values, 1.0 / float(window_len)) - 1.0
+                market_day_return = float(np.nanmean(market_daily_values))
+
+        for offset in range(window_len):
+            sim_date = dates[rebalance_idx + offset]
+            day_return = base_day_return
+            if offset == 0:
+                day_return -= day_cost
+            portfolio_returns.append({"date": sim_date, "return": day_return})
+            if np.isfinite(market_day_return):
+                market_returns_list.append(market_day_return)
+
     if not portfolio_returns:
         return {
             "summary": {
@@ -656,40 +688,47 @@ def simulate_realistic_portfolio(
             "daily": pd.DataFrame(),
         }
     
-    daily_df = pd.DataFrame(portfolio_returns)
+    daily_df = pd.DataFrame(portfolio_returns).sort_values("date").reset_index(drop=True)
     returns = daily_df["return"]
-    
+
     # Compute metrics
     cumulative = (1 + returns).cumprod()
     total_return = float(cumulative.iloc[-1] - 1)
     n_days = len(returns)
     ann_return = float((1 + total_return) ** (252 / n_days) - 1) if n_days > 0 else float("nan")
-    
+
     # Sharpe
     if returns.std() > 0:
         sharpe = float(np.sqrt(252) * returns.mean() / returns.std())
     else:
         sharpe = float("nan")
-    
+    downside = returns[returns < 0]
+    if len(downside) > 1 and downside.std() > 0:
+        sortino = float(np.sqrt(252) * returns.mean() / downside.std())
+    else:
+        sortino = float("nan")
+
     # Max Drawdown
     rolling_max = cumulative.cummax()
     drawdown = (cumulative - rolling_max) / rolling_max
     max_dd = float(drawdown.min())
-    
+
     # Average turnover per rebalance
-    avg_turnover = float(total_turnover / n_rebalances) if n_rebalances > 0 else 0.0
-    
+    avg_turnover = float(total_turnover / n_turnover_events) if n_turnover_events > 0 else 0.0
+
     # Alpha metrics if market data available
     alpha_ann = float("nan")
     if market_returns_list and len(market_returns_list) == len(returns):
         alpha_daily = returns.values - np.array(market_returns_list)
         alpha_ann = float(np.nanmean(alpha_daily) * 252)
-    
+    return_per_day = float((1.0 + total_return) ** (1.0 / n_days) - 1.0) if n_days > 0 else float("nan")
+
     summary = {
         "total_return": total_return,
         "ann_return": ann_return,
-        "return_per_day": float(total_return / n_days) if n_days > 0 else float("nan"),
+        "return_per_day": return_per_day,
         "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
         "cost_adjusted_sharpe": sharpe,
         "max_drawdown": max_dd,
         "avg_turnover": avg_turnover,
