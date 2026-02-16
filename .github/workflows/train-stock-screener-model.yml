@@ -25,7 +25,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-actions.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -37,14 +37,14 @@ jobs:
             cache/
             data_cache/
             models/
-          key: ${{ runner.os }}-screener-model-${{ hashFiles('requirements.txt', '.github/workflows/train-stock-screener-model.yml') }}
+          key: ${{ runner.os }}-screener-model-${{ hashFiles('requirements-actions.txt', '.github/workflows/train-stock-screener-model.yml') }}
           restore-keys: |
             ${{ runner.os }}-screener-model-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-actions.txt
 
       - name: Show system resources
         run: |

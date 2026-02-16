@@ -1,0 +1,21 @@
+# GitHub Actions runtime dependencies (cost-controlled).
+# Keep versions bounded to reduce solver churn and avoid oversized wheel pulls.
+#
+# NOTE:
+# xgboost>=3 pulls additional GPU-related dependencies (e.g., nvidia-nccl-cu12)
+# on Linux runners, which significantly increases install time/cache size.
+# Keep xgboost on the 2.x line for CPU-only Actions workloads.
+pandas>=2.0.0,<3.0.0
+numpy>=1.24.0,<2.4.0
+pyarrow>=12.0.0,<20.0.0
+yfinance>=0.2.0,<1.0
+requests>=2.28.0,<3.0.0
+scikit-learn>=1.3.0,<1.9.0
+xgboost>=2.0.0,<3.0.0
+lightgbm>=4.0.0,<5.0.0
+optuna>=3.0.0,<5.0.0
+scipy>=1.11.0,<1.18.0
+rich>=13.0.0,<15.0.0
+lxml>=4.9.0,<7.0.0
+html5lib>=1.1,<2.0.0
+joblib>=1.3.0,<2.0.0
