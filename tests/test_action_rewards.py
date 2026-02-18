@@ -156,11 +156,21 @@ class TestBackfillPrices:
         assert e.price_1d_after == 105.0
         assert abs(e.return_1d - 0.05) < 1e-6
 
+    def test_uses_trading_day_horizons(self):
+        """Friday->Monday should count as one trading day, not three calendar days."""
+        log = ActionRewardLog()
+        log.append_batch([_sell_entry(date="2026-01-02", price_at_action=100.0)])
+        prices = pd.Series({"AAPL": 101.0})
+        log.backfill_prices(prices, "2026-01-05")
+        e = log.entries[0]
+        assert e.return_1d is not None
+        assert e.return_3d is None
+
     def test_fills_5d_and_classifies_sell(self):
         log = ActionRewardLog()
         log.append_batch([_sell_entry(date="2026-01-27", price_at_action=100.0, entry_price=90.0)])
         prices = pd.Series({"AAPL": 105.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.return_5d is not None
         assert abs(e.return_5d - 0.05) < 1e-6
@@ -170,7 +180,7 @@ class TestBackfillPrices:
         log = ActionRewardLog()
         log.append_batch([_sell_entry(date="2026-01-27", price_at_action=100.0)])
         prices = pd.Series({"AAPL": 95.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.was_premature_sell is False
 
@@ -178,7 +188,7 @@ class TestBackfillPrices:
         log = ActionRewardLog()
         log.append_batch([_buy_entry(date="2026-01-27", price_at_action=400.0)])
         prices = pd.Series({"MSFT": 380.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.was_bad_buy is True
 
@@ -186,7 +196,7 @@ class TestBackfillPrices:
         log = ActionRewardLog()
         log.append_batch([_hold_entry(date="2026-01-27", price_at_action=150.0)])
         prices = pd.Series({"GOOG": 140.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.was_wrong_hold is True
 
@@ -207,7 +217,7 @@ class TestBackfillPrices:
         log.append_batch([e])
         # AAPL went to 95 (sold correctly), GOOG went to 165 (+10%)
         prices = pd.Series({"AAPL": 95.0, "GOOG": 165.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.replaced_by_return_5d is not None
         assert abs(e.replaced_by_return_5d - 0.10) < 1e-6
@@ -225,7 +235,7 @@ class TestBackfillPrices:
         log.append_batch([e])
         # MSFT went to 420 (+5%), AAPL went to 110 (+10%)
         prices = pd.Series({"MSFT": 420.0, "AAPL": 110.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.replaced_return_5d is not None
         assert abs(e.replaced_return_5d - 0.10) < 1e-6
@@ -239,7 +249,7 @@ class TestBackfillPrices:
         e = _buy_entry(date="2026-01-27", price_at_action=400.0, stock_volatility=0.30)
         log.append_batch([e])
         prices = pd.Series({"MSFT": 420.0})
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.vol_adjusted_return_5d is not None
         # expected_5d_vol = 0.30 * sqrt(5/252) ≈ 0.0423
@@ -253,7 +263,7 @@ class TestBackfillPrices:
                        screened_avg_pred_return=0.03)
         log.append_batch([e])
         prices = pd.Series({"MSFT": 420.0})  # +5%
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.selection_alpha_5d is not None
         # selection_alpha = actual_return - screened_avg_pred = 0.05 - 0.03 = 0.02
@@ -266,7 +276,7 @@ class TestBackfillPrices:
                        predicted_return=0.08, confidence=0.7)
         log.append_batch([e])
         prices = pd.Series({"MSFT": 420.0})  # Positive return, prediction was positive
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.confidence_calibration is not None
         assert e.confidence_calibration == 0.7  # Correct direction -> +confidence
@@ -278,7 +288,7 @@ class TestBackfillPrices:
                        predicted_return=0.08, confidence=0.7)
         log.append_batch([e])
         prices = pd.Series({"MSFT": 380.0})  # Negative return, prediction was positive
-        log.backfill_prices(prices, "2026-02-01")
+        log.backfill_prices(prices, "2026-02-03")
         e = log.entries[0]
         assert e.confidence_calibration is not None
         assert e.confidence_calibration == -0.7  # Wrong direction -> -confidence
@@ -346,6 +356,12 @@ class TestScoreAction:
         e.rotation_alpha = -0.10  # Replacement did 10% worse
         total, comps = score_action(e)
         assert comps["rotation_alpha"] == pytest.approx(-0.10, abs=1e-6)
+
+    def test_sell_partial_uses_entry_price_for_base_outcome(self):
+        e = _sell_entry(action="SELL_PARTIAL", entry_price=100.0, price_at_action=110.0)
+        e.return_5d = -0.01
+        _, comps = score_action(e)
+        assert comps["base_outcome"] == pytest.approx(0.10, abs=1e-6)
 
     def test_sell_no_post_return(self):
         """No post-action data yet -> only base gain matters."""

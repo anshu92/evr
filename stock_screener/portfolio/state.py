@@ -14,8 +14,11 @@ def _utcnow() -> datetime:
 def _dt_from_iso(x: str | None) -> datetime | None:
     if not x:
         return None
-    # datetime.fromisoformat preserves embedded timezone offsets if present.
-    return datetime.fromisoformat(x)
+    # Keep all timestamps timezone-aware and normalized to UTC.
+    dt = datetime.fromisoformat(x)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass
@@ -231,4 +234,3 @@ def compute_drawdown_scalar(
     
     dd_info["drawdown_scalar"] = scalar
     return scalar, dd_info
-

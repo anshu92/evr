@@ -210,6 +210,8 @@ def test_portfolio_manager_peak_detection():
     assert actions[0].action == "SELL_PARTIAL"
     assert "PEAK" in actions[0].reason
     assert actions[0].shares == 5  # 50% of 10
+    assert actions[0].entry_price == pytest.approx(100.0)
+    assert actions[0].realized_gain_pct == pytest.approx(0.10)
 
 
 def test_peak_full_liquidation_emits_sell(tmp_path):
@@ -256,6 +258,55 @@ def test_peak_full_liquidation_emits_sell(tmp_path):
     assert actions[0].action == "SELL"
     assert actions[0].reason.startswith("PEAK_")
     assert len([p for p in state.positions if p.status == "OPEN"]) == 0
+
+
+def test_build_trade_plan_consolidates_duplicate_open_lots(tmp_path):
+    """Duplicate open lots for the same ticker should be consolidated deterministically."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[
+            Position(ticker="AAPL", entry_price=100.0, entry_date=now - timedelta(days=5), shares=1.0),
+            Position(ticker="AAPL", entry_price=110.0, entry_date=now - timedelta(days=3), shares=2.0),
+        ],
+        last_updated=now,
+    )
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    screened = pd.DataFrame({"pred_return": [0.02], "score": [1.0]}, index=["AAPL"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["AAPL"])
+    prices = pd.Series({"AAPL": 120.0})
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+
+    holds = [a for a in plan.actions if a.action == "HOLD" and a.ticker == "AAPL"]
+    assert len(holds) == 1
+    assert holds[0].shares == pytest.approx(3.0)
+    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 1
 
 
 def test_fractional_buy_when_cash_below_share_price(tmp_path):

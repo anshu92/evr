@@ -28,3 +28,13 @@ def test_dynamic_size_min_pred_return_default_is_aligned(monkeypatch):
 
     monkeypatch.setenv("DYNAMIC_SIZE_MIN_PRED_RETURN", "0.025")
     assert Config.from_env().dynamic_size_min_pred_return == 0.025
+
+
+def test_dynamic_size_max_positions_is_capped_by_portfolio_size(monkeypatch):
+    monkeypatch.setenv("PORTFOLIO_SIZE", "5")
+    monkeypatch.setenv("DYNAMIC_SIZE_MAX_POSITIONS", "50")
+    assert Config.from_env().dynamic_size_max_positions == 5
+
+    monkeypatch.setenv("PORTFOLIO_SIZE", "3")
+    monkeypatch.setenv("DYNAMIC_SIZE_MAX_POSITIONS", "10")
+    assert Config.from_env().dynamic_size_max_positions == 3

@@ -9,10 +9,20 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from stock_screener.portfolio.manager import _trading_days_between
 
 
 def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+def _date_to_utc_datetime(x: str) -> datetime:
+    ts = pd.Timestamp(x)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.to_pydatetime()
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +197,14 @@ class ActionRewardLog:
             if px is None or pd.isna(px) or float(px) <= 0:
                 continue
             px_f = float(px)
-            days_elapsed = (
-                pd.Timestamp(current_date) - pd.Timestamp(e.date)
-            ).days
+            try:
+                days_elapsed = _trading_days_between(
+                    _date_to_utc_datetime(e.date),
+                    _date_to_utc_datetime(current_date),
+                )
+            except Exception:
+                # Fallback for malformed dates: keep prior calendar-day behavior.
+                days_elapsed = (pd.Timestamp(current_date) - pd.Timestamp(e.date)).days
 
             if days_elapsed >= 1 and e.price_1d_after is None:
                 e.price_1d_after = px_f
@@ -311,9 +326,22 @@ class RewardEntry:
     # Event type allows prediction rows and close-label rows to coexist safely.
     event_type: str = "PREDICTION"  # PREDICTION | CLOSE
 
-    def key(self) -> tuple[str, str, str]:
-        """Dedup key: (date, ticker, event_type)."""
-        return (self.date, self.ticker, self.event_type.upper())
+    def key(self) -> tuple[str, ...]:
+        """Dedup key.
+
+        For CLOSE rows, include extra fields so multiple same-day closes for one
+        ticker are not collapsed into a single record.
+        """
+        event = self.event_type.upper()
+        if event == "CLOSE":
+            return (
+                self.date,
+                self.ticker,
+                event,
+                str(self.exit_reason or ""),
+                str(self.days_held) if self.days_held is not None else "",
+            )
+        return (self.date, self.ticker, event)
 
 
 @dataclass
@@ -392,7 +420,7 @@ class RewardLog:
 
     def append_batch(self, entries: list[RewardEntry]) -> None:
         """Append multiple entries, deduplicating by key (including within batch)."""
-        deduped: dict[tuple[str, str, str], RewardEntry] = {}
+        deduped: dict[tuple[str, ...], RewardEntry] = {}
         for e in entries:
             deduped[e.key()] = e
         new_entries = list(deduped.values())

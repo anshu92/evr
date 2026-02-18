@@ -16,6 +16,10 @@ class TestRewardEntry:
         e = _make_entry()
         assert e.key() == ("2026-01-15", "AAPL", "PREDICTION")
 
+    def test_close_key_includes_reason_and_days(self):
+        e = _make_entry(event_type="CLOSE", exit_reason="STOP_LOSS", days_held=4)
+        assert e.key() == ("2026-01-15", "AAPL", "CLOSE", "STOP_LOSS", "4")
+
     def test_defaults(self):
         e = _make_entry()
         assert e.realized_1d_return is None
@@ -78,6 +82,29 @@ class TestRewardLog:
         ])
         assert len(log.entries) == 2
         assert {e.event_type for e in log.entries} == {"PREDICTION", "CLOSE"}
+
+    def test_multiple_close_entries_same_day_are_preserved(self):
+        log = RewardLog()
+        log.append_batch([
+            _make_entry(
+                date="2026-01-15",
+                ticker="AAPL",
+                pred=0.03,
+                event_type="CLOSE",
+                exit_reason="TAKE_PROFIT",
+                days_held=2,
+            ),
+            _make_entry(
+                date="2026-01-15",
+                ticker="AAPL",
+                pred=0.01,
+                event_type="CLOSE",
+                exit_reason="PEAK_NEG_PRED",
+                days_held=5,
+            ),
+        ])
+        close_rows = [e for e in log.entries if e.event_type == "CLOSE"]
+        assert len(close_rows) == 2
 
     def test_save_load_roundtrip(self, tmp_path):
         log = RewardLog()

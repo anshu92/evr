@@ -255,6 +255,94 @@ class PortfolioManager:
                 out[p.ticker] = p
         return out
 
+    def _normalize_open_positions(self, state: PortfolioState) -> None:
+        """Consolidate duplicate OPEN lots per ticker into one lot.
+
+        The runtime expects one open position per ticker. Legacy/manual states can
+        violate this and cause silent lot drops in planning paths.
+        """
+        grouped: dict[str, list[Position]] = {}
+        closed: list[Position] = []
+        for p in state.positions:
+            if p.status == "OPEN" and p.ticker and p.shares > 0:
+                ticker = str(p.ticker).upper()
+                p.ticker = ticker
+                grouped.setdefault(ticker, []).append(p)
+            else:
+                closed.append(p)
+
+        if not grouped:
+            state.positions = closed
+            return
+
+        normalized_open: list[Position] = []
+        duplicate_tickers = 0
+        duplicate_lots = 0
+        for ticker, lots in grouped.items():
+            if len(lots) == 1:
+                normalized_open.append(lots[0])
+                continue
+
+            duplicate_tickers += 1
+            duplicate_lots += len(lots) - 1
+
+            total_shares = float(sum(float(l.shares) for l in lots if l.shares > 0))
+            if total_shares <= 0:
+                continue
+
+            px_num = 0.0
+            px_den = 0.0
+            pred_ret_num = 0.0
+            pred_ret_den = 0.0
+            peak_days_num = 0.0
+            peak_days_den = 0.0
+            for lot in lots:
+                sh = float(lot.shares)
+                if sh <= 0:
+                    continue
+                ep = float(lot.entry_price) if lot.entry_price is not None else 0.0
+                if ep > 0:
+                    px_num += ep * sh
+                    px_den += sh
+                if lot.entry_pred_return is not None and not pd.isna(lot.entry_pred_return):
+                    pred_ret_num += float(lot.entry_pred_return) * sh
+                    pred_ret_den += sh
+                if lot.entry_pred_peak_days is not None and not pd.isna(lot.entry_pred_peak_days):
+                    peak_days_num += float(lot.entry_pred_peak_days) * sh
+                    peak_days_den += sh
+
+            entry_price = (px_num / px_den) if px_den > 0 else float(lots[0].entry_price)
+            entry_date = min(l.entry_date for l in lots)
+            highest_vals = [float(l.highest_price) for l in lots if l.highest_price is not None and float(l.highest_price) > 0]
+            highest_price = max(highest_vals) if highest_vals else None
+            stop_loss = next((l.stop_loss_pct for l in lots if l.stop_loss_pct is not None), lots[0].stop_loss_pct)
+            take_profit = next((l.take_profit_pct for l in lots if l.take_profit_pct is not None), lots[0].take_profit_pct)
+            pred_return = (pred_ret_num / pred_ret_den) if pred_ret_den > 0 else lots[0].entry_pred_return
+            pred_peak_days = (peak_days_num / peak_days_den) if peak_days_den > 0 else lots[0].entry_pred_peak_days
+
+            normalized_open.append(
+                Position(
+                    ticker=ticker,
+                    entry_price=float(entry_price),
+                    entry_date=entry_date,
+                    shares=float(total_shares),
+                    stop_loss_pct=stop_loss,
+                    take_profit_pct=take_profit,
+                    highest_price=highest_price,
+                    entry_pred_peak_days=pred_peak_days,
+                    entry_pred_return=pred_return,
+                )
+            )
+
+        if duplicate_lots > 0:
+            self.logger.warning(
+                "Consolidated %d duplicate OPEN lot(s) across %d ticker(s).",
+                duplicate_lots,
+                duplicate_tickers,
+            )
+
+        state.positions = normalized_open + closed
+
     def _close_position(self, p: Position, *, price_cad: float, reason: str) -> Position:
         p.status = f"CLOSED:{reason}"
         p.exit_price = float(price_cad)
@@ -373,6 +461,8 @@ class PortfolioManager:
         
         # Update position to reduced shares
         p.shares = shares_remaining
+        entry_px = float(p.entry_price) if p.entry_price else None
+        realized_gain = ((price_cad / entry_px) - 1.0) if entry_px and entry_px > 0 else None
         
         action = TradeAction(
             ticker=p.ticker,
@@ -381,6 +471,8 @@ class PortfolioManager:
             shares=shares_to_sell,
             price_cad=float(price_cad),
             days_held=days_held,
+            entry_price=entry_px,
+            realized_gain_pct=realized_gain,
         )
         
         return action, p
@@ -531,6 +623,7 @@ class PortfolioManager:
         features: pd.DataFrame | None = None,
         market_vol_regime: float | None = None,
     ) -> list[TradeAction]:
+        self._normalize_open_positions(state)
         actions: list[TradeAction] = []
         now = _utcnow()
         open_positions: list[Position] = [p for p in state.positions if p.status == "OPEN"]
@@ -755,6 +848,7 @@ class PortfolioManager:
         features: pd.DataFrame | None = None,
         blocked_buys: set[str] | None = None,
     ) -> TradePlan:
+        self._normalize_open_positions(state)
         # weights is expected to represent the *target* holdings universe, but we may rotate.
         now = _utcnow()
         actions: list[TradeAction] = []
