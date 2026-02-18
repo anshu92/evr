@@ -14,12 +14,12 @@ def _utcnow() -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Trading-day calendar: weekdays minus NYSE market holidays.
+# Trading-day calendar: weekdays minus market holidays (NYSE / TSX).
 # Self-contained — no external dependency required.
 # ---------------------------------------------------------------------------
 from datetime import date as _date
 
-_HOLIDAY_CACHE: dict[int, set] = {}
+_HOLIDAY_CACHE: dict[tuple[str, int], set[_date]] = {}
 
 
 def _nth_weekday(year: int, month: int, weekday: int, n: int) -> _date:
@@ -63,10 +63,11 @@ def _easter(year: int) -> _date:
     return _date(year, month, day + 1)
 
 
-def _nyse_holidays(year: int) -> set:
+def _nyse_holidays(year: int) -> set[_date]:
     """Compute NYSE market holidays for a given year."""
-    if year in _HOLIDAY_CACHE:
-        return _HOLIDAY_CACHE[year]
+    key = ("US", year)
+    if key in _HOLIDAY_CACHE:
+        return _HOLIDAY_CACHE[key]
 
     holidays = set()
 
@@ -101,20 +102,85 @@ def _nyse_holidays(year: int) -> set:
     # Christmas (December 25)
     holidays.add(_observed(_date(year, 12, 25)))
 
-    _HOLIDAY_CACHE[year] = holidays
+    _HOLIDAY_CACHE[key] = holidays
     return holidays
 
 
-def _is_trading_day(d) -> bool:
-    """Check if a date is a trading day (weekday + not an NYSE holiday)."""
+def _canada_observed(d: _date) -> _date:
+    """Canada-style observed holiday (Sat/Sun -> Monday)."""
+    if d.weekday() == 5:  # Saturday -> Monday
+        return d + timedelta(days=2)
+    if d.weekday() == 6:  # Sunday -> Monday
+        return d + timedelta(days=1)
+    return d
+
+
+def _tsx_holidays(year: int) -> set[_date]:
+    """Compute core TSX holidays for a given year."""
+    key = ("CA", year)
+    if key in _HOLIDAY_CACHE:
+        return _HOLIDAY_CACHE[key]
+
+    holidays: set[_date] = set()
+
+    # New Year's Day
+    holidays.add(_canada_observed(_date(year, 1, 1)))
+
+    # Family Day (3rd Monday in February)
+    holidays.add(_nth_weekday(year, 2, 0, 3))
+
+    # Good Friday
+    holidays.add(_easter(year) - timedelta(days=2))
+
+    # Victoria Day (Monday preceding May 25)
+    victoria = _date(year, 5, 24)
+    while victoria.weekday() != 0:
+        victoria -= timedelta(days=1)
+    holidays.add(victoria)
+
+    # Canada Day
+    holidays.add(_canada_observed(_date(year, 7, 1)))
+
+    # Civic Holiday (1st Monday in August)
+    holidays.add(_nth_weekday(year, 8, 0, 1))
+
+    # Labour Day (1st Monday in September)
+    holidays.add(_nth_weekday(year, 9, 0, 1))
+
+    # Thanksgiving (2nd Monday in October)
+    holidays.add(_nth_weekday(year, 10, 0, 2))
+
+    # Christmas + Boxing Day (ensure distinct observed dates)
+    christmas_obs = _canada_observed(_date(year, 12, 25))
+    holidays.add(christmas_obs)
+    boxing_obs = _canada_observed(_date(year, 12, 26))
+    while boxing_obs in holidays or boxing_obs.weekday() >= 5:
+        boxing_obs += timedelta(days=1)
+    holidays.add(boxing_obs)
+
+    _HOLIDAY_CACHE[key] = holidays
+    return holidays
+
+
+def _market_for_ticker(ticker: str | None) -> str:
+    t = str(ticker or "").strip().upper()
+    if t.endswith(".TO") or t.endswith(".V"):
+        return "CA"
+    return "US"
+
+
+def _is_trading_day(d, market: str = "US") -> bool:
+    """Check if a date is a trading day for the requested market."""
     if hasattr(d, "date"):
         d = d.date()
     if d.weekday() >= 5:
         return False
-    return d not in _nyse_holidays(d.year)
+    m = str(market or "US").upper()
+    holidays = _tsx_holidays(d.year) if m == "CA" else _nyse_holidays(d.year)
+    return d not in holidays
 
 
-def _trading_days_between(start: datetime, end: datetime) -> int:
+def _trading_days_between(start: datetime, end: datetime, market: str = "US") -> int:
     """Count trading days between two dates, excluding start, including end."""
     if end <= start:
         return 0
@@ -122,13 +188,13 @@ def _trading_days_between(start: datetime, end: datetime) -> int:
     d = start.date() + timedelta(days=1)
     end_d = end.date()
     while d <= end_d:
-        if _is_trading_day(d):
+        if _is_trading_day(d, market=market):
             count += 1
         d += timedelta(days=1)
     return count
 
 
-def _add_trading_days(start: datetime, trading_days: int) -> datetime:
+def _add_trading_days(start: datetime, trading_days: int, market: str = "US") -> datetime:
     """Return the datetime that is N trading days after start."""
     if trading_days <= 0:
         return start
@@ -136,7 +202,7 @@ def _add_trading_days(start: datetime, trading_days: int) -> datetime:
     added = 0
     while added < trading_days:
         d += timedelta(days=1)
-        if _is_trading_day(d):
+        if _is_trading_day(d, market=market):
             added += 1
     return d
 
@@ -207,6 +273,7 @@ class PortfolioManager:
         logger,
         min_trade_notional_cad: float = 10.0,
         min_rebalance_weight_delta: float = 0.01,
+        rotate_on_missing_data: bool = False,
     ) -> None:
         self.state_path = state_path
         self.max_holding_days = max(1, int(max_holding_days))
@@ -246,6 +313,7 @@ class PortfolioManager:
         self.peak_above_ma_ratio = peak_above_ma_ratio
         self.min_trade_notional_cad = max(1.0, float(min_trade_notional_cad))
         self.min_rebalance_weight_delta = max(0.0, float(min_rebalance_weight_delta))
+        self.rotate_on_missing_data = bool(rotate_on_missing_data)
         self.logger = logger
 
     def _positions_by_ticker(self, state: PortfolioState) -> dict[str, Position]:
@@ -635,7 +703,8 @@ class PortfolioManager:
                 keep.append(p)
                 continue
 
-            days = _trading_days_between(p.entry_date, now)  # trading days (matches model)
+            market = _market_for_ticker(p.ticker)
+            days = _trading_days_between(p.entry_date, now, market=market)  # trading days (matches model)
 
             # Adaptive peak-target exit: combine entry-time and today's predictions.
             # pred_peak_days is in trading days (model trained on trading-day rows).
@@ -886,7 +955,8 @@ class PortfolioManager:
                     # No price data – keep position; HOLD action emitted later.
                     continue
                 # Use trading days consistently for tenure-aware rotation checks.
-                days = _trading_days_between(p.entry_date, now)
+                market = _market_for_ticker(t)
+                days = _trading_days_between(p.entry_date, now, market=market)
                 
                 # Get current predictions for this ticker (if available in screened)
                 ticker_data = screened[screened.index == t] if t in screened.index else None
@@ -910,9 +980,8 @@ class PortfolioManager:
                 elif score_pct is not None and score_pct < 0.30:
                     should_rotate = True
                     rotation_reason = "ROTATION:LOW_RANK"
-                # 3. If we have no prediction data and stock is not in target, still rotate
-                # (but only if held for minimum period to avoid same-day churn)
-                elif pred_ret is None and days >= 2:
+                # 3. Optional policy: rotate stale no-data holdings (disabled by default).
+                elif pred_ret is None and self.rotate_on_missing_data and days >= 2:
                     should_rotate = True
                     rotation_reason = "ROTATION:NO_DATA"
 
@@ -1044,7 +1113,7 @@ class PortfolioManager:
                 # pred_peak_days is in trading days (model trained on trading-day data).
                 if pred_peak_days is not None and pred_peak_days > 0:
                     peak_day = max(1, int(pred_peak_days))
-                    sell_dt = _add_trading_days(now, peak_day)
+                    sell_dt = _add_trading_days(now, peak_day, market=_market_for_ticker(t_norm))
                     expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day})"
                 else:
                     expected_sell = "N/A (peak signal pending)"
@@ -1074,7 +1143,8 @@ class PortfolioManager:
                 continue  # Already have a BUY/SELL action for this ticker
             p = open_by_ticker.get(t)
             px = float(prices_cad.get(t, float("nan")))
-            days = _trading_days_between(p.entry_date, now) if p else None
+            market = _market_for_ticker(t)
+            days = _trading_days_between(p.entry_date, now, market=market) if p else None
 
             in_target = t.upper() in target_set_upper
             hold_reason = "IN_TARGET" if in_target else "HOLDING"
@@ -1114,8 +1184,8 @@ class PortfolioManager:
 
             if entry_peak is not None or today_peak is not None:
                 # Convert trading-day offsets to actual calendar sell dates.
-                entry_sell_dt = _add_trading_days(p.entry_date, entry_peak) if entry_peak and p else None
-                today_sell_dt = _add_trading_days(now, today_peak) if today_peak else None
+                entry_sell_dt = _add_trading_days(p.entry_date, entry_peak, market=market) if entry_peak and p else None
+                today_sell_dt = _add_trading_days(now, today_peak, market=market) if today_peak else None
 
                 # Pick the earlier date (adaptive: react to new info)
                 if entry_sell_dt and today_sell_dt:
@@ -1132,7 +1202,7 @@ class PortfolioManager:
                     sell_dt = today_sell_dt
                     source = "updated"
 
-                days_left = _trading_days_between(now, sell_dt)
+                days_left = _trading_days_between(now, sell_dt, market=market)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} ({source}, {days_left}td left)"
             else:
                 expected_sell = "N/A (peak signal pending)"
@@ -1155,7 +1225,7 @@ class PortfolioManager:
         holdings["entry_price_cad"] = pd.NA
         for t, p in self._positions_by_ticker(state).items():
             if t in holdings.index:
-                holdings.loc[t, "days_held"] = int(_trading_days_between(p.entry_date, now))
+                holdings.loc[t, "days_held"] = int(_trading_days_between(p.entry_date, now, market=_market_for_ticker(t)))
                 holdings.loc[t, "entry_price_cad"] = float(p.entry_price)
 
         state.last_updated = now

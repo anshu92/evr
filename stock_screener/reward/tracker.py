@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from stock_screener.portfolio.manager import _trading_days_between
+from stock_screener.portfolio.manager import _market_for_ticker, _trading_days_between
 
 
 def _utcnow() -> datetime:
@@ -201,6 +201,7 @@ class ActionRewardLog:
                 days_elapsed = _trading_days_between(
                     _date_to_utc_datetime(e.date),
                     _date_to_utc_datetime(current_date),
+                    market=_market_for_ticker(e.ticker),
                 )
             except Exception:
                 # Fallback for malformed dates: keep prior calendar-day behavior.

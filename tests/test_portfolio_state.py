@@ -54,3 +54,13 @@ def test_load_state_converts_offset_datetimes_to_utc(tmp_path):
     assert state.last_updated.tzinfo is not None
     assert state.positions[0].entry_date.hour == 15
     assert state.positions[0].entry_date.tzinfo is not None
+
+
+def test_load_state_corrupt_json_falls_back_to_fresh_state(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("{not valid json", encoding="utf-8")
+
+    state = load_portfolio_state(path, initial_cash_cad=321.0)
+    assert state.cash_cad == 321.0
+    assert state.positions == []
+    assert state.last_updated.tzinfo is not None

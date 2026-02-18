@@ -150,6 +150,7 @@ class Config:
     momentum_decay_exit: bool = True  # Exit when return momentum decelerates
     extend_hold_min_pred_return: float | None = 0.03
     extend_hold_min_score: float | None = None
+    rotate_on_missing_data: bool = False  # If True, can rotate out holdings with no fresh prediction data
     portfolio_state_path: str = "screener_portfolio_state.json"
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
@@ -393,6 +394,7 @@ class Config:
             extend_hold_min_score=(
                 _get_float("EXTEND_HOLD_MIN_SCORE", 0.0) if os.getenv("EXTEND_HOLD_MIN_SCORE") not in {None, ""} else None
             ),
+            rotate_on_missing_data=_get_bool("ROTATE_ON_MISSING_DATA", False),
             portfolio_state_path=_get_str("PORTFOLIO_STATE_PATH", "screener_portfolio_state.json"),
             stop_loss_pct=(
                 _get_float("STOP_LOSS_PCT", 0.0) if os.getenv("STOP_LOSS_PCT") not in {None, ""} else None

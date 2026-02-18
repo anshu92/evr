@@ -79,8 +79,13 @@ def compute_dynamic_portfolio_size(
             count = max(1, min(max_positions, (screened["score"] >= threshold).sum()))
             logger.info("Dynamic sizing: No ML metrics, using score threshold, selecting %d positions", count)
             return count
-        logger.info("Dynamic sizing: No confidence/return/score data, defaulting to 5")
-        return 5
+        fallback = max(1, min(max_positions, 5))
+        logger.info(
+            "Dynamic sizing: No confidence/return/score data, defaulting to %d (max_positions=%d)",
+            fallback,
+            max_positions,
+        )
+        return fallback
     
     # Calculate quality score for each stock
     # Quality = weighted combination of confidence and predicted return percentile
@@ -142,6 +147,57 @@ def compute_dynamic_portfolio_size(
     )
     
     return dynamic_size
+
+
+def _lookup_frame_metric(
+    frame: pd.DataFrame | None,
+    ticker: str,
+    column: str,
+) -> float | None:
+    if frame is None or frame.empty or column not in frame.columns:
+        return None
+    t = str(ticker).strip()
+    if not t:
+        return None
+
+    for key in (t, t.upper()):
+        if key in frame.index:
+            val = frame.loc[key, column]
+            if isinstance(val, pd.Series):
+                val = val.iloc[0]
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(v):
+                continue
+            return v
+
+    t_upper = t.upper()
+    for i, idx_val in enumerate(frame.index):
+        if str(idx_val).upper() != t_upper:
+            continue
+        val = frame.iloc[i][column]
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(v):
+            return None
+        return v
+    return None
+
+
+def _lookup_metric_from_sources(
+    ticker: str,
+    column: str,
+    sources: list[pd.DataFrame | None],
+) -> float | None:
+    for frame in sources:
+        val = _lookup_frame_metric(frame, ticker, column)
+        if val is not None:
+            return val
+    return None
 
 
 def _extract_model_holdout_ic(model_metadata: dict[str, Any] | None) -> float | None:
@@ -1285,6 +1341,7 @@ def run_daily(cfg: Config, logger) -> None:
         peak_above_ma_ratio=cfg.peak_above_ma_ratio,
         min_trade_notional_cad=getattr(cfg, "min_trade_notional_cad", 15.0),
         min_rebalance_weight_delta=getattr(cfg, "min_rebalance_weight_delta", 0.015),
+        rotate_on_missing_data=getattr(cfg, "rotate_on_missing_data", False),
         logger=logger,
     )
     # Extract market volatility regime for dynamic holding period
@@ -1547,11 +1604,33 @@ def run_daily(cfg: Config, logger) -> None:
 
                     if entry_price and action.price_cad:
                         cum_ret = (action.price_cad - entry_price) / entry_price
+                        close_pred_return = _lookup_metric_from_sources(
+                            action.ticker,
+                            "pred_return",
+                            [screened, scored, features],
+                        )
+                        if close_pred_return is None and action.pred_return is not None:
+                            close_pred_return = float(action.pred_return)
+                        if (
+                            close_pred_return is None
+                            and pos is not None
+                            and getattr(pos, "entry_pred_return", None) is not None
+                        ):
+                            try:
+                                close_pred_return = float(pos.entry_pred_return)
+                            except (TypeError, ValueError):
+                                close_pred_return = None
+                        close_confidence = _lookup_metric_from_sources(
+                            action.ticker,
+                            "pred_confidence",
+                            [screened, scored, features],
+                        )
                         # Update or create an entry for the closed trade
                         new_entries.append(RewardEntry(
                             date=today_str,
                             ticker=action.ticker,
-                            predicted_return=float(screened.loc[action.ticker, "pred_return"]) if action.ticker in screened.index and "pred_return" in screened.columns else 0.0,
+                            predicted_return=float(close_pred_return) if close_pred_return is not None else 0.0,
+                            confidence=float(close_confidence) if close_confidence is not None else None,
                             realized_cumulative_return=cum_ret,
                             days_held=action.days_held,
                             exit_reason=action.reason,
@@ -1606,8 +1685,20 @@ def run_daily(cfg: Config, logger) -> None:
                 px = action.price_cad
                 if not px or pd.isna(px) or float(px) <= 0:
                     continue
-                pred_ret = float(action.pred_return) if action.pred_return is not None else 0.0
-                conf = float(screened.loc[action.ticker, "pred_confidence"]) if action.ticker in screened.index and "pred_confidence" in screened.columns else 0.0
+                pred_ret_val = float(action.pred_return) if action.pred_return is not None else None
+                if pred_ret_val is None:
+                    pred_ret_val = _lookup_metric_from_sources(
+                        action.ticker,
+                        "pred_return",
+                        [screened, scored, features],
+                    )
+                pred_ret = float(pred_ret_val) if pred_ret_val is not None else 0.0
+                conf_val = _lookup_metric_from_sources(
+                    action.ticker,
+                    "pred_confidence",
+                    [screened, scored, features],
+                )
+                conf = float(conf_val) if conf_val is not None else 0.0
                 entry_px = float(action.entry_price) if action.entry_price else None
 
                 # Look up stock volatility from features

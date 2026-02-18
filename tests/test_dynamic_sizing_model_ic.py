@@ -38,3 +38,11 @@ def test_dynamic_size_max_positions_is_capped_by_portfolio_size(monkeypatch):
     monkeypatch.setenv("PORTFOLIO_SIZE", "3")
     monkeypatch.setenv("DYNAMIC_SIZE_MAX_POSITIONS", "10")
     assert Config.from_env().dynamic_size_max_positions == 3
+
+
+def test_rotate_on_missing_data_defaults_off_and_reads_env(monkeypatch):
+    monkeypatch.delenv("ROTATE_ON_MISSING_DATA", raising=False)
+    assert Config.from_env().rotate_on_missing_data is False
+
+    monkeypatch.setenv("ROTATE_ON_MISSING_DATA", "1")
+    assert Config.from_env().rotate_on_missing_data is True

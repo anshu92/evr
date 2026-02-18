@@ -3,7 +3,11 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import pytest
 
-from stock_screener.portfolio.manager import PortfolioManager, TradeAction
+from stock_screener.portfolio.manager import (
+    PortfolioManager,
+    TradeAction,
+    _trading_days_between,
+)
 from stock_screener.portfolio.state import PortfolioState, Position
 
 
@@ -567,6 +571,7 @@ def test_rotation_buy_records_replaced_ticker(monkeypatch, tmp_path):
         peak_score_percentile_drop=None,
         peak_rsi_overbought=None,
         peak_above_ma_ratio=None,
+        rotate_on_missing_data=True,
         logger=logger,
     )
 
@@ -591,3 +596,61 @@ def test_rotation_buy_records_replaced_ticker(monkeypatch, tmp_path):
     assert len(buys) == 1
     assert len(sells) == 1
     assert buys[0].replaces_ticker == "OLD"
+
+
+def test_rotation_does_not_sell_missing_data_by_default(monkeypatch, tmp_path):
+    """Holdings absent from screened should not be auto-rotated by missing data alone."""
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 10, 15, 0, tzinfo=timezone.utc)
+    entry_date = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="OLD", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.02], "score": [0.9]}, index=["NEW"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["NEW"])
+    prices = pd.Series({"OLD": 101.0, "NEW": 100.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+
+    assert len([a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]) == 0
+    assert len([a for a in plan.actions if a.action == "HOLD" and a.ticker == "OLD"]) == 1
+
+
+def test_trading_days_between_uses_market_calendar():
+    """US and CA calendars should differ on market-specific holidays."""
+    start = datetime(2025, 8, 1, 15, 0, tzinfo=timezone.utc)  # Friday
+    end = datetime(2025, 8, 4, 15, 0, tzinfo=timezone.utc)  # Monday (Civic Holiday in CA)
+
+    assert _trading_days_between(start, end, market="US") == 1
+    assert _trading_days_between(start, end, market="CA") == 0

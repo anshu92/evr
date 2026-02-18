@@ -15,7 +15,10 @@ def _dt_from_iso(x: str | None) -> datetime | None:
     if not x:
         return None
     # Keep all timestamps timezone-aware and normalized to UTC.
-    dt = datetime.fromisoformat(x)
+    try:
+        dt = datetime.fromisoformat(str(x))
+    except (TypeError, ValueError):
+        return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -62,8 +65,17 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
     if not p.exists():
         return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
 
-    data = json.loads(p.read_text(encoding="utf-8"))
-    cash = float(data.get("cash_cad", initial_cash_cad))
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
+    if not isinstance(data, dict):
+        return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
+
+    try:
+        cash = float(data.get("cash_cad", initial_cash_cad))
+    except (TypeError, ValueError):
+        cash = float(initial_cash_cad)
     last_updated = _dt_from_iso(data.get("last_updated")) or _utcnow()
 
     positions: list[Position] = []
