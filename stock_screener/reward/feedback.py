@@ -35,8 +35,14 @@ def compute_online_ic(
     pred = np.array([e.predicted_return for e in valid])
     real = np.array([e.realized_1d_return for e in valid])
 
-    # Ensemble-level IC
-    ensemble_ic = float(spearmanr(pred, real).statistic)
+    # Ensemble-level IC (guard against undefined/NaN when inputs are constant)
+    pred_std = float(np.nanstd(pred))
+    real_std = float(np.nanstd(real))
+    if pred_std <= 0.0 or real_std <= 0.0:
+        ensemble_ic = None
+    else:
+        ensemble_stat = spearmanr(pred, real).statistic
+        ensemble_ic = float(ensemble_stat) if ensemble_stat is not None and np.isfinite(ensemble_stat) else None
 
     # Per-model ICs (if per_model_preds are stored)
     per_model_ics: list[float] | None = None
@@ -50,7 +56,12 @@ def compute_online_ic(
             per_model_ics = []
             for i in range(n_models):
                 model_preds = np.array([e.per_model_preds[i] for e in usable])  # type: ignore[index]
-                ic = float(spearmanr(model_preds, real_arr).statistic)
+                model_std = float(np.nanstd(model_preds))
+                if model_std <= 0.0 or float(np.nanstd(real_arr)) <= 0.0:
+                    ic = 0.0
+                else:
+                    ic_stat = spearmanr(model_preds, real_arr).statistic
+                    ic = float(ic_stat) if ic_stat is not None and np.isfinite(ic_stat) else 0.0
                 per_model_ics.append(ic)
 
     return {

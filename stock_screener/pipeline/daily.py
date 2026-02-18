@@ -751,47 +751,54 @@ def run_daily(cfg: Config, logger) -> None:
     _check_runtime_budget(started_utc, cfg, logger, "screening")
 
     alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
-    
-    # Compute fully dynamic portfolio size based on model metrics and predicted returns
-    # No base size - portfolio can range from 1 to max based on opportunity quality
-    if getattr(cfg, "dynamic_portfolio_sizing", True):
-        # Extract model IC from metadata (used to calibrate aggressiveness)
-        model_meta = run_meta.get("model", {}).get("metadata")
-        model_ic = _extract_model_holdout_ic(model_meta)
-        if model_ic is not None:
-            logger.info("Model holdout IC: %.4f (used for dynamic sizing)", model_ic)
-        
-        effective_portfolio_size = compute_dynamic_portfolio_size(
-            screened=screened,
-            min_confidence=getattr(cfg, "dynamic_size_min_confidence", 0.5),
-            min_pred_return=getattr(cfg, "dynamic_size_min_pred_return", 0.01),
-            max_positions=getattr(cfg, "dynamic_size_max_positions", 50),
-            model_ic=model_ic,
-            logger=logger,
-        )
-        run_meta["dynamic_portfolio_size"] = effective_portfolio_size
+
+    if screened.empty:
+        logger.warning("No screened tickers remain after entry filters; skipping new-entry weight construction.")
+        effective_portfolio_size = 0
+        target_weights = screened.copy()
+        if "weight" not in target_weights.columns:
+            target_weights["weight"] = pd.Series(dtype=float)
     else:
-        # Fallback to static portfolio_size when dynamic sizing disabled
-        effective_portfolio_size = cfg.portfolio_size
-    
-    # Compute portfolio weights with optional correlation awareness
-    if cfg.use_correlation_weights:
-        logger.info("Using correlation-aware risk parity weights")
-        target_weights = compute_correlation_aware_weights(
-            features=screened,
-            prices=prices,  # Need historical prices for covariance
-            portfolio_size=effective_portfolio_size,
-            weight_cap=cfg.weight_cap,
-            logger=logger,
-        )
-    else:
-        target_weights = compute_inverse_vol_weights(
-            features=screened,
-            portfolio_size=effective_portfolio_size,
-            weight_cap=cfg.weight_cap,
-            logger=logger,
-            alpha_col=alpha_col,
-        )
+        # Compute fully dynamic portfolio size based on model metrics and predicted returns
+        # No base size - portfolio can range from 1 to max based on opportunity quality
+        if getattr(cfg, "dynamic_portfolio_sizing", True):
+            # Extract model IC from metadata (used to calibrate aggressiveness)
+            model_meta = run_meta.get("model", {}).get("metadata")
+            model_ic = _extract_model_holdout_ic(model_meta)
+            if model_ic is not None:
+                logger.info("Model holdout IC: %.4f (used for dynamic sizing)", model_ic)
+
+            effective_portfolio_size = compute_dynamic_portfolio_size(
+                screened=screened,
+                min_confidence=getattr(cfg, "dynamic_size_min_confidence", 0.5),
+                min_pred_return=getattr(cfg, "dynamic_size_min_pred_return", 0.01),
+                max_positions=getattr(cfg, "dynamic_size_max_positions", 50),
+                model_ic=model_ic,
+                logger=logger,
+            )
+            run_meta["dynamic_portfolio_size"] = effective_portfolio_size
+        else:
+            # Fallback to static portfolio_size when dynamic sizing disabled
+            effective_portfolio_size = cfg.portfolio_size
+
+        # Compute portfolio weights with optional correlation awareness
+        if cfg.use_correlation_weights:
+            logger.info("Using correlation-aware risk parity weights")
+            target_weights = compute_correlation_aware_weights(
+                features=screened,
+                prices=prices,  # Need historical prices for covariance
+                portfolio_size=effective_portfolio_size,
+                weight_cap=cfg.weight_cap,
+                logger=logger,
+            )
+        else:
+            target_weights = compute_inverse_vol_weights(
+                features=screened,
+                portfolio_size=effective_portfolio_size,
+                weight_cap=cfg.weight_cap,
+                logger=logger,
+                alpha_col=alpha_col,
+            )
     
     # Optional single-pass constrained optimizer (replaces sequential transforms).
     unified_opt_enabled = bool(getattr(cfg, "unified_optimizer_enabled", True))
@@ -1296,7 +1303,7 @@ def run_daily(cfg: Config, logger) -> None:
     exited_sell_tickers = {
         str(a.ticker).upper()
         for a in exit_actions
-        if a.action == "SELL" and getattr(a, "ticker", None)
+        if a.action in ("SELL", "SELL_PARTIAL") and getattr(a, "ticker", None)
     }
     if exit_actions:
         sells = len([a for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")])
@@ -1499,15 +1506,47 @@ def run_daily(cfg: Config, logger) -> None:
                     event_type="PREDICTION",
                 ))
 
+            # Index closed positions by ticker (newest first) so each sell action
+            # can be matched to the most recent close instead of a stale old lot.
+            closed_positions_by_ticker: dict[str, list[Any]] = {}
+            dt_min_utc = datetime.min.replace(tzinfo=timezone.utc)
+            for p in state.positions:
+                if p.status == "OPEN" or not p.ticker:
+                    continue
+                key = str(p.ticker).upper()
+                closed_positions_by_ticker.setdefault(key, []).append(p)
+            for key in list(closed_positions_by_ticker.keys()):
+                closed_positions_by_ticker[key] = sorted(
+                    closed_positions_by_ticker[key],
+                    key=lambda p: p.exit_date if p.exit_date is not None else dt_min_utc,
+                    reverse=True,
+                )
+
             # Record closed positions from today's exits
             for action in trade_plan.actions:
                 if action.action in ("SELL", "SELL_PARTIAL"):
-                    pos = next(
-                        (p for p in state.positions if p.ticker == action.ticker and p.status != "OPEN"),
-                        None,
-                    )
-                    if pos and pos.entry_price and pos.entry_price > 0 and action.price_cad:
-                        cum_ret = (action.price_cad - pos.entry_price) / pos.entry_price
+                    ticker_key = str(action.ticker).upper()
+                    candidates = closed_positions_by_ticker.get(ticker_key, [])
+                    pos = None
+                    if candidates:
+                        # Prefer matching exit reason to avoid mismatching lots.
+                        reason_idx = next(
+                            (i for i, candidate in enumerate(candidates) if candidate.exit_reason == action.reason),
+                            None,
+                        )
+                        if reason_idx is not None:
+                            pos = candidates.pop(reason_idx)
+                        else:
+                            pos = candidates.pop(0)
+
+                    entry_price = None
+                    if pos and pos.entry_price and pos.entry_price > 0:
+                        entry_price = float(pos.entry_price)
+                    elif action.entry_price and action.entry_price > 0:
+                        entry_price = float(action.entry_price)
+
+                    if entry_price and action.price_cad:
+                        cum_ret = (action.price_cad - entry_price) / entry_price
                         # Update or create an entry for the closed trade
                         new_entries.append(RewardEntry(
                             date=today_str,
@@ -1516,7 +1555,7 @@ def run_daily(cfg: Config, logger) -> None:
                             realized_cumulative_return=cum_ret,
                             days_held=action.days_held,
                             exit_reason=action.reason,
-                            price_at_prediction=pos.entry_price,
+                            price_at_prediction=entry_price,
                             event_type="CLOSE",
                         ))
 

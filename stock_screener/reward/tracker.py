@@ -406,17 +406,29 @@ class RewardLog:
         prices_cad: pd.Series,
         date_str: str,
     ) -> int:
-        """Back-fill realized_1d_return for entries from the previous day.
+        """Back-fill realized_1d_return for the most recent unresolved prediction day.
 
-        For entries whose price_next_day is still None, fills it with the
-        current price and computes the 1-day return.  Returns count updated.
+        We intentionally update only one cohort (latest prior prediction date)
+        per run to avoid labeling stale multi-day moves as "1d" returns.
+        Returns count updated.
         """
+        pending_dates = sorted({
+            str(e.date)
+            for e in self.entries
+            if str(getattr(e, "event_type", "PREDICTION")).upper() == "PREDICTION"
+            and e.realized_1d_return is None
+            and str(e.date) < str(date_str)
+        })
+        if not pending_dates:
+            return 0
+        target_date = pending_dates[-1]
+
         updated = 0
         for e in self.entries:
             if str(e.event_type).upper() != "PREDICTION":
                 continue
-            if e.date == date_str:
-                continue  # Same day; skip -- return not yet realized
+            if str(e.date) != target_date:
+                continue
             if e.realized_1d_return is not None:
                 continue  # Already filled
             if e.price_at_prediction is None or e.price_at_prediction <= 0:

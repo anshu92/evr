@@ -63,12 +63,20 @@ def compute_inverse_vol_weights(
     if n <= 0:
         n = 20
     df = df.head(n).copy()
+    if df.empty:
+        out = features.head(0).copy()
+        out["weight"] = pd.Series(dtype=float)
+        logger.warning("No tickers available for weighting; returning empty weights.")
+        return out
 
     vol = pd.to_numeric(df["vol_60d_ann"], errors="coerce")
     vol = vol.replace([0.0, np.inf, -np.inf], np.nan).dropna()
     df = df.loc[vol.index].copy()
     if df.empty:
-        raise RuntimeError("No tickers with valid volatility for weighting")
+        out = features.head(0).copy()
+        out["weight"] = pd.Series(dtype=float)
+        logger.warning("No tickers with valid volatility for weighting; returning empty weights.")
+        return out
 
     inv = 1.0 / vol
     if alpha_col and alpha_col in df.columns:

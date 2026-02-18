@@ -317,6 +317,22 @@ class TestComputeOnlineIC:
         assert result["ensemble_ic"] is not None
         assert result["n_observations"] == 6
 
+    def test_constant_inputs_return_none_or_finite_values(self):
+        log = RewardLog()
+        for i in range(6):
+            log.append(RewardEntry(
+                date=f"2026-02-{i+1:02d}",
+                ticker=f"T{i}",
+                predicted_return=0.01,
+                realized_1d_return=0.01,
+                per_model_preds=[0.02, 0.02, 0.02],
+            ))
+
+        result = compute_online_ic(log, window=60)
+        assert result["ensemble_ic"] is None
+        if result["per_model_ics"] is not None:
+            assert all(np.isfinite(v) for v in result["per_model_ics"])
+
 
 class TestComputeEnsembleRewardWeights:
     def test_equal_ics(self):

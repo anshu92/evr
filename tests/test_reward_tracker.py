@@ -146,6 +146,20 @@ class TestRewardLog:
         updated = log.update_realized_returns(prices, date_str="2026-01-15")
         assert updated == 0  # Already has a realized return
 
+    def test_update_only_latest_unresolved_date(self):
+        log = RewardLog()
+        log.append(_make_entry(date="2026-01-10", ticker="OLD", price_at_prediction=100.0))
+        log.append(_make_entry(date="2026-01-14", ticker="NEW", price_at_prediction=200.0))
+
+        prices = pd.Series({"OLD": 110.0, "NEW": 210.0})
+        updated = log.update_realized_returns(prices, date_str="2026-01-15")
+        assert updated == 1
+
+        old = [e for e in log.entries if e.ticker == "OLD"][0]
+        new = [e for e in log.entries if e.ticker == "NEW"][0]
+        assert old.realized_1d_return is None
+        assert new.realized_1d_return is not None
+
     def test_closed_entries(self):
         log = RewardLog()
         log.append(_make_entry(ticker="AAPL"))

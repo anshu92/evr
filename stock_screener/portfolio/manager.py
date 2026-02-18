@@ -351,15 +351,21 @@ class PortfolioManager:
         reason: str,
         days_held: int,
         sell_portion: float,
-    ) -> tuple[TradeAction, Position]:
+    ) -> tuple[TradeAction, Position | None]:
         """Sell a portion of position, keeping the rest open."""
         shares_to_sell = max(0.01, round(p.shares * sell_portion, 4))  # Fractional shares
         shares_remaining = round(p.shares - shares_to_sell, 4)
         
         # Don't do partial sell if it would leave us with 0 shares
         if shares_remaining <= 0:
-            shares_to_sell = p.shares
-            shares_remaining = 0
+            full_action = self._sell_position(
+                state,
+                p,
+                price_cad=price_cad,
+                reason=f"PEAK_{reason}",
+                days_held=days_held,
+            )
+            return full_action, None
         
         # Execute partial sell
         proceeds = float(price_cad) * float(shares_to_sell)
@@ -727,7 +733,7 @@ class PortfolioManager:
                             days_held=days, sell_portion=self.peak_sell_portion_pct
                         )
                         actions.append(action)
-                        if remaining_pos.shares > 0:
+                        if remaining_pos is not None and remaining_pos.shares > 0:
                             keep.append(remaining_pos)
                         continue
 

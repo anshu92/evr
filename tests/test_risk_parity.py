@@ -34,6 +34,17 @@ def test_weight_cap_allows_cash_when_infeasible():
     assert weights.sum() <= 0.50 + 1e-9
 
 
+def test_inverse_vol_weights_empty_features_returns_empty():
+    out = compute_inverse_vol_weights(
+        features=pd.DataFrame(columns=["vol_60d_ann"]),
+        portfolio_size=5,
+        weight_cap=0.10,
+        logger=logging.getLogger("test"),
+    )
+    assert out.empty
+    assert "weight" in out.columns
+
+
 def test_max_position_cap_never_exceeds_cap():
     weights_df = pd.DataFrame({"weight": [0.9, 0.1]}, index=["A", "B"])
     out = apply_max_position_cap(weights_df, max_position_pct=0.20, logger=logging.getLogger("test"))

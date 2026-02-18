@@ -212,6 +212,52 @@ def test_portfolio_manager_peak_detection():
     assert actions[0].shares == 5  # 50% of 10
 
 
+def test_peak_full_liquidation_emits_sell(tmp_path):
+    """A 100% peak sell should be treated as a full SELL, not SELL_PARTIAL."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+    entry_date = now - timedelta(days=7)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=10,
+        max_holding_days_hard=20,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=True,
+        peak_sell_portion_pct=1.0,  # full liquidation
+        peak_min_gain_pct=0.05,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=-0.02,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=70.0,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="AAPL", entry_price=100.0, entry_date=entry_date, shares=2.0)],
+        last_updated=now,
+    )
+    prices = pd.Series({"AAPL": 110.0})
+    features = pd.DataFrame({"rsi_14": [75.0]}, index=["AAPL"])
+    pred_return = pd.Series({"AAPL": -0.03})
+
+    actions = manager.apply_exits(state, prices, pred_return=pred_return, features=features)
+
+    assert len(actions) == 1
+    assert actions[0].action == "SELL"
+    assert actions[0].reason.startswith("PEAK_")
+    assert len([p for p in state.positions if p.status == "OPEN"]) == 0
+
+
 def test_fractional_buy_when_cash_below_share_price(tmp_path):
     """Allow fractional entry even when cash is below one full share price."""
     logger = logging.getLogger("test")
