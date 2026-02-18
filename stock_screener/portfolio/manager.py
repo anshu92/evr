@@ -529,6 +529,7 @@ class PortfolioManager:
         
         # Update position to reduced shares
         p.shares = shares_remaining
+        p.last_partial_sell_at = _utcnow()
         entry_px = float(p.entry_price) if p.entry_price else None
         realized_gain = ((price_cad / entry_px) - 1.0) if entry_px and entry_px > 0 else None
         
@@ -908,6 +909,15 @@ class PortfolioManager:
                     )
                     
                     if is_peak:
+                        if p.last_partial_sell_at is not None:
+                            since_last = _trading_days_between(
+                                p.last_partial_sell_at,
+                                now,
+                                market=market,
+                            )
+                            if since_last < 1:
+                                keep.append(p)
+                                continue
                         potential_shares = max(0.01, round(p.shares * self.peak_sell_portion_pct, 4))
                         if float(potential_shares) * float(px) < self.min_trade_notional_cad:
                             keep.append(p)
@@ -989,6 +999,29 @@ class PortfolioManager:
                     if "score" in ticker_data.columns:
                         ticker_score = ticker_data["score"].iloc[0]
                         score_pct = (screened["score"] < ticker_score).mean() if "score" in screened.columns else None
+                if pred_ret is None:
+                    for source in (scored, features):
+                        if source is None or source.empty or t not in source.index or "pred_return" not in source.columns:
+                            continue
+                        val = source.loc[t, "pred_return"]
+                        if isinstance(val, pd.Series):
+                            val = val.iloc[0]
+                        if val is not None and not pd.isna(val):
+                            pred_ret = float(val)
+                            break
+                if score_pct is None:
+                    for source in (scored, features):
+                        if source is None or source.empty or t not in source.index or "score" not in source.columns:
+                            continue
+                        ticker_score = source.loc[t, "score"]
+                        if isinstance(ticker_score, pd.Series):
+                            ticker_score = ticker_score.iloc[0]
+                        if ticker_score is None or pd.isna(ticker_score):
+                            continue
+                        all_scores = pd.to_numeric(source["score"], errors="coerce").dropna()
+                        if len(all_scores) > 0:
+                            score_pct = float((all_scores < float(ticker_score)).mean())
+                            break
                 
                 # Decide whether to rotate: only sell if one of these conditions is met
                 should_rotate = False

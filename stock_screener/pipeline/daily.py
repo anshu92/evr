@@ -396,7 +396,10 @@ def _apply_rebalance_controls(
     if dyn_enabled and market_vol_regime is not None and pd.notna(market_vol_regime):
         vol_stress = float(max(0.0, min(1.0, (float(market_vol_regime) - 1.0) / 0.8)))
 
-    for t in set(adjusted.index.astype(str)).union(current_weights.keys()):
+    all_tickers = sorted(
+        {str(t) for t in adjusted.index.astype(str)}.union(str(t) for t in current_weights.keys())
+    )
+    for t in all_tickers:
         tgt_w = float(adjusted.loc[t, "weight"]) if t in adjusted.index and "weight" in adjusted.columns else 0.0
         cur_w = float(current_weights.get(t, 0.0))
         delta = abs(tgt_w - cur_w)
@@ -481,6 +484,30 @@ def _compute_open_position_values(
     return values
 
 
+def _resolve_portfolio_state_path(
+    raw_path: str,
+    *,
+    repo_root: Path | None = None,
+    cwd: Path | None = None,
+) -> Path:
+    """Resolve portfolio state path consistently across run contexts.
+
+    Relative paths are anchored to repo root by default. For backward compatibility,
+    if only the current working directory candidate exists, we keep using it.
+    """
+    p = Path(str(raw_path)).expanduser()
+    if p.is_absolute():
+        return p
+
+    root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
+    cur = cwd if cwd is not None else Path.cwd()
+    repo_candidate = (root / p).resolve()
+    cwd_candidate = (cur / p).resolve()
+    if cwd_candidate.exists() and not repo_candidate.exists():
+        return cwd_candidate
+    return repo_candidate
+
+
 def _build_price_history_cad(prices: pd.DataFrame, fx_usdcad: pd.Series) -> pd.DataFrame:
     """Build ticker->CAD close history aligned to trading days for reward backfills."""
     if prices.empty or not isinstance(prices.columns, pd.MultiIndex):
@@ -514,6 +541,7 @@ def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
     started_utc = datetime.now(tz=timezone.utc)
+    state_path = _resolve_portfolio_state_path(cfg.portfolio_state_path)
     cache_dir = ensure_dir(cfg.cache_dir)
     data_cache_dir = ensure_dir(cfg.data_cache_dir)
     reports_dir = ensure_dir(cfg.reports_dir)
@@ -522,6 +550,7 @@ def run_daily(cfg: Config, logger) -> None:
     run_meta: dict[str, Any] = {
         "run_utc": datetime.now(tz=timezone.utc).isoformat(),
         "config": asdict(cfg),
+        "portfolio_state_path": str(state_path),
     }
 
     us = fetch_us_universe(cfg=cfg, cache_dir=cache_dir, logger=logger)
@@ -905,7 +934,7 @@ def run_daily(cfg: Config, logger) -> None:
     # Load portfolio state once before optimization so optimizer and execution
     # share the same migrated/current holdings view.
     state = load_portfolio_state(
-        cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad
+        state_path, initial_cash_cad=cfg.portfolio_budget_cad
     )
     # Migration safeguard:
     # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,
@@ -914,7 +943,9 @@ def run_daily(cfg: Config, logger) -> None:
     try:
         budget = float(cfg.portfolio_budget_cad)
         open_positions = [p for p in state.positions if p.status == "OPEN"]
-        legacy_placeholder = bool(open_positions) and all(int(p.shares) == 1 for p in open_positions)
+        legacy_placeholder = bool(open_positions) and all(
+            abs(float(p.shares) - 1.0) < 1e-9 for p in open_positions
+        )
         if budget > 0 and legacy_placeholder and float(state.cash_cad) >= budget * 25.0:
             logger.warning(
                 "Portfolio state appears legacy (cash_cad=%s, budget_cad=%s, open_positions=%s). "
@@ -927,7 +958,7 @@ def run_daily(cfg: Config, logger) -> None:
             state.positions = []
             state.pnl_history = []
             state.last_updated = datetime.now(tz=timezone.utc)
-            save_portfolio_state(cfg.portfolio_state_path, state)
+            save_portfolio_state(state_path, state)
     except Exception as e:
         logger.warning("Could not evaluate/reset legacy portfolio state: %s", e)
 
@@ -1352,7 +1383,7 @@ def run_daily(cfg: Config, logger) -> None:
         )
 
     pm = PortfolioManager(
-        state_path=cfg.portfolio_state_path,
+        state_path=str(state_path),
         max_holding_days=cfg.max_holding_days,
         max_holding_days_hard=cfg.max_holding_days_hard,
         extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
@@ -1421,7 +1452,7 @@ def run_daily(cfg: Config, logger) -> None:
         # Persist state immediately after exits so position closures and cash
         # updates are not lost if the pipeline crashes before build_trade_plan.
         try:
-            save_portfolio_state(cfg.portfolio_state_path, state)
+            save_portfolio_state(state_path, state)
         except Exception as e:
             logger.warning("Could not save portfolio state after exits: %s", e)
 
@@ -1467,10 +1498,20 @@ def run_daily(cfg: Config, logger) -> None:
     # Merge exit-based SELL actions (PEAK_TARGET, STOP_LOSS, etc.) into the
     # trade plan so they appear in the report and email.  Place sells first.
     if exit_actions:
+        exit_sell_tickers = {
+            a.ticker
+            for a in exit_actions
+            if a.action in ("SELL", "SELL_PARTIAL")
+        }
+        base_actions = [
+            a
+            for a in trade_plan.actions
+            if not (a.action == "HOLD" and a.ticker in exit_sell_tickers)
+        ]
         # Avoid duplicates: build_trade_plan may also generate ROTATION sells
         # for the same tickers that apply_exits already closed.
         existing_sell_tickers = {
-            a.ticker for a in trade_plan.actions
+            a.ticker for a in base_actions
             if a.action in ("SELL", "SELL_PARTIAL")
         }
         new_sells = [
@@ -1479,7 +1520,12 @@ def run_daily(cfg: Config, logger) -> None:
         ]
         if new_sells:
             trade_plan = TradePlan(
-                actions=new_sells + trade_plan.actions,
+                actions=new_sells + base_actions,
+                holdings=trade_plan.holdings,
+            )
+        else:
+            trade_plan = TradePlan(
+                actions=base_actions,
                 holdings=trade_plan.holdings,
             )
 

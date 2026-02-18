@@ -311,6 +311,58 @@ def test_peak_detection_allows_fractional_partial_sell(tmp_path):
     assert open_positions[0].shares == pytest.approx(0.75)
 
 
+def test_peak_partial_sell_respects_same_day_cooldown(monkeypatch, tmp_path):
+    """Do not repeatedly partial-sell the same position in same trading day."""
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 10, 15, 0, tzinfo=timezone.utc)
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=10,
+        max_holding_days_hard=20,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=True,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=0.05,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=-0.02,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=70.0,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[
+            Position(
+                ticker="AAPL",
+                entry_price=100.0,
+                entry_date=entry_date,
+                shares=2.0,
+                last_partial_sell_at=now,  # same-day prior partial sell
+            )
+        ],
+        last_updated=now,
+    )
+    prices = pd.Series({"AAPL": 110.0})
+    features = pd.DataFrame({"rsi_14": [75.0]}, index=["AAPL"])
+    pred_return = pd.Series({"AAPL": -0.03})
+
+    actions = manager.apply_exits(state, prices, pred_return=pred_return, features=features)
+    assert actions == []
+    assert state.positions[0].shares == pytest.approx(2.0)
+
+
 def test_build_trade_plan_consolidates_duplicate_open_lots(tmp_path):
     """Duplicate open lots for the same ticker should be consolidated deterministically."""
     logger = logging.getLogger("test")
@@ -692,6 +744,59 @@ def test_rotation_does_not_sell_missing_data_by_default(monkeypatch, tmp_path):
 
     assert len([a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]) == 0
     assert len([a for a in plan.actions if a.action == "HOLD" and a.ticker == "OLD"]) == 1
+
+
+def test_rotation_uses_feature_prediction_for_out_of_screen_holdings(monkeypatch, tmp_path):
+    """Out-of-screen holdings should rotate on negative live prediction from features."""
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 10, 15, 0, tzinfo=timezone.utc)
+    entry_date = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="OLD", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    # OLD is not in screened/top-N set.
+    screened = pd.DataFrame({"pred_return": [0.02], "score": [0.9]}, index=["NEW"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["NEW"])
+    prices = pd.Series({"OLD": 101.0, "NEW": 100.0})
+    features = pd.DataFrame({"pred_return": [-0.05]}, index=["OLD"])
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+        features=features,
+    )
+
+    sells = [a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]
+    assert len(sells) == 1
+    assert sells[0].reason == "ROTATION:NEG_PRED"
 
 
 def test_trading_days_between_uses_market_calendar():

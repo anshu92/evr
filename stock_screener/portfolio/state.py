@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
+
+try:
+    import fcntl  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 
 def _utcnow() -> datetime:
@@ -34,6 +42,64 @@ def _opt_float(x: Any) -> float | None:
     return v
 
 
+def _backup_path(path: Path) -> Path:
+    return Path(str(path) + ".bak")
+
+
+@contextmanager
+def _state_lock(path: Path, *, exclusive: bool):
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(fh.fileno(), mode)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        fh.close()
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except OSError:
+            pass
+
+
 @dataclass
 class Position:
     ticker: str
@@ -49,6 +115,7 @@ class Position:
     highest_price: float | None = None  # Peak price for trailing stop
     entry_pred_peak_days: float | None = None  # Predicted peak day at entry
     entry_pred_return: float | None = None  # Predicted return at entry (for sell target)
+    last_partial_sell_at: datetime | None = None  # Cooldown marker for repeated partial exits
 
     def days_held(self, now: datetime | None = None) -> int:
         n = now or _utcnow()
@@ -72,14 +139,15 @@ class PortfolioState:
 def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> PortfolioState:
     """Load portfolio state or create a new one."""
     p = Path(path)
-    if not p.exists():
+    bkp = _backup_path(p)
+    if not p.exists() and not bkp.exists():
         return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
 
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, ValueError):
-        return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
-    if not isinstance(data, dict):
+    with _state_lock(p, exclusive=False):
+        data = _read_json_dict(p)
+        if data is None:
+            data = _read_json_dict(bkp)
+    if data is None:
         return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
 
     try:
@@ -111,6 +179,7 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
             highest_price=_opt_float(raw.get("highest_price")),
             entry_pred_peak_days=_opt_float(raw.get("entry_pred_peak_days")),
             entry_pred_return=_opt_float(raw.get("entry_pred_return")),
+            last_partial_sell_at=_dt_from_iso(raw.get("last_partial_sell_at")),
         )
         if pos.ticker and pos.shares > 0:
             positions.append(pos)
@@ -148,13 +217,16 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
 def save_portfolio_state(path: str | Path, state: PortfolioState) -> None:
     """Save portfolio state to JSON."""
     p = Path(path)
+    bkp = _backup_path(p)
     obj: dict[str, Any] = asdict(state)
     obj["last_updated"] = state.last_updated.isoformat()
     for pos, raw in zip(state.positions, obj.get("positions", [])):
         raw["entry_date"] = pos.entry_date.isoformat()
         raw["exit_date"] = pos.exit_date.isoformat() if pos.exit_date else None
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    payload = json.dumps(obj, indent=2, sort_keys=True)
+    with _state_lock(p, exclusive=True):
+        _atomic_write_text(p, payload)
+        _atomic_write_text(bkp, payload)
 
 
 def compute_portfolio_drawdown(state: PortfolioState) -> dict[str, float]:

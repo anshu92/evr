@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timezone, timedelta
 
 from stock_screener.portfolio.manager import _trading_days_between
-from stock_screener.portfolio.state import load_portfolio_state
+from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, PortfolioState, Position
 
 
 def test_load_state_normalizes_naive_datetimes_to_utc(tmp_path):
@@ -95,3 +95,29 @@ def test_load_state_skips_malformed_position_numerics(tmp_path):
     assert state.positions[0].ticker == "AAPL"
     assert state.positions[0].entry_price == 100.5
     assert state.positions[0].shares == 1.25
+
+
+def test_load_state_uses_backup_when_primary_corrupt(tmp_path):
+    path = tmp_path / "state.json"
+    now = datetime.now(tz=timezone.utc)
+    state = PortfolioState(
+        cash_cad=777.0,
+        positions=[
+            Position(
+                ticker="AAPL",
+                entry_price=123.0,
+                entry_date=now,
+                shares=1.5,
+            )
+        ],
+        last_updated=now,
+    )
+    save_portfolio_state(path, state)
+    # Corrupt primary file but keep backup intact.
+    path.write_text("{broken json", encoding="utf-8")
+
+    loaded = load_portfolio_state(path, initial_cash_cad=100.0)
+    assert loaded.cash_cad == 777.0
+    assert len(loaded.positions) == 1
+    assert loaded.positions[0].ticker == "AAPL"
+    assert loaded.positions[0].shares == 1.5
