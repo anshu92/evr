@@ -43,7 +43,11 @@ def score_universe(
             logger.info("Vol cap (%.0f%%): removed %d tickers", max_volatility * 100, dropped)
 
     if df.empty:
-        raise RuntimeError("No tickers left after liquidity/price/vol filters")
+        if logger:
+            logger.warning("No tickers left after liquidity/price/vol filters")
+        out = features.iloc[0:0].copy()
+        out["score"] = pd.Series(dtype=float)
+        return out
 
     # Score:
     # - If ML predictions are available, blend them in as the primary alpha term.
@@ -285,4 +289,3 @@ def apply_entry_filters(
         )
     
     return filtered, stats
-

@@ -696,6 +696,11 @@ class PortfolioManager:
         now = _utcnow()
         open_positions: list[Position] = [p for p in state.positions if p.status == "OPEN"]
         keep: list[Position] = []
+        adjusted_max_hold, _ = self.compute_dynamic_holding_days(market_vol_regime)
+        age_urgency_start = self.age_urgency_start_day
+        if self.dynamic_holding_enabled and self.max_holding_days > 0:
+            ratio = float(adjusted_max_hold) / float(self.max_holding_days)
+            age_urgency_start = max(1, int(round(float(self.age_urgency_start_day) * ratio)))
 
         for p in open_positions:
             px = float(prices_cad.get(p.ticker, float("nan")))
@@ -787,11 +792,15 @@ class PortfolioManager:
                     if daily_return < self.min_daily_return:
                         self.logger.info(
                             "%s low daily return: %.2f%% total / %d days = %.2f%%/day (min: %.2f%%)",
-                            p.ticker, gain * 100, days, daily_return * 100, self.min_daily_return * 100
+                            p.ticker,
+                            gain * 100,
+                            days,
+                            daily_return * 100,
+                            self.min_daily_return * 100,
                         )
                         actions.append(self._sell_position(state, p, price_cad=px, reason="LOW_DAILY_RETURN", days_held=days))
                         continue
-                
+
                 # Momentum decay: exit if we're past peak and velocity is slowing
                 if self.momentum_decay_exit and p.highest_price and p.highest_price > p.entry_price:
                     current_gain = gain
@@ -805,6 +814,19 @@ class PortfolioManager:
                         )
                         actions.append(self._sell_position(state, p, price_cad=px, reason="MOMENTUM_DECAY", days_held=days))
                         continue
+
+            # Age urgency: once a position is old enough, require a minimum
+            # absolute gain floor to keep capital efficient.
+            if self.age_urgency_enabled and days >= age_urgency_start and ret < self.age_urgency_min_return:
+                self.logger.info(
+                    "%s age urgency: %.2f%% gain after %d trading days (< %.2f%% minimum)",
+                    p.ticker,
+                    ret * 100,
+                    days,
+                    self.age_urgency_min_return * 100,
+                )
+                actions.append(self._sell_position(state, p, price_cad=px, reason="AGE_URGENCY", days_held=days))
+                continue
 
             # Trailing stop: update highest price and check trailing stop trigger
             if self.trailing_stop_enabled and p.entry_price > 0:
@@ -885,7 +907,7 @@ class PortfolioManager:
                         days_held=days,
                     )
                     
-                    if is_peak and p.shares >= 2:  # Only do partial sell if we have at least 2 shares
+                    if is_peak:
                         potential_shares = max(0.01, round(p.shares * self.peak_sell_portion_pct, 4))
                         if float(potential_shares) * float(px) < self.min_trade_notional_cad:
                             keep.append(p)

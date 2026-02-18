@@ -264,6 +264,53 @@ def test_peak_full_liquidation_emits_sell(tmp_path):
     assert len([p for p in state.positions if p.status == "OPEN"]) == 0
 
 
+def test_peak_detection_allows_fractional_partial_sell(tmp_path):
+    """Peak partial exits should work for fractional positions below 2 shares."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+    entry_date = now - timedelta(days=7)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=10,
+        max_holding_days_hard=20,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=True,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=0.05,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=-0.02,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=70.0,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="AAPL", entry_price=100.0, entry_date=entry_date, shares=1.5)],
+        last_updated=now,
+    )
+    prices = pd.Series({"AAPL": 110.0})
+    features = pd.DataFrame({"rsi_14": [75.0]}, index=["AAPL"])
+    pred_return = pd.Series({"AAPL": -0.03})
+
+    actions = manager.apply_exits(state, prices, pred_return=pred_return, features=features)
+    assert len(actions) == 1
+    assert actions[0].action == "SELL_PARTIAL"
+    assert actions[0].shares == pytest.approx(0.75)
+    open_positions = [p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]
+    assert len(open_positions) == 1
+    assert open_positions[0].shares == pytest.approx(0.75)
+
+
 def test_build_trade_plan_consolidates_duplicate_open_lots(tmp_path):
     """Duplicate open lots for the same ticker should be consolidated deterministically."""
     logger = logging.getLogger("test")

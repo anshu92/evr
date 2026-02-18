@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from stock_screener.portfolio.manager import _market_for_ticker, _trading_days_between
+from stock_screener.portfolio.manager import _add_trading_days, _market_for_ticker, _trading_days_between
 
 
 def _utcnow() -> datetime:
@@ -182,6 +182,8 @@ class ActionRewardLog:
         self,
         prices_cad: pd.Series,
         current_date: str,
+        *,
+        price_history_cad: pd.DataFrame | None = None,
     ) -> int:
         """Back-fill post-action prices, rotation returns, and derived metrics.
 
@@ -189,6 +191,54 @@ class ActionRewardLog:
         returns, selection alpha, and confidence calibration once enough
         data is available.  Returns count of fields updated.
         """
+        history = None
+        history_col_map: dict[str, str] = {}
+        current_day = pd.Timestamp(current_date)
+        if current_day.tzinfo is not None:
+            current_day = current_day.tz_convert("UTC").tz_localize(None)
+        current_day = current_day.normalize()
+        if price_history_cad is not None and not price_history_cad.empty:
+            history = price_history_cad.copy()
+            idx = pd.to_datetime(history.index)
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert("UTC").tz_localize(None)
+            history.index = idx.normalize()
+            history = history[~history.index.duplicated(keep="last")].sort_index()
+            history_col_map = {str(c).upper(): str(c) for c in history.columns}
+
+        def _history_horizon_price(ticker: str, action_date: str, horizon_td: int) -> float | None:
+            if history is None or horizon_td <= 0:
+                return None
+            ticker_norm = str(ticker).strip().upper()
+            if not ticker_norm:
+                return None
+            col = history_col_map.get(ticker_norm)
+            if col is None:
+                return None
+            try:
+                start_dt = _date_to_utc_datetime(action_date)
+                target_dt = _add_trading_days(start_dt, int(horizon_td), market=_market_for_ticker(ticker_norm))
+            except Exception:
+                return None
+            target_day = pd.Timestamp(target_dt)
+            if target_day.tzinfo is not None:
+                target_day = target_day.tz_convert("UTC").tz_localize(None)
+            target_day = target_day.normalize()
+            series = pd.to_numeric(history[col], errors="coerce")
+            val = series.get(target_day)
+            if val is not None and not pd.isna(val) and float(val) > 0:
+                return float(val)
+            future = series.loc[series.index >= target_day].dropna()
+            if future.empty:
+                return None
+            candidate_day = future.index[0]
+            if candidate_day > current_day:
+                return None
+            candidate_px = float(future.iloc[0])
+            if pd.isna(candidate_px) or candidate_px <= 0:
+                return None
+            return candidate_px
+
         updated = 0
         for e in self.entries:
             if e.price_at_action is None or e.price_at_action <= 0:
@@ -208,16 +258,22 @@ class ActionRewardLog:
                 days_elapsed = (pd.Timestamp(current_date) - pd.Timestamp(e.date)).days
 
             if days_elapsed >= 1 and e.price_1d_after is None:
-                e.price_1d_after = px_f
-                e.return_1d = (px_f - e.price_at_action) / e.price_at_action
+                horizon_px = _history_horizon_price(e.ticker, e.date, 1)
+                px_1d = horizon_px if horizon_px is not None else px_f
+                e.price_1d_after = px_1d
+                e.return_1d = (px_1d - e.price_at_action) / e.price_at_action
                 updated += 1
             if days_elapsed >= 3 and e.price_3d_after is None:
-                e.price_3d_after = px_f
-                e.return_3d = (px_f - e.price_at_action) / e.price_at_action
+                horizon_px = _history_horizon_price(e.ticker, e.date, 3)
+                px_3d = horizon_px if horizon_px is not None else px_f
+                e.price_3d_after = px_3d
+                e.return_3d = (px_3d - e.price_at_action) / e.price_at_action
                 updated += 1
             if days_elapsed >= 5 and e.price_5d_after is None:
-                e.price_5d_after = px_f
-                e.return_5d = (px_f - e.price_at_action) / e.price_at_action
+                horizon_px = _history_horizon_price(e.ticker, e.date, 5)
+                px_5d = horizon_px if horizon_px is not None else px_f
+                e.price_5d_after = px_5d
+                e.return_5d = (px_5d - e.price_at_action) / e.price_at_action
                 updated += 1
 
                 # ---- Classify action quality ----
@@ -233,14 +289,22 @@ class ActionRewardLog:
 
                 # ---- Rotation counterpart return ----
                 if e.replaced_by_ticker and e.replaced_by_price and e.replaced_by_price > 0:
-                    rpl_px = prices_cad.get(e.replaced_by_ticker)
-                    if rpl_px is not None and not pd.isna(rpl_px) and float(rpl_px) > 0:
+                    rpl_px = _history_horizon_price(e.replaced_by_ticker, e.date, 5)
+                    if rpl_px is None:
+                        rpl_px_raw = prices_cad.get(e.replaced_by_ticker)
+                        if rpl_px_raw is not None and not pd.isna(rpl_px_raw) and float(rpl_px_raw) > 0:
+                            rpl_px = float(rpl_px_raw)
+                    if rpl_px is not None and float(rpl_px) > 0:
                         e.replaced_by_return_5d = (float(rpl_px) - e.replaced_by_price) / e.replaced_by_price
                         e.rotation_alpha = e.replaced_by_return_5d - e.return_5d
                         updated += 1
                 if e.replaced_ticker and e.replaced_price and e.replaced_price > 0:
-                    rpl_px = prices_cad.get(e.replaced_ticker)
-                    if rpl_px is not None and not pd.isna(rpl_px) and float(rpl_px) > 0:
+                    rpl_px = _history_horizon_price(e.replaced_ticker, e.date, 5)
+                    if rpl_px is None:
+                        rpl_px_raw = prices_cad.get(e.replaced_ticker)
+                        if rpl_px_raw is not None and not pd.isna(rpl_px_raw) and float(rpl_px_raw) > 0:
+                            rpl_px = float(rpl_px_raw)
+                    if rpl_px is not None and float(rpl_px) > 0:
                         e.replaced_return_5d = (float(rpl_px) - e.replaced_price) / e.replaced_price
                         # For BUY: rotation_alpha = our return - what the sold stock did
                         e.rotation_alpha = e.return_5d - e.replaced_return_5d

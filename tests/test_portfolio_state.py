@@ -64,3 +64,34 @@ def test_load_state_corrupt_json_falls_back_to_fresh_state(tmp_path):
     assert state.cash_cad == 321.0
     assert state.positions == []
     assert state.last_updated.tzinfo is not None
+
+
+def test_load_state_skips_malformed_position_numerics(tmp_path):
+    path = tmp_path / "state.json"
+    payload = {
+        "cash_cad": 500.0,
+        "last_updated": "2025-01-06T15:00:00Z",
+        "positions": [
+            {
+                "ticker": "BAD",
+                "entry_price": "oops",
+                "entry_date": "2025-01-03T15:00:00Z",
+                "shares": 1.0,
+                "status": "OPEN",
+            },
+            {
+                "ticker": "AAPL",
+                "entry_price": "100.5",
+                "entry_date": "2025-01-03T15:00:00Z",
+                "shares": "1.25",
+                "status": "OPEN",
+            },
+        ],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    state = load_portfolio_state(path)
+    assert len(state.positions) == 1
+    assert state.positions[0].ticker == "AAPL"
+    assert state.positions[0].entry_price == 100.5
+    assert state.positions[0].shares == 1.25

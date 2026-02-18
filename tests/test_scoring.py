@@ -48,3 +48,16 @@ def test_score_universe_filters_and_order():
     )
     assert len(screened) == 2
     assert list(screened.index) == list(scored.index[:2])
+
+
+def test_score_universe_empty_after_filters_returns_empty_frame():
+    logger = logging.getLogger("test")
+    df = _base_features()
+    scored = score_universe(
+        features=df,
+        min_price_cad=1_000.0,
+        min_avg_dollar_volume_cad=1_000_000_000.0,
+        logger=logger,
+    )
+    assert scored.empty
+    assert "score" in scored.columns

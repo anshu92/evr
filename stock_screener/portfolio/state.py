@@ -24,6 +24,16 @@ def _dt_from_iso(x: str | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _opt_float(x: Any) -> float | None:
+    if x is None:
+        return None
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v
+
+
 @dataclass
 class Position:
     ticker: str
@@ -83,20 +93,24 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
         if not isinstance(raw, dict):
             continue
         entry_date = raw.get("entry_date")
+        entry_price = _opt_float(raw.get("entry_price", 0.0))
+        shares = _opt_float(raw.get("shares", 0))
+        if entry_price is None or shares is None:
+            continue
         pos = Position(
             ticker=str(raw.get("ticker", "")).upper(),
-            entry_price=float(raw.get("entry_price", 0.0)),
+            entry_price=float(entry_price),
             entry_date=_dt_from_iso(entry_date) or _utcnow(),
-            shares=float(raw.get("shares", 0)),  # Fractional shares supported
-            stop_loss_pct=raw.get("stop_loss_pct"),
-            take_profit_pct=raw.get("take_profit_pct"),
+            shares=float(shares),  # Fractional shares supported
+            stop_loss_pct=_opt_float(raw.get("stop_loss_pct")),
+            take_profit_pct=_opt_float(raw.get("take_profit_pct")),
             status=str(raw.get("status", "OPEN")),
-            exit_price=raw.get("exit_price"),
+            exit_price=_opt_float(raw.get("exit_price")),
             exit_date=_dt_from_iso(raw.get("exit_date")),
             exit_reason=raw.get("exit_reason"),
-            highest_price=raw.get("highest_price"),
-            entry_pred_peak_days=raw.get("entry_pred_peak_days"),
-            entry_pred_return=raw.get("entry_pred_return"),
+            highest_price=_opt_float(raw.get("highest_price")),
+            entry_pred_peak_days=_opt_float(raw.get("entry_pred_peak_days")),
+            entry_pred_return=_opt_float(raw.get("entry_pred_return")),
         )
         if pos.ticker and pos.shares > 0:
             positions.append(pos)

@@ -464,6 +464,52 @@ def _apply_rebalance_controls(
     return adjusted.sort_values("weight", ascending=False)
 
 
+def _compute_open_position_values(
+    state,
+    prices_cad: pd.Series,
+) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for p in state.positions:
+        if p.status != "OPEN" or not p.ticker or p.shares <= 0:
+            continue
+        px = float(prices_cad.get(p.ticker, float("nan")))
+        if pd.isna(px) or px <= 0:
+            px = float(getattr(p, "entry_price", 0.0) or 0.0)
+        if px <= 0:
+            continue
+        values[p.ticker] = values.get(p.ticker, 0.0) + (float(px) * float(p.shares))
+    return values
+
+
+def _build_price_history_cad(prices: pd.DataFrame, fx_usdcad: pd.Series) -> pd.DataFrame:
+    """Build ticker->CAD close history aligned to trading days for reward backfills."""
+    if prices.empty or not isinstance(prices.columns, pd.MultiIndex):
+        return pd.DataFrame()
+    idx = pd.to_datetime(prices.index).sort_values()
+    if idx.empty:
+        return pd.DataFrame()
+
+    fx = pd.to_numeric(fx_usdcad, errors="coerce").copy()
+    fx.index = pd.to_datetime(fx.index)
+    fx = fx.reindex(idx).ffill()
+
+    out: dict[str, pd.Series] = {}
+    tickers = list(dict.fromkeys(str(t) for t in prices.columns.get_level_values(0)))
+    for t in tickers:
+        col = (t, "Close")
+        if col not in prices.columns:
+            continue
+        close = pd.to_numeric(prices[col], errors="coerce")
+        is_tsx = str(t).upper().endswith(".TO") or str(t).upper().endswith(".V")
+        if is_tsx:
+            out[t] = close
+        else:
+            out[t] = close * fx
+    if not out:
+        return pd.DataFrame(index=idx)
+    return pd.DataFrame(out, index=idx).sort_index()
+
+
 def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
@@ -856,31 +902,56 @@ def run_daily(cfg: Config, logger) -> None:
                 alpha_col=alpha_col,
             )
     
+    # Load portfolio state once before optimization so optimizer and execution
+    # share the same migrated/current holdings view.
+    state = load_portfolio_state(
+        cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad
+    )
+    # Migration safeguard:
+    # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,
+    # without debiting cash on buys. If we now run with a small configured budget (e.g., 500 CAD), the cached
+    # state would show misleading "cash" and P&L. Detect this legacy pattern and reset once so accounting is sane.
+    try:
+        budget = float(cfg.portfolio_budget_cad)
+        open_positions = [p for p in state.positions if p.status == "OPEN"]
+        legacy_placeholder = bool(open_positions) and all(int(p.shares) == 1 for p in open_positions)
+        if budget > 0 and legacy_placeholder and float(state.cash_cad) >= budget * 25.0:
+            logger.warning(
+                "Portfolio state appears legacy (cash_cad=%s, budget_cad=%s, open_positions=%s). "
+                "Resetting state to configured budget and rebuilding sized positions.",
+                state.cash_cad,
+                budget,
+                len(open_positions),
+            )
+            state.cash_cad = float(budget)
+            state.positions = []
+            state.pnl_history = []
+            state.last_updated = datetime.now(tz=timezone.utc)
+            save_portfolio_state(cfg.portfolio_state_path, state)
+    except Exception as e:
+        logger.warning("Could not evaluate/reset legacy portfolio state: %s", e)
+
+    px_now = (
+        features["last_close_cad"].astype(float)
+        if "last_close_cad" in features.columns
+        else pd.Series(dtype=float)
+    )
+    open_values = _compute_open_position_values(state, px_now)
+    live_equity_cad = float(state.cash_cad) + float(sum(open_values.values()))
+    liquidity_portfolio_value = (
+        float(live_equity_cad)
+        if live_equity_cad > 0
+        else float(cfg.portfolio_budget_cad)
+    )
+
     # Optional single-pass constrained optimizer (replaces sequential transforms).
     unified_opt_enabled = bool(getattr(cfg, "unified_optimizer_enabled", True))
-    state_for_optimizer = None
     if unified_opt_enabled:
         current_weights = None
         try:
-            state_for_optimizer = load_portfolio_state(
-                cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad
-            )
-            px_now = features["last_close_cad"].astype(float) if "last_close_cad" in features.columns else pd.Series(dtype=float)
-            open_values = {}
-            open_total = 0.0
-            for p in state_for_optimizer.positions:
-                if p.status != "OPEN" or not p.ticker or p.shares <= 0:
-                    continue
-                px = float(px_now.get(p.ticker, float("nan")))
-                if pd.isna(px) or px <= 0:
-                    continue
-                val = float(px) * float(p.shares)
-                open_values[p.ticker] = val
-                open_total += val
-            equity = float(state_for_optimizer.cash_cad) + float(open_total)
-            if equity > 0 and open_values:
+            if live_equity_cad > 0 and open_values:
                 current_weights = pd.Series(
-                    {t: (v / equity) for t, v in open_values.items()},
+                    {t: (v / live_equity_cad) for t, v in open_values.items()},
                     dtype=float,
                 )
         except Exception as e:
@@ -953,7 +1024,7 @@ def run_daily(cfg: Config, logger) -> None:
                 min_liquidity=getattr(cfg, "min_liquidity_cad", 100_000),
                 target_liquidity=getattr(cfg, "target_liquidity_cad", 1_000_000),
                 max_position_pct_of_volume=getattr(cfg, "max_position_pct_of_volume", 0.05),
-                portfolio_value=cfg.portfolio_budget_cad,
+                portfolio_value=liquidity_portfolio_value,
                 logger=logger,
             )
             run_meta["liquidity_adjustment"] = {"enabled": True}
@@ -1054,34 +1125,7 @@ def run_daily(cfg: Config, logger) -> None:
     prices_cad = features["last_close_cad"].astype(float)
     pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
     score = scored["score"].astype(float) if "score" in scored.columns else None
-    state = (
-        state_for_optimizer
-        if state_for_optimizer is not None
-        else load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
-    )
-    # Migration safeguard:
-    # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,
-    # without debiting cash on buys. If we now run with a small configured budget (e.g., 500 CAD), the cached
-    # state would show misleading "cash" and P&L. Detect this legacy pattern and reset once so accounting is sane.
-    try:
-        budget = float(cfg.portfolio_budget_cad)
-        open_positions = [p for p in state.positions if p.status == "OPEN"]
-        legacy_placeholder = bool(open_positions) and all(int(p.shares) == 1 for p in open_positions)
-        if budget > 0 and legacy_placeholder and float(state.cash_cad) >= budget * 25.0:
-            logger.warning(
-                "Portfolio state appears legacy (cash_cad=%s, budget_cad=%s, open_positions=%s). "
-                "Resetting state to configured budget and rebuilding sized positions.",
-                state.cash_cad,
-                budget,
-                len(open_positions),
-            )
-            state.cash_cad = float(budget)
-            state.positions = []
-            state.pnl_history = []
-            state.last_updated = datetime.now(tz=timezone.utc)
-            save_portfolio_state(cfg.portfolio_state_path, state)
-    except Exception as e:
-        logger.warning("Could not evaluate/reset legacy portfolio state: %s", e)
+    # `state` is loaded and migration-normalized before optimizer sizing.
     
     # Apply drawdown-based position sizing if enabled
     drawdown_scalar = 1.0
@@ -1148,7 +1192,12 @@ def run_daily(cfg: Config, logger) -> None:
 
             # Back-fill post-action prices and score completed actions
             today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-            n_action_bf = action_reward_log.backfill_prices(prices_cad, today_str)
+            price_history_cad = _build_price_history_cad(prices, fx)
+            n_action_bf = action_reward_log.backfill_prices(
+                prices_cad,
+                today_str,
+                price_history_cad=price_history_cad,
+            )
             n_action_scored = score_actions(action_reward_log, window=60)
             if n_action_bf or n_action_scored:
                 logger.info(

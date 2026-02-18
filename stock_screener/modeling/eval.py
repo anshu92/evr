@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -964,8 +967,8 @@ def compute_calibration(predictions: pd.Series, realized: pd.Series, n_bins: int
             slope, intercept = np.polyfit(df["pred"].values.astype(float), df["real"].values.astype(float), 1)
             calibration_slope = float(slope)
             calibration_intercept = float(intercept)
-        except Exception:
-            pass
+        except Exception as e:
+            LOGGER.debug("Calibration slope fit failed: %s", e, exc_info=True)
 
     # Directional calibration quality via Brier score of up/down probability.
     directional_brier = float("nan")

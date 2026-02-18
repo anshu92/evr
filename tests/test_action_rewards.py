@@ -293,6 +293,34 @@ class TestBackfillPrices:
         assert e.confidence_calibration is not None
         assert e.confidence_calibration == -0.7  # Wrong direction -> -confidence
 
+    def test_uses_exact_horizon_prices_when_history_available(self):
+        """History-backed backfill should use exact D+1/D+3/D+5 prices, not latest snapshot."""
+        log = ActionRewardLog()
+        log.append_batch([_sell_entry(date="2026-01-27", price_at_action=100.0)])
+        prices = pd.Series({"AAPL": 130.0})  # Latest snapshot; should not be used for exact horizons
+        history = pd.DataFrame(
+            {
+                "AAPL": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
+            },
+            index=pd.to_datetime(
+                [
+                    "2026-01-27",
+                    "2026-01-28",
+                    "2026-01-29",
+                    "2026-01-30",
+                    "2026-02-02",
+                    "2026-02-03",
+                    "2026-02-04",
+                ]
+            ),
+        )
+        log.backfill_prices(prices, "2026-02-04", price_history_cad=history)
+        e = log.entries[0]
+        assert e.price_1d_after == pytest.approx(101.0)
+        assert e.price_3d_after == pytest.approx(103.0)
+        assert e.price_5d_after == pytest.approx(105.0)
+        assert e.return_5d == pytest.approx(0.05)
+
 
 # ---------------------------------------------------------------------------
 # Composite scoring
