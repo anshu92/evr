@@ -14,7 +14,7 @@ def _make_entry(date: str = "2026-01-15", ticker: str = "AAPL", pred: float = 0.
 class TestRewardEntry:
     def test_key(self):
         e = _make_entry()
-        assert e.key() == ("2026-01-15", "AAPL")
+        assert e.key() == ("2026-01-15", "AAPL", "PREDICTION")
 
     def test_defaults(self):
         e = _make_entry()
@@ -63,6 +63,22 @@ class TestRewardLog:
         aapl = [e for e in log.entries if e.ticker == "AAPL"][0]
         assert aapl.predicted_return == 0.10
 
+    def test_prediction_and_close_entries_can_coexist(self):
+        log = RewardLog()
+        log.append_batch([
+            _make_entry(date="2026-01-15", ticker="AAPL", pred=0.03, event_type="PREDICTION"),
+            _make_entry(
+                date="2026-01-15",
+                ticker="AAPL",
+                pred=0.03,
+                event_type="CLOSE",
+                exit_reason="TAKE_PROFIT",
+                realized_cumulative_return=0.06,
+            ),
+        ])
+        assert len(log.entries) == 2
+        assert {e.event_type for e in log.entries} == {"PREDICTION", "CLOSE"}
+
     def test_save_load_roundtrip(self, tmp_path):
         log = RewardLog()
         log.append(_make_entry(ticker="AAPL", pred=0.05))
@@ -97,6 +113,24 @@ class TestRewardLog:
         assert abs(aapl.realized_1d_return - 0.02) < 1e-6
         msft = [e for e in log.entries if e.ticker == "MSFT"][0]
         assert abs(msft.realized_1d_return - (-0.01)) < 1e-6
+
+    def test_update_realized_returns_skips_close_events(self):
+        log = RewardLog()
+        log.append(_make_entry(date="2026-01-14", ticker="AAPL", price_at_prediction=150.0))
+        log.append(_make_entry(
+            date="2026-01-14",
+            ticker="AAPL",
+            price_at_prediction=150.0,
+            event_type="CLOSE",
+            exit_reason="TAKE_PROFIT",
+        ))
+        prices = pd.Series({"AAPL": 153.0})
+        updated = log.update_realized_returns(prices, date_str="2026-01-15")
+        assert updated == 1
+        pred_row = [e for e in log.entries if e.event_type == "PREDICTION"][0]
+        close_row = [e for e in log.entries if e.event_type == "CLOSE"][0]
+        assert pred_row.realized_1d_return is not None
+        assert close_row.realized_1d_return is None
 
     def test_update_skips_same_day(self):
         log = RewardLog()

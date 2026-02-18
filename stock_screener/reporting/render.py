@@ -101,6 +101,13 @@ def render_reports(
         except Exception:
             return None
 
+    def _action_value(action_obj: Any, field: str, default: Any = None) -> Any:
+        if isinstance(action_obj, dict):
+            val = action_obj.get(field, default)
+        else:
+            val = getattr(action_obj, field, default)
+        return default if val is None else val
+
     def _fmt_ic_summary(summary: dict[str, Any] | None) -> str:
         if not summary:
             return "N/A"
@@ -221,31 +228,33 @@ def render_reports(
         lines.append("RECOMMENDED ACTIONS (sell at predicted peak)")
         lines.append("-" * 78)
         for a in trade_actions:
-            # Support both dataclass actions and dict-like actions.
-            ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
-            action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
-            reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
-            shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
-            px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
-            days = getattr(a, "days_held", None) or (a.get("days_held") if isinstance(a, dict) else "")
-            pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
-            sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
+            ticker = _action_value(a, "ticker", "")
+            action = _action_value(a, "action", "")
+            reason = _action_value(a, "reason", "")
+            shares = _action_value(a, "shares", "")
+            px = _action_value(a, "price_cad", None)
+            days = _action_value(a, "days_held", None)
+            pred_ret = _action_value(a, "pred_return", None)
+            sell_date = _action_value(a, "expected_sell_date", "")
             
-            px_cad_str = _fmt_money(px) if px else "N/A"
-            px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
+            px_f = _to_float(px)
+            px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
+            px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
             
             # For SELL actions, show realized gain/loss; for BUY/HOLD show predicted return and target sell price
             if action in ("SELL", "SELL_PARTIAL"):
-                entry_px = getattr(a, "entry_price", None) or (a.get("entry_price") if isinstance(a, dict) else None)
-                realized_gain = getattr(a, "realized_gain_pct", None) or (a.get("realized_gain_pct") if isinstance(a, dict) else None)
-                entry_px_str = _fmt_money(entry_px) if entry_px else "N/A"
-                entry_px_usd_str = _fmt_money(float(entry_px) / fx_rate) if entry_px and fx_rate and fx_rate > 0 else "N/A"
+                entry_px = _action_value(a, "entry_price", None)
+                realized_gain = _action_value(a, "realized_gain_pct", None)
+                entry_px_f = _to_float(entry_px)
+                entry_px_str = _fmt_money(entry_px_f) if entry_px_f is not None else "N/A"
+                entry_px_usd_str = _fmt_money(entry_px_f / fx_rate) if entry_px_f is not None and fx_rate and fx_rate > 0 else "N/A"
                 realized_str = _fmt_pct(realized_gain) if realized_gain is not None else "N/A"
-                lines.append(f"{action:>4} {ticker:<12} shares={shares} sell@={px_cad_str}/{px_usd_str} entry@={entry_px_str}/{entry_px_usd_str} gain={realized_str} days_held={days} reason={reason}")
+                days_label = days if days is not None else "N/A"
+                lines.append(f"{action:>4} {ticker:<12} shares={shares} sell@={px_cad_str}/{px_usd_str} entry@={entry_px_str}/{entry_px_usd_str} gain={realized_str} days_held={days_label} reason={reason}")
             else:
                 pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
                 # Calculate target sell price based on predicted return
-                sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
+                sell_px_cad = float(px_f) * (1 + float(pred_ret)) if px_f is not None and pred_ret is not None else None
                 sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
                 sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
                 lines.append(f"{action:>4} {ticker:<12} shares={shares} price={px_cad_str}/{px_usd_str} pred_ret={pred_ret_str} sell@={sell_px_cad_str}/{sell_px_usd_str} sell_date={sell_date or 'N/A'} reason={reason}")
@@ -332,6 +341,8 @@ def render_reports(
 
     _base_cols = ["ticker", "weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]
     _reset = weights.reset_index()
+    if "ticker" not in _reset.columns and len(_reset.columns) > 0:
+        _reset = _reset.rename(columns={_reset.columns[0]: "ticker"})
     _base_cols = [c for c in _base_cols if c in _reset.columns]
     weights_table = _reset[_base_cols].copy()
     # Ensure columns exist (may be missing for holdings built from raw features)
@@ -399,21 +410,24 @@ def render_reports(
         if sell_actions:
             sell_rows: list[str] = []
             for a in sell_actions:
-                ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
-                action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
-                reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
-                shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
-                px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
-                days = getattr(a, "days_held", None) or (a.get("days_held") if isinstance(a, dict) else "")
-                entry_px = getattr(a, "entry_price", None) or (a.get("entry_price") if isinstance(a, dict) else None)
-                realized_gain = getattr(a, "realized_gain_pct", None) or (a.get("realized_gain_pct") if isinstance(a, dict) else None)
+                ticker = _action_value(a, "ticker", "")
+                action = _action_value(a, "action", "")
+                reason = _action_value(a, "reason", "")
+                shares = _action_value(a, "shares", "")
+                px = _action_value(a, "price_cad", None)
+                days = _action_value(a, "days_held", None)
+                entry_px = _action_value(a, "entry_price", None)
+                realized_gain = _action_value(a, "realized_gain_pct", None)
                 
-                px_cad_str = _fmt_money(px) if px else "N/A"
-                px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
-                entry_px_str = _fmt_money(entry_px) if entry_px else "N/A"
-                entry_px_usd_str = _fmt_money(float(entry_px) / fx_rate) if entry_px and fx_rate and fx_rate > 0 else "N/A"
+                px_f = _to_float(px)
+                entry_px_f = _to_float(entry_px)
+                px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
+                px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
+                entry_px_str = _fmt_money(entry_px_f) if entry_px_f is not None else "N/A"
+                entry_px_usd_str = _fmt_money(entry_px_f / fx_rate) if entry_px_f is not None and fx_rate and fx_rate > 0 else "N/A"
                 realized_str = _fmt_pct(realized_gain) if realized_gain is not None else "N/A"
                 gain_color = "#059669" if realized_gain and realized_gain > 0 else "#dc2626" if realized_gain and realized_gain < 0 else "#666"
+                days_label = days if days is not None else "N/A"
                 
                 sell_rows.append(
                     f"<tr><td style='padding:4px 8px;color:#dc2626;font-weight:bold;'>{_html_escape(action)}</td>"
@@ -422,7 +436,7 @@ def render_reports(
                     f"<td style='padding:4px 8px;'>{entry_px_str}/{entry_px_usd_str}</td>"
                     f"<td style='padding:4px 8px;'>{px_cad_str}/{px_usd_str}</td>"
                     f"<td style='padding:4px 8px;color:{gain_color};font-weight:bold;'>{realized_str}</td>"
-                    f"<td style='padding:4px 8px;'>{days or 'N/A'}</td>"
+                    f"<td style='padding:4px 8px;'>{days_label}</td>"
                     f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
                 )
             actions_html_parts.append(f"""<h4 style="color:#dc2626;margin:10px 0 5px 0;">SELL Actions</h4>
@@ -444,19 +458,20 @@ def render_reports(
         if buy_hold_actions:
             buy_rows: list[str] = []
             for a in buy_hold_actions:
-                ticker = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else "")
-                action = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")
-                reason = getattr(a, "reason", None) or (a.get("reason") if isinstance(a, dict) else "")
-                shares = getattr(a, "shares", None) or (a.get("shares") if isinstance(a, dict) else "")
-                px = getattr(a, "price_cad", None) or (a.get("price_cad") if isinstance(a, dict) else "")
-                pred_ret = getattr(a, "pred_return", None) or (a.get("pred_return") if isinstance(a, dict) else None)
-                sell_date = getattr(a, "expected_sell_date", None) or (a.get("expected_sell_date") if isinstance(a, dict) else "")
+                ticker = _action_value(a, "ticker", "")
+                action = _action_value(a, "action", "")
+                reason = _action_value(a, "reason", "")
+                shares = _action_value(a, "shares", "")
+                px = _action_value(a, "price_cad", None)
+                pred_ret = _action_value(a, "pred_return", None)
+                sell_date = _action_value(a, "expected_sell_date", "")
                 
                 pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
-                px_cad_str = _fmt_money(px) if px else "N/A"
-                px_usd_str = _fmt_money(float(px) / fx_rate) if px and fx_rate and fx_rate > 0 else "N/A"
+                px_f = _to_float(px)
+                px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
+                px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
                 # Calculate target sell price based on predicted return
-                sell_px_cad = float(px) * (1 + float(pred_ret)) if px and pred_ret is not None else None
+                sell_px_cad = float(px_f) * (1 + float(pred_ret)) if px_f is not None and pred_ret is not None else None
                 sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
                 sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
                 action_color = "#059669" if action == "BUY" else "#2563eb"
@@ -652,11 +667,10 @@ def render_reports(
                             "pred_return": pred_ret,
                             "sell_price_cad": sell_px,
                             "expected_sell_date": getattr(a, "expected_sell_date", None),
+                            "replaces_ticker": getattr(a, "replaces_ticker", None),
                         }
                     )
             (reports_dir / "trade_actions.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning("Could not write trade_actions.json: %s", e)
     logger.info("Rendered reports: %s", str(reports_dir))
-
-

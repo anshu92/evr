@@ -150,10 +150,12 @@ class TradeAction:
     price_cad: float
     days_held: int | None = None
     pred_return: float | None = None  # Predicted return for this position
-    expected_sell_date: str | None = None  # Expected sell date (based on max hold days)
+    expected_sell_date: str | None = None  # Expected sell date from peak model (if available)
     # For SELL actions: realized gain/loss info
     entry_price: float | None = None  # Entry price (for sells)
     realized_gain_pct: float | None = None  # Realized % gain/loss (for sells)
+    # For BUY actions: explicit linkage to the rotated-out ticker (if any)
+    replaces_ticker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -527,16 +529,6 @@ class PortfolioManager:
         now = _utcnow()
         open_positions: list[Position] = [p for p in state.positions if p.status == "OPEN"]
         keep: list[Position] = []
-        
-        # Compute dynamic holding period based on market volatility
-        max_hold, max_hold_hard = self.compute_dynamic_holding_days(market_vol_regime)
-        if self.dynamic_holding_enabled and market_vol_regime is not None:
-            if max_hold != self.max_holding_days:
-                self.logger.info(
-                    "Dynamic holding: vol_regime=%.2f, max_days=%d->%d, hard=%d->%d",
-                    market_vol_regime, self.max_holding_days, max_hold,
-                    self.max_holding_days_hard, max_hold_hard
-                )
 
         for p in open_positions:
             px = float(prices_cad.get(p.ticker, float("nan")))
@@ -544,7 +536,6 @@ class PortfolioManager:
                 keep.append(p)
                 continue
 
-            cal_days = p.days_held(now)  # calendar days (for logging)
             days = _trading_days_between(p.entry_date, now)  # trading days (matches model)
 
             # Adaptive peak-target exit: combine entry-time and today's predictions.
@@ -587,45 +578,6 @@ class PortfolioManager:
                     ))
                     continue
 
-            # Hard time cap — safety net regardless of peak prediction
-            if days >= max_hold_hard:
-                actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT_HARD", days_held=days))
-                continue
-
-            # Time exits (only when peak_based_exit is disabled):
-            # - Default behavior: exit at max_holding_days (dynamic if enabled).
-            # - Extension behavior: if model signal is strong, allow holding up to max_holding_days_hard.
-            if not self.peak_based_exit and days >= max_hold:
-                strong = False
-                strong_reason = None
-                if pred_return is not None and self.extend_hold_min_pred_return is not None:
-                    pr = float(pred_return.get(p.ticker, float("nan")))
-                    if not pd.isna(pr) and pr >= float(self.extend_hold_min_pred_return):
-                        strong = True
-                        strong_reason = f"EXTEND_PRED_RETURN>={self.extend_hold_min_pred_return}"
-                if (not strong) and score is not None and self.extend_hold_min_score is not None:
-                    sc = float(score.get(p.ticker, float("nan")))
-                    if not pd.isna(sc) and sc >= float(self.extend_hold_min_score):
-                        strong = True
-                        strong_reason = f"EXTEND_SCORE>={self.extend_hold_min_score}"
-
-                if strong:
-                    keep.append(p)
-                    actions.append(
-                        TradeAction(
-                            ticker=p.ticker,
-                            action="HOLD",
-                            reason=strong_reason or "EXTENDED",
-                            shares=p.shares,
-                            price_cad=px,
-                            days_held=days,
-                        )
-                    )
-                    continue
-
-                actions.append(self._sell_position(state, p, price_cad=px, reason="TIME_EXIT", days_held=days))
-                continue
-
             # Optional stop/target exits.
             if p.entry_price > 0:
                 ret = px / float(p.entry_price) - 1.0
@@ -646,24 +598,6 @@ class PortfolioManager:
             if self.take_profit_pct is not None and ret >= abs(float(self.take_profit_pct)):
                 actions.append(self._sell_position(state, p, price_cad=px, reason="TAKE_PROFIT", days_held=days))
                 continue
-
-            # Age urgency: exit underperformers earlier as they age
-            # As positions age, we require progressively higher returns to justify holding
-            if self.age_urgency_enabled and days >= self.age_urgency_start_day:
-                # Calculate required return that increases with age
-                # At start_day: require min_return
-                # At max_hold: require 2x min_return
-                age_ratio = min(1.0, (days - self.age_urgency_start_day) / max(1, max_hold - self.age_urgency_start_day))
-                required_return = self.age_urgency_min_return * (1.0 + age_ratio)
-                
-                if ret < required_return:
-                    # Position is underperforming for its age
-                    self.logger.info(
-                        "%s age urgency: day %d, ret=%.1f%% < required=%.1f%%",
-                        p.ticker, days, ret * 100, required_return * 100
-                    )
-                    actions.append(self._sell_position(state, p, price_cad=px, reason="AGE_URGENCY", days_held=days))
-                    continue
 
             # Time-weighted return optimization: exit to maximize capital efficiency
             if self.twr_optimization and p.entry_price > 0:
@@ -813,6 +747,7 @@ class PortfolioManager:
         prices_cad: pd.Series,
         scored: pd.DataFrame | None = None,
         features: pd.DataFrame | None = None,
+        blocked_buys: set[str] | None = None,
     ) -> TradePlan:
         # weights is expected to represent the *target* holdings universe, but we may rotate.
         now = _utcnow()
@@ -823,6 +758,12 @@ class PortfolioManager:
 
         target_tickers = list(weights.index.astype(str))
         target_set = set(target_tickers)
+        target_set_upper = {t.upper() for t in target_set}
+        blocked_buy_tickers = {
+            str(t).strip().upper()
+            for t in (blocked_buys or set())
+            if str(t).strip()
+        }
 
         # SELL positions not in target - but only if they meet rotation criteria.
         # Avoid excessive turnover by requiring deteriorating fundamentals to rotate out.
@@ -839,12 +780,12 @@ class PortfolioManager:
         equity_for_rotation = float(state.cash_cad) + float(open_mkt_value_for_rotation)
 
         for t, p in list(open_by_ticker.items()):
-            if t not in target_set:
+            if t.upper() not in target_set_upper:
                 px = float(prices_cad.get(t, float("nan")))
                 if pd.isna(px) or px <= 0:
                     # No price data – keep position; HOLD action emitted later.
                     continue
-                # Use trading days consistently for all max-hold logic.
+                # Use trading days consistently for tenure-aware rotation checks.
                 days = _trading_days_between(p.entry_date, now)
                 
                 # Get current predictions for this ticker (if available in screened)
@@ -869,11 +810,7 @@ class PortfolioManager:
                 elif score_pct is not None and score_pct < 0.30:
                     should_rotate = True
                     rotation_reason = "ROTATION:LOW_RANK"
-                # 3. Position has been held past max holding days (forced exit)
-                elif days >= self.max_holding_days_hard:
-                    should_rotate = True
-                    rotation_reason = "ROTATION:MAX_DAYS"
-                # 4. If we have no prediction data and stock is not in target, still rotate
+                # 3. If we have no prediction data and stock is not in target, still rotate
                 # (but only if held for minimum period to avoid same-day churn)
                 elif pred_ret is None and days >= 2:
                     should_rotate = True
@@ -919,13 +856,20 @@ class PortfolioManager:
         equity_cad = float(state.cash_cad) + float(open_mkt_value)
 
         slots = max(self.max_positions - len(open_tickers), 0)
+        rotation_sell_queue: list[str] = []
+        for a in actions:
+            if a.action == "SELL" and str(a.reason).startswith("ROTATION"):
+                rotation_sell_queue.append(str(a.ticker).upper())
         if slots > 0:
             for t in target_tickers:
+                t_norm = t.upper()
                 if slots <= 0:
                     break
-                if t in open_tickers:
+                if t_norm in open_tickers:
                     continue
-                px = float(prices_cad.get(t, float("nan")))
+                if t_norm in blocked_buy_tickers:
+                    continue
+                px = float(prices_cad.get(t_norm, prices_cad.get(t, float("nan"))))
                 if pd.isna(px) or px <= 0:
                     continue
 
@@ -985,7 +929,7 @@ class PortfolioManager:
                         continue
                 state.cash_cad = float(state.cash_cad) - float(cost)
                 pos = Position(
-                    ticker=t,
+                    ticker=t_norm,
                     entry_price=px,
                     entry_date=now,
                     shares=float(shares),  # Fractional shares
@@ -1003,19 +947,19 @@ class PortfolioManager:
                     sell_dt = _add_trading_days(now, peak_day)
                     expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (peak day {peak_day})"
                 else:
-                    sell_dt = _add_trading_days(now, self.max_holding_days or 3)
-                    expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
+                    expected_sell = "N/A (peak signal pending)"
                 
                 actions.append(
                     TradeAction(
-                        ticker=t,
+                        ticker=t_norm,
                         action="BUY",
                         reason="TOP_RANKED:SEED_NOTIONAL" if seed_notional_entry else "TOP_RANKED",
                         shares=float(shares),
-                        price_cad=px, days_held=0, pred_return=pred_ret, expected_sell_date=expected_sell
+                        price_cad=px, days_held=0, pred_return=pred_ret, expected_sell_date=expected_sell,
+                        replaces_ticker=rotation_sell_queue.pop(0) if rotation_sell_queue else None,
                     )
                 )
-                open_tickers.add(t)
+                open_tickers.add(t_norm)
                 slots -= 1
 
         # Track tickers that already have an action (BUY or SELL) so we don't double-report.
@@ -1032,7 +976,7 @@ class PortfolioManager:
             px = float(prices_cad.get(t, float("nan")))
             days = _trading_days_between(p.entry_date, now) if p else None
 
-            in_target = t in target_set
+            in_target = t.upper() in target_set_upper
             hold_reason = "IN_TARGET" if in_target else "HOLDING"
 
             # Get pred_return and pred_peak_days -- cascade through progressively
@@ -1090,12 +1034,8 @@ class PortfolioManager:
 
                 days_left = _trading_days_between(now, sell_dt)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} ({source}, {days_left}td left)"
-            elif p and self.max_holding_days:
-                sell_dt = _add_trading_days(p.entry_date, self.max_holding_days)
-                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
             else:
-                sell_dt = _add_trading_days(now, self.max_holding_days or 3)
-                expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} (max)"
+                expected_sell = "N/A (peak signal pending)"
             
             # For sell price: prefer today's prediction (latest info),
             # fall back to entry prediction for positions filtered from scoring.

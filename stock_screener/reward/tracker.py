@@ -308,10 +308,12 @@ class RewardEntry:
     exit_reason: str | None = None
     # Per-model raw predictions (for per-model IC tracking)
     per_model_preds: list[float] | None = None
+    # Event type allows prediction rows and close-label rows to coexist safely.
+    event_type: str = "PREDICTION"  # PREDICTION | CLOSE
 
-    def key(self) -> tuple[str, str]:
-        """Dedup key: (date, ticker)."""
-        return (self.date, self.ticker)
+    def key(self) -> tuple[str, str, str]:
+        """Dedup key: (date, ticker, event_type)."""
+        return (self.date, self.ticker, self.event_type.upper())
 
 
 @dataclass
@@ -341,6 +343,13 @@ class RewardLog:
             if not isinstance(item, dict):
                 continue
             try:
+                event_type = (
+                    str(item.get("event_type")).upper()
+                    if item.get("event_type") is not None
+                    else ("CLOSE" if item.get("exit_reason") is not None else "PREDICTION")
+                )
+                if event_type not in {"PREDICTION", "CLOSE"}:
+                    event_type = "PREDICTION"
                 entries.append(RewardEntry(
                     date=str(item["date"]),
                     ticker=str(item["ticker"]),
@@ -356,6 +365,7 @@ class RewardLog:
                     days_held=item.get("days_held"),
                     exit_reason=item.get("exit_reason"),
                     per_model_preds=item.get("per_model_preds"),
+                    event_type=event_type,
                 ))
             except (KeyError, TypeError, ValueError):
                 continue
@@ -374,17 +384,21 @@ class RewardLog:
     # ---- mutators -----------------------------------------------------------
 
     def append(self, entry: RewardEntry) -> None:
-        """Append entry, replacing any existing entry with the same (date, ticker)."""
+        """Append entry, replacing any existing entry with the same dedup key."""
         key = entry.key()
         self.entries = [e for e in self.entries if e.key() != key]
         self.entries.append(entry)
         self._trim()
 
     def append_batch(self, entries: list[RewardEntry]) -> None:
-        """Append multiple entries, deduplicating by (date, ticker)."""
-        new_keys = {e.key() for e in entries}
+        """Append multiple entries, deduplicating by key (including within batch)."""
+        deduped: dict[tuple[str, str, str], RewardEntry] = {}
+        for e in entries:
+            deduped[e.key()] = e
+        new_entries = list(deduped.values())
+        new_keys = set(deduped.keys())
         self.entries = [e for e in self.entries if e.key() not in new_keys]
-        self.entries.extend(entries)
+        self.entries.extend(new_entries)
         self._trim()
 
     def update_realized_returns(
@@ -399,6 +413,8 @@ class RewardLog:
         """
         updated = 0
         for e in self.entries:
+            if str(e.event_type).upper() != "PREDICTION":
+                continue
             if e.date == date_str:
                 continue  # Same day; skip -- return not yet realized
             if e.realized_1d_return is not None:
@@ -445,4 +461,4 @@ class RewardLog:
         cutoff_str = cutoff.strftime("%Y-%m-%d")
         self.entries = [e for e in self.entries if e.date >= cutoff_str]
         # Secondary sort to keep chronological order
-        self.entries.sort(key=lambda e: (e.date, e.ticker))
+        self.entries.sort(key=lambda e: (e.date, e.ticker, e.event_type))

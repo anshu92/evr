@@ -7,8 +7,8 @@ from stock_screener.portfolio.manager import PortfolioManager, TradeAction
 from stock_screener.portfolio.state import PortfolioState, Position
 
 
-def test_portfolio_manager_time_exit():
-    """Test that positions exit at max_holding_days."""
+def test_portfolio_manager_no_time_exit():
+    """Positions should not be sold purely for exceeding holding days."""
     logger = logging.getLogger("test")
     
     manager = PortfolioManager(
@@ -50,11 +50,9 @@ def test_portfolio_manager_time_exit():
     
     actions = manager.apply_exits(state, prices)
     
-    # Should have one TIME_EXIT action
-    assert len(actions) == 1
-    assert actions[0].action == "SELL"
-    assert actions[0].reason == "TIME_EXIT"
-    assert actions[0].ticker == "AAPL"
+    # No max-days sell logic: this should remain open.
+    assert len(actions) == 0
+    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 1
 
 
 def test_portfolio_manager_stop_loss():
@@ -258,11 +256,11 @@ def test_fractional_buy_when_cash_below_share_price(tmp_path):
     assert buys[0].shares < 1.0
 
 
-def test_rotation_max_days_uses_trading_days(monkeypatch, tmp_path):
-    """Do not rotate purely on weekend calendar drift; use trading days."""
+def test_rotation_does_not_force_sell_on_holding_days(monkeypatch, tmp_path):
+    """Rotation should not force sell solely because a position is old."""
     logger = logging.getLogger("test")
     now = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)  # Monday
-    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)  # Friday
+    entry_date = datetime(2024, 12, 16, 15, 0, tzinfo=timezone.utc)  # Older holding
 
     monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
 
@@ -292,7 +290,10 @@ def test_rotation_max_days_uses_trading_days(monkeypatch, tmp_path):
         positions=[Position(ticker="AAPL", entry_price=100.0, entry_date=entry_date, shares=1.0)],
         last_updated=now,
     )
-    screened = pd.DataFrame({"pred_return": [0.01]}, index=["AAPL"])
+    screened = pd.DataFrame(
+        {"pred_return": [0.02, 0.01, 0.00, -0.01], "score": [0.95, 0.85, 0.75, 0.65]},
+        index=["AAPL", "BBB", "CCC", "DDD"],
+    )
     weights = pd.DataFrame({"weight": []})
     prices = pd.Series({"AAPL": 102.0})
 
@@ -397,3 +398,99 @@ def test_cold_start_seed_buy_allowed_below_min_trade_notional(tmp_path):
     assert len(buys) == 1
     assert buys[0].reason == "TOP_RANKED:SEED_NOTIONAL"
     assert 1.0 <= float(buys[0].shares * buys[0].price_cad) < 15.0
+
+
+def test_blocked_buys_prevents_same_run_reentry(tmp_path):
+    """Tickers exited earlier in the run must not be re-bought in the same plan."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
+    screened = pd.DataFrame({"pred_return": [0.05]}, index=["AAPL"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.05]}, index=["AAPL"])
+    prices = pd.Series({"AAPL": 200.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+        blocked_buys={"aapl"},
+    )
+
+    assert len([a for a in plan.actions if a.action == "BUY" and a.ticker == "AAPL"]) == 0
+    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 0
+    assert state.cash_cad == pytest.approx(1000.0)
+
+
+def test_rotation_buy_records_replaced_ticker(monkeypatch, tmp_path):
+    """BUY actions should carry explicit replaced ticker for reward attribution."""
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 10, 15, 0, tzinfo=timezone.utc)
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="OLD", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.02]}, index=["NEW"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["NEW"])
+    prices = pd.Series({"OLD": 100.0, "NEW": 100.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+
+    buys = [a for a in plan.actions if a.action == "BUY" and a.ticker == "NEW"]
+    sells = [a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]
+    assert len(buys) == 1
+    assert len(sells) == 1
+    assert buys[0].replaces_ticker == "OLD"

@@ -67,7 +67,7 @@ def test_run_daily_smoke(monkeypatch, tmp_path):
         def apply_exits(self, *args, **kwargs):
             return []
 
-        def build_trade_plan(self, *, state, screened, weights, prices_cad, scored=None, features=None):
+        def build_trade_plan(self, *, state, screened, weights, prices_cad, scored=None, features=None, blocked_buys=None):
             return TradePlan(actions=[], holdings=weights.copy())
 
     monkeypatch.setattr(daily_mod, "fetch_us_universe", _fake_universe)

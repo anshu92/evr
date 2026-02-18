@@ -138,8 +138,8 @@ class Config:
 
     # Portfolio/trading (stateful)
     portfolio_budget_cad: float = 500.0
-    max_holding_days: int = 3  # Soft cap — peak model drives actual exit
-    max_holding_days_hard: int = 5  # Hard cap — never hold longer (for compounding)
+    max_holding_days: int = 3  # Legacy compatibility field (max-day exits disabled)
+    max_holding_days_hard: int = 5  # Legacy compatibility field (max-day exits disabled)
     peak_based_exit: bool = True  # Exit at predicted peak day, not fixed time
     
     # Time-weighted return optimization

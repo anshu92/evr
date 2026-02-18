@@ -128,8 +128,11 @@ def compute_dynamic_portfolio_size(
     dynamic_size = max(1, min(max_positions, qualifying_count))
     
     # Log details
-    hard_threshold_count = ((screened.get("pred_confidence", pd.Series(1.0)) >= min_confidence) & 
-                            (screened.get("pred_return", pd.Series(1.0)) >= min_pred_return)).sum()
+    default_metric = pd.Series(1.0, index=screened.index, dtype=float)
+    hard_threshold_count = (
+        (screened.get("pred_confidence", default_metric) >= min_confidence)
+        & (screened.get("pred_return", default_metric) >= min_pred_return)
+    ).sum()
     
     logger.info(
         "Dynamic sizing: %d stocks pass hard thresholds (conf>=%.2f, ret>=%.1f%%), "
@@ -1227,21 +1230,19 @@ def run_daily(cfg: Config, logger) -> None:
     adaptive_vol_stop_base = getattr(cfg, "vol_adjusted_stop_base", 0.08) / max(exit_t, 0.1)
     adaptive_vol_stop_min = getattr(cfg, "vol_adjusted_stop_min", 0.04) / max(exit_t, 0.1)
     adaptive_vol_stop_max = getattr(cfg, "vol_adjusted_stop_max", 0.15) / max(exit_t, 0.1)
-    adaptive_max_hold = max(1, round(cfg.max_holding_days * hold_p))
-    adaptive_max_hold_hard = max(adaptive_max_hold, round(cfg.max_holding_days_hard * hold_p))
     adaptive_quick_profit_pct = getattr(cfg, "quick_profit_pct", 0.05) / max(hold_p, 0.1)
     adaptive_min_daily_return = getattr(cfg, "min_daily_return", 0.005) / max(hold_p, 0.1)
     if abs(exit_t - 1.0) > 0.05 or abs(hold_p - 1.0) > 0.05:
         logger.info(
-            "Adaptive PM params: trailing_dist=%.3f vol_stop=%.3f max_hold=%d quick_profit=%.3f",
+            "Adaptive PM params: trailing_dist=%.3f vol_stop=%.3f quick_profit=%.3f",
             adaptive_trailing_dist, adaptive_vol_stop_base,
-            adaptive_max_hold, adaptive_quick_profit_pct,
+            adaptive_quick_profit_pct,
         )
 
     pm = PortfolioManager(
         state_path=cfg.portfolio_state_path,
-        max_holding_days=adaptive_max_hold,
-        max_holding_days_hard=adaptive_max_hold_hard,
+        max_holding_days=cfg.max_holding_days,
+        max_holding_days_hard=cfg.max_holding_days_hard,
         extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
         extend_hold_min_score=cfg.extend_hold_min_score,
         max_positions=effective_portfolio_size,
@@ -1292,9 +1293,18 @@ def run_daily(cfg: Config, logger) -> None:
         features=features,
         market_vol_regime=market_vol_regime,
     )
+    exited_sell_tickers = {
+        str(a.ticker).upper()
+        for a in exit_actions
+        if a.action == "SELL" and getattr(a, "ticker", None)
+    }
     if exit_actions:
         sells = len([a for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")])
         logger.info("Exited %s position(s) (time/stop/target/peak).", sells)
+        if exited_sell_tickers:
+            shown = sorted(exited_sell_tickers)
+            preview = ", ".join(shown[:8]) + ("..." if len(shown) > 8 else "")
+            logger.info("Blocking same-run re-entry for exited tickers: %s", preview)
         # Persist state immediately after exits so position closures and cash
         # updates are not lost if the pipeline crashes before build_trade_plan.
         try:
@@ -1338,6 +1348,7 @@ def run_daily(cfg: Config, logger) -> None:
         prices_cad=prices_cad,
         scored=scored,
         features=features,
+        blocked_buys=exited_sell_tickers,
     )
 
     # Merge exit-based SELL actions (PEAK_TARGET, STOP_LOSS, etc.) into the
@@ -1362,7 +1373,8 @@ def run_daily(cfg: Config, logger) -> None:
     # Build holdings weights from ALL open positions using the full features
     # DataFrame (not just 'screened'), so positions that have fallen out of
     # today's top-N screening still appear in the portfolio report.
-    open_tickers = [p.ticker for p in state.positions if p.status == "OPEN"]
+    open_positions = [p for p in state.positions if p.status == "OPEN" and p.ticker and p.shares > 0]
+    open_tickers = list(dict.fromkeys(str(p.ticker).upper() for p in open_positions))
     holdings_features = features.loc[features.index.intersection(open_tickers)].copy()
     # Merge in the score column from scored so all holdings have scores for
     # the report, even tickers that dropped out of the screened top-N.
@@ -1395,10 +1407,54 @@ def run_daily(cfg: Config, logger) -> None:
             logger=logger,
             alpha_col=alpha_col,
         )
+    # If some open positions are missing from today's feature frame (e.g., transient data gap),
+    # keep them in the holdings report with best-effort market-value weights.
+    holdings_index_upper = {str(t).upper() for t in holdings_weights.index.astype(str)}
+    missing_holdings = [t for t in open_tickers if t not in holdings_index_upper]
+    if missing_holdings:
+        open_mkt_value = 0.0
+        market_value_by_ticker: dict[str, float] = {}
+        for p in open_positions:
+            px = float(prices_cad.get(p.ticker, float("nan")))
+            if pd.isna(px) or px <= 0:
+                continue
+            mv = float(px) * float(p.shares)
+            open_mkt_value += mv
+            market_value_by_ticker[str(p.ticker).upper()] = mv
+        equity_cad = float(state.cash_cad) + float(open_mkt_value)
+        fallback_rows: list[dict[str, Any]] = []
+        for t in missing_holdings:
+            px = float(prices_cad.get(t, float("nan")))
+            px_val = pd.NA if pd.isna(px) or px <= 0 else float(px)
+            mv = market_value_by_ticker.get(t)
+            w = float(mv / equity_cad) if mv is not None and equity_cad > 0 else pd.NA
+            fallback_rows.append(
+                {
+                    "ticker": t,
+                    "weight": w,
+                    "score": pd.NA,
+                    "last_close_cad": px_val,
+                    "ret_60d": pd.NA,
+                    "vol_60d_ann": pd.NA,
+                    "avg_dollar_volume_cad": pd.NA,
+                }
+            )
+        if fallback_rows:
+            fallback_df = pd.DataFrame(fallback_rows).set_index("ticker")
+            holdings_weights = pd.concat([holdings_weights, fallback_df], axis=0)
+            shown = ", ".join(missing_holdings[:8]) + ("..." if len(missing_holdings) > 8 else "")
+            logger.warning(
+                "Included %d open holding(s) without feature rows in report: %s",
+                len(missing_holdings),
+                shown,
+            )
     # Attach current holdings sizing for reporting (shares + position value). Keep fractional shares.
-    shares_by_ticker = {p.ticker: float(p.shares) for p in state.positions if p.status == "OPEN"}
+    shares_by_ticker = {str(p.ticker).upper(): float(p.shares) for p in open_positions}
     holdings_weights = holdings_weights.copy()
-    holdings_weights["shares"] = [shares_by_ticker.get(str(t), pd.NA) for t in holdings_weights.index.astype(str)]
+    holdings_weights["shares"] = [
+        shares_by_ticker.get(str(t).upper(), pd.NA)
+        for t in holdings_weights.index.astype(str)
+    ]
 
     render_reports(
         reports_dir=Path(cfg.reports_dir),
@@ -1440,6 +1496,7 @@ def run_daily(cfg: Config, logger) -> None:
                     confidence=conf,
                     weight_assigned=tw,
                     price_at_prediction=px,
+                    event_type="PREDICTION",
                 ))
 
             # Record closed positions from today's exits
@@ -1460,6 +1517,7 @@ def run_daily(cfg: Config, logger) -> None:
                             days_held=action.days_held,
                             exit_reason=action.reason,
                             price_at_prediction=pos.entry_price,
+                            event_type="CLOSE",
                         ))
 
             if new_entries:
@@ -1485,24 +1543,21 @@ def run_daily(cfg: Config, logger) -> None:
                     screened_avg_pred = float(preds.mean())
                     screened_top_pred = float(preds.max())
 
-            # Identify rotation pairs: SELLs and BUYs on the same day
-            sells_today = [
-                a for a in trade_plan.actions
-                if a.action in ("SELL", "SELL_PARTIAL")
-                and a.price_cad and not pd.isna(a.price_cad) and float(a.price_cad) > 0
-            ]
-            buys_today = [
-                a for a in trade_plan.actions
-                if a.action == "BUY"
-                and a.price_cad and not pd.isna(a.price_cad) and float(a.price_cad) > 0
-            ]
-            # Build rotation linkage: pair sells to buys (order-matched)
+            # Build explicit rotation linkage from BUY actions that declare
+            # which ticker they replaced (set in PortfolioManager.build_trade_plan).
             sell_to_buy: dict[str, str] = {}  # sold_ticker -> bought_ticker
             buy_to_sell: dict[str, str] = {}  # bought_ticker -> sold_ticker
-            for i, sell_a in enumerate(sells_today):
-                if i < len(buys_today):
-                    sell_to_buy[sell_a.ticker] = buys_today[i].ticker
-                    buy_to_sell[buys_today[i].ticker] = sell_a.ticker
+            for a in trade_plan.actions:
+                if a.action != "BUY":
+                    continue
+                replaced = getattr(a, "replaces_ticker", None)
+                if not replaced:
+                    continue
+                sold_ticker = str(replaced).upper()
+                bought_ticker = str(a.ticker).upper()
+                buy_to_sell[bought_ticker] = sold_ticker
+                if sold_ticker not in sell_to_buy:
+                    sell_to_buy[sold_ticker] = bought_ticker
 
             action_entries: list[ActionRewardEntry] = []
 
@@ -1529,15 +1584,16 @@ def run_daily(cfg: Config, logger) -> None:
                 replaced = None
                 replaced_px = None
 
-                if action.action in ("SELL", "SELL_PARTIAL") and action.ticker in sell_to_buy:
-                    rpl_ticker = sell_to_buy[action.ticker]
+                action_ticker = str(action.ticker).upper()
+                if action.action in ("SELL", "SELL_PARTIAL") and action_ticker in sell_to_buy:
+                    rpl_ticker = sell_to_buy[action_ticker]
                     replaced_by = rpl_ticker
                     rpl_px = prices_cad.get(rpl_ticker)
                     if rpl_px and not pd.isna(rpl_px) and float(rpl_px) > 0:
                         replaced_by_px = float(rpl_px)
 
-                if action.action == "BUY" and action.ticker in buy_to_sell:
-                    sold_ticker = buy_to_sell[action.ticker]
+                if action.action == "BUY" and action_ticker in buy_to_sell:
+                    sold_ticker = buy_to_sell[action_ticker]
                     replaced = sold_ticker
                     rpl_px = prices_cad.get(sold_ticker)
                     if rpl_px and not pd.isna(rpl_px) and float(rpl_px) > 0:
@@ -1570,7 +1626,7 @@ def run_daily(cfg: Config, logger) -> None:
             n_by_type: dict[str, int] = {}
             for ae in action_entries:
                 n_by_type[ae.action] = n_by_type.get(ae.action, 0) + 1
-            n_rotations = len(sell_to_buy)
+            n_rotations = len(buy_to_sell)
             logger.info(
                 "Action reward tracker: logged %d actions %s, %d rotation pairs (%d total)",
                 len(action_entries), dict(n_by_type), n_rotations,

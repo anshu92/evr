@@ -25,7 +25,9 @@ def compute_online_ic(
     # Need entries that have both a prediction and a realized return
     valid = [
         e for e in entries
-        if e.realized_1d_return is not None and e.predicted_return is not None
+        if str(getattr(e, "event_type", "PREDICTION")).upper() == "PREDICTION"
+        and e.realized_1d_return is not None
+        and e.predicted_return is not None
     ]
     if len(valid) < 5:
         return {"ensemble_ic": None, "per_model_ics": None, "n_observations": len(valid)}
@@ -135,7 +137,9 @@ def compute_prediction_bias(
     entries = reward_log.entries_for_window(last_n_days=window)
     valid = [
         e for e in entries
-        if e.realized_1d_return is not None and e.predicted_return is not None
+        if str(getattr(e, "event_type", "PREDICTION")).upper() == "PREDICTION"
+        and e.realized_1d_return is not None
+        and e.predicted_return is not None
     ]
     if len(valid) < 5:
         return {"mean_bias": 0.0, "bias_std": 0.0, "n_observations": len(valid)}

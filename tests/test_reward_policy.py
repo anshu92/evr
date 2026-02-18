@@ -295,6 +295,28 @@ class TestComputeOnlineIC:
         assert result["per_model_ics"] is not None
         assert len(result["per_model_ics"]) == 3
 
+    def test_ignores_close_event_rows(self):
+        log = RewardLog()
+        for i in range(6):
+            log.append(RewardEntry(
+                date=f"2026-02-{i+1:02d}",
+                ticker=f"T{i}",
+                predicted_return=0.01 * (i + 1),
+                realized_1d_return=0.005 * (i + 1),
+                event_type="PREDICTION",
+            ))
+            log.append(RewardEntry(
+                date=f"2026-02-{i+1:02d}",
+                ticker=f"T{i}",
+                predicted_return=0.0,
+                realized_1d_return=-0.5,  # intentionally noisy
+                event_type="CLOSE",
+                exit_reason="TAKE_PROFIT",
+            ))
+        result = compute_online_ic(log, window=60)
+        assert result["ensemble_ic"] is not None
+        assert result["n_observations"] == 6
+
 
 class TestComputeEnsembleRewardWeights:
     def test_equal_ics(self):
