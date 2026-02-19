@@ -121,3 +121,29 @@ def test_load_state_uses_backup_when_primary_corrupt(tmp_path):
     assert len(loaded.positions) == 1
     assert loaded.positions[0].ticker == "AAPL"
     assert loaded.positions[0].shares == 1.5
+
+
+def test_save_load_preserves_last_partial_sell_at(tmp_path):
+    path = tmp_path / "state.json"
+    now = datetime.now(tz=timezone.utc)
+    partial_ts = now - timedelta(hours=3)
+
+    state = PortfolioState(
+        cash_cad=500.0,
+        positions=[
+            Position(
+                ticker="AAPL",
+                entry_price=100.0,
+                entry_date=now - timedelta(days=1),
+                shares=1.25,
+                last_partial_sell_at=partial_ts,
+            )
+        ],
+        last_updated=now,
+    )
+    save_portfolio_state(path, state)
+
+    loaded = load_portfolio_state(path)
+    assert len(loaded.positions) == 1
+    assert loaded.positions[0].last_partial_sell_at is not None
+    assert loaded.positions[0].last_partial_sell_at == partial_ts

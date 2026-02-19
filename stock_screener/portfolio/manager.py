@@ -259,7 +259,7 @@ class PortfolioManager:
         vol_adjusted_stop_base: float = 0.08,
         vol_adjusted_stop_min: float = 0.04,
         vol_adjusted_stop_max: float = 0.15,
-        age_urgency_enabled: bool = True,
+        age_urgency_enabled: bool = False,
         age_urgency_start_day: int = 2,
         age_urgency_min_return: float = 0.01,
         peak_detection_enabled: bool,

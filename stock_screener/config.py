@@ -175,7 +175,7 @@ class Config:
     vol_adjusted_stop_max: float = 0.15  # Maximum stop-loss (high vol stocks)
     
     # Position age urgency settings
-    age_urgency_enabled: bool = True  # Exit underperformers earlier as they age
+    age_urgency_enabled: bool = False  # Disabled by default; enable only if explicit tenure pressure is desired
     age_urgency_start_day: int = 2  # Start applying urgency after N days
     age_urgency_min_return: float = 0.01  # Min return to avoid urgency exit (1%)
 
@@ -413,7 +413,7 @@ class Config:
             vol_adjusted_stop_base=_get_float("VOL_ADJUSTED_STOP_BASE", 0.08),
             vol_adjusted_stop_min=_get_float("VOL_ADJUSTED_STOP_MIN", 0.04),
             vol_adjusted_stop_max=_get_float("VOL_ADJUSTED_STOP_MAX", 0.15),
-            age_urgency_enabled=os.getenv("AGE_URGENCY_ENABLED", "1").strip() in {"1", "true", "True"},
+            age_urgency_enabled=os.getenv("AGE_URGENCY_ENABLED", "0").strip() in {"1", "true", "True"},
             age_urgency_start_day=_get_int("AGE_URGENCY_START_DAY", 2) or 2,
             age_urgency_min_return=_get_float("AGE_URGENCY_MIN_RETURN", 0.01),
             peak_detection_enabled=os.getenv("PEAK_DETECTION_ENABLED", "1").strip() in {"1", "true", "True"},

@@ -223,6 +223,9 @@ def save_portfolio_state(path: str | Path, state: PortfolioState) -> None:
     for pos, raw in zip(state.positions, obj.get("positions", [])):
         raw["entry_date"] = pos.entry_date.isoformat()
         raw["exit_date"] = pos.exit_date.isoformat() if pos.exit_date else None
+        raw["last_partial_sell_at"] = (
+            pos.last_partial_sell_at.isoformat() if pos.last_partial_sell_at else None
+        )
     payload = json.dumps(obj, indent=2, sort_keys=True)
     with _state_lock(p, exclusive=True):
         _atomic_write_text(p, payload)

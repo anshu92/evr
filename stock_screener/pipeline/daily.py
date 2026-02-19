@@ -37,7 +37,7 @@ from stock_screener.modeling.model import (
     compute_feature_schema_hash,
 )
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
-from stock_screener.portfolio.manager import PortfolioManager, TradePlan
+from stock_screener.portfolio.manager import PortfolioManager, TradeAction, TradePlan
 from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
 from stock_screener.reward.tracker import RewardEntry, RewardLog, ActionRewardEntry, ActionRewardLog
 from stock_screener.reward.feedback import (
@@ -537,6 +537,51 @@ def _build_price_history_cad(prices: pd.DataFrame, fx_usdcad: pd.Series) -> pd.D
     return pd.DataFrame(out, index=idx).sort_index()
 
 
+def _sanitize_trade_actions(actions: list[TradeAction], logger) -> list[TradeAction]:
+    """Enforce one-way action consistency before reporting.
+
+    Rules:
+    - If a ticker has any SELL/SELL_PARTIAL action, drop BUY/HOLD actions for that ticker.
+    - Drop duplicate actions by (ticker, action), keeping the first occurrence.
+    """
+    if not actions:
+        return []
+
+    sell_tickers = {
+        str(a.ticker).strip().upper()
+        for a in actions
+        if a.action in ("SELL", "SELL_PARTIAL") and str(getattr(a, "ticker", "")).strip()
+    }
+
+    kept: list[TradeAction] = []
+    seen: set[tuple[str, str]] = set()
+    dropped_conflicts = 0
+    dropped_dupes = 0
+
+    for action in actions:
+        ticker = str(getattr(action, "ticker", "")).strip().upper()
+        kind = str(getattr(action, "action", "")).strip().upper()
+        if not ticker or not kind:
+            continue
+        if ticker in sell_tickers and kind not in {"SELL", "SELL_PARTIAL"}:
+            dropped_conflicts += 1
+            continue
+        key = (ticker, kind)
+        if key in seen:
+            dropped_dupes += 1
+            continue
+        seen.add(key)
+        kept.append(action)
+
+    if dropped_conflicts > 0 or dropped_dupes > 0:
+        logger.warning(
+            "Sanitized trade actions: dropped %d conflicting and %d duplicate action(s).",
+            dropped_conflicts,
+            dropped_dupes,
+        )
+    return kept
+
+
 def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
@@ -936,6 +981,31 @@ def run_daily(cfg: Config, logger) -> None:
     state = load_portfolio_state(
         state_path, initial_cash_cad=cfg.portfolio_budget_cad
     )
+    run_meta["portfolio_state_loaded"] = {
+        "path": str(state_path),
+        "open_positions": int(len([p for p in state.positions if p.status == "OPEN"])),
+        "closed_positions": int(len([p for p in state.positions if p.status != "OPEN"])),
+        "last_updated_utc": (
+            state.last_updated.isoformat()
+            if getattr(state, "last_updated", None) is not None
+            else None
+        ),
+    }
+    if getattr(state, "last_updated", None) is not None:
+        try:
+            staleness_hours = (
+                datetime.now(tz=timezone.utc) - state.last_updated
+            ).total_seconds() / 3600.0
+            run_meta["portfolio_state_loaded"]["staleness_hours"] = float(staleness_hours)
+            if staleness_hours > 36 and state.positions:
+                logger.warning(
+                    "Portfolio state appears stale (last_updated=%s, staleness=%.1fh). "
+                    "Cross-run persistence may be misconfigured.",
+                    state.last_updated.isoformat(),
+                    staleness_hours,
+                )
+        except Exception:
+            pass
     # Migration safeguard:
     # Earlier versions created a state file with a large default cash balance and used `shares=1` placeholders,
     # without debiting cash on buys. If we now run with a small configured budget (e.g., 500 CAD), the cached
@@ -1528,6 +1598,10 @@ def run_daily(cfg: Config, logger) -> None:
                 actions=base_actions,
                 holdings=trade_plan.holdings,
             )
+    trade_plan = TradePlan(
+        actions=_sanitize_trade_actions(trade_plan.actions, logger),
+        holdings=trade_plan.holdings,
+    )
 
     # Build holdings weights from ALL open positions using the full features
     # DataFrame (not just 'screened'), so positions that have fallen out of
@@ -1614,6 +1688,10 @@ def run_daily(cfg: Config, logger) -> None:
         shares_by_ticker.get(str(t).upper(), pd.NA)
         for t in holdings_weights.index.astype(str)
     ]
+    run_meta["portfolio_state_after_planning"] = {
+        "open_positions": int(len(open_positions)),
+        "closed_positions": int(len([p for p in state.positions if p.status != "OPEN"])),
+    }
 
     render_reports(
         reports_dir=Path(cfg.reports_dir),
