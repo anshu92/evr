@@ -1,0 +1,189 @@
+name: Verify Daily Session Coverage
+
+on:
+  schedule:
+    # Runs after the pre-close daily session should have completed.
+    - cron: '15 22 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date_utc:
+        description: "Target UTC date to validate (YYYY-MM-DD). Defaults to today."
+        required: false
+        default: ""
+      create_issue_on_failure:
+        description: "Create an issue when one or more session windows are missing"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: verify-daily-session-coverage
+  cancel-in-progress: true
+
+jobs:
+  verify_coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TARGET_DATE_UTC: ${{ inputs.date_utc || '' }}
+      CREATE_ISSUE_ON_FAILURE: ${{ inputs.create_issue_on_failure || 'true' }}
+    steps:
+      - name: Check daily session window coverage
+        id: coverage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflow_id = "daily-stock-screener.yml";
+
+            function fmtDateUTC(d) {
+              const y = d.getUTCFullYear();
+              const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const day = String(d.getUTCDate()).padStart(2, "0");
+              return `${y}-${m}-${day}`;
+            }
+
+            function parseTargetDate(input) {
+              const raw = String(input || "").trim();
+              if (!raw) {
+                const now = new Date();
+                return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+              }
+              const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+              if (!m) {
+                throw new Error(`Invalid TARGET_DATE_UTC format: '${raw}'. Expected YYYY-MM-DD.`);
+              }
+              const y = Number(m[1]);
+              const mo = Number(m[2]) - 1;
+              const d = Number(m[3]);
+              return new Date(Date.UTC(y, mo, d));
+            }
+
+            function minutesUTC(ts) {
+              const d = new Date(ts);
+              return d.getUTCHours() * 60 + d.getUTCMinutes();
+            }
+
+            function inWindow(value, startMin, endMin) {
+              return value >= startMin && value < endMin;
+            }
+
+            const targetDate = parseTargetDate(process.env.TARGET_DATE_UTC);
+            const targetDateStr = fmtDateUTC(targetDate);
+            const dayOfWeek = targetDate.getUTCDay(); // 0=Sun ... 6=Sat
+            const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+
+            const start = new Date(targetDate);
+            const end = new Date(targetDate);
+            end.setUTCDate(end.getUTCDate() + 1);
+
+            const sessionWindows = [
+              { key: "PRE_MARKET", start: 11 * 60 + 30, end: 13 * 60 + 30 },
+              { key: "MID_DAY", start: 14 * 60 + 30, end: 16 * 60 + 30 },
+              { key: "PRE_CLOSE", start: 19 * 60 + 0, end: 21 * 60 + 0 },
+            ];
+
+            const counts = Object.fromEntries(sessionWindows.map((s) => [s.key, 0]));
+
+            if (isWeekday) {
+              const createdRange = `${start.toISOString()}..${end.toISOString()}`;
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner,
+                repo,
+                workflow_id,
+                per_page: 100,
+                created: createdRange,
+              });
+
+              for (const run of runs) {
+                if (run.status !== "completed" || run.conclusion !== "success") {
+                  continue;
+                }
+                const ts = run.run_started_at || run.created_at;
+                if (!ts) {
+                  continue;
+                }
+                const m = minutesUTC(ts);
+                for (const s of sessionWindows) {
+                  if (inWindow(m, s.start, s.end)) {
+                    counts[s.key] += 1;
+                    break;
+                  }
+                }
+              }
+            }
+
+            const missing = isWeekday
+              ? sessionWindows.filter((s) => counts[s.key] < 1).map((s) => s.key)
+              : [];
+
+            const shouldCreateIssue =
+              String(process.env.CREATE_ISSUE_ON_FAILURE || "true").toLowerCase() === "true";
+
+            let issueCreated = false;
+            if (missing.length > 0 && shouldCreateIssue) {
+              const issueTitle = `Daily Screener Coverage Gap - ${targetDateStr}`;
+              const existing = await github.paginate(github.rest.issues.listForRepo, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
+              const dup = existing.find((it) => it.title === issueTitle);
+
+              if (!dup) {
+                const body = [
+                  `Coverage check found missing daily screener session windows for \`${targetDateStr}\` (UTC).`,
+                  "",
+                  `- Missing windows: \`${missing.join(", ")}\``,
+                  `- Observed successful windows: \`${JSON.stringify(counts)}\``,
+                  `- Check run: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                  "",
+                  "Please inspect daily workflow history and rerun missing sessions if needed.",
+                ].join("\n");
+
+                await github.rest.issues.create({
+                  owner,
+                  repo,
+                  title: issueTitle,
+                  body,
+                  labels: ["automation", "screener", "ops"],
+                });
+                issueCreated = true;
+              }
+            }
+
+            core.setOutput("target_date", targetDateStr);
+            core.setOutput("is_weekday", isWeekday ? "true" : "false");
+            core.setOutput("pre_market_count", String(counts.PRE_MARKET));
+            core.setOutput("mid_day_count", String(counts.MID_DAY));
+            core.setOutput("pre_close_count", String(counts.PRE_CLOSE));
+            core.setOutput("missing_sessions", missing.join(","));
+            core.setOutput("missing_count", String(missing.length));
+            core.setOutput("issue_created", issueCreated ? "true" : "false");
+
+            if (missing.length > 0) {
+              core.setFailed(
+                `Missing session windows for ${targetDateStr}: ${missing.join(", ")}`
+              );
+            }
+
+      - name: Write coverage summary
+        if: always()
+        run: |
+          {
+            echo "### Daily Session Coverage Summary"
+            echo ""
+            echo "- Target date (UTC): \`${{ steps.coverage.outputs.target_date }}\`"
+            echo "- Weekday validation active: \`${{ steps.coverage.outputs.is_weekday }}\`"
+            echo "- Session success counts (PRE_MARKET / MID_DAY / PRE_CLOSE): \`${{ steps.coverage.outputs.pre_market_count }} / ${{ steps.coverage.outputs.mid_day_count }} / ${{ steps.coverage.outputs.pre_close_count }}\`"
+            echo "- Missing sessions: \`${{ steps.coverage.outputs.missing_sessions || 'none' }}\`"
+            echo "- Issue created: \`${{ steps.coverage.outputs.issue_created }}\`"
+            echo "- Job status: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

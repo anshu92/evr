@@ -60,6 +60,101 @@ def test_portfolio_manager_hard_max_hold_exit():
     assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 0
 
 
+def test_portfolio_manager_soft_max_hold_exit_when_extension_signal_missing():
+    """Positions beyond soft max hold should exit unless extension thresholds are met."""
+    logger = logging.getLogger("test")
+
+    manager = PortfolioManager(
+        state_path="test_state.json",
+        max_holding_days=3,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=0.03,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    now = datetime.now(tz=timezone.utc)
+    entry_date = now - timedelta(days=8)
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
+    state.positions.append(
+        Position(
+            ticker="AAPL",
+            entry_price=100.0,
+            entry_date=entry_date,
+            shares=1.0,
+        )
+    )
+
+    prices = pd.Series({"AAPL": 101.0})
+    pred_return = pd.Series({"AAPL": 0.01})  # below extension threshold
+    actions = manager.apply_exits(state, prices, pred_return=pred_return)
+
+    assert len(actions) == 1
+    assert actions[0].action == "SELL"
+    assert actions[0].reason.startswith("SOFT_MAX_HOLD")
+
+
+def test_portfolio_manager_soft_max_hold_can_extend_on_strong_prediction():
+    """Soft max hold should keep position when extension signal is strong."""
+    logger = logging.getLogger("test")
+
+    manager = PortfolioManager(
+        state_path="test_state.json",
+        max_holding_days=3,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=0.03,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    now = datetime.now(tz=timezone.utc)
+    entry_date = now - timedelta(days=8)
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
+    state.positions.append(
+        Position(
+            ticker="AAPL",
+            entry_price=100.0,
+            entry_date=entry_date,
+            shares=1.0,
+        )
+    )
+
+    prices = pd.Series({"AAPL": 101.0})
+    pred_return = pd.Series({"AAPL": 0.05})  # meets extension threshold
+    actions = manager.apply_exits(state, prices, pred_return=pred_return)
+
+    assert actions == []
+    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 1
+
+
 def test_portfolio_manager_stop_loss():
     """Test that stop loss triggers correctly."""
     logger = logging.getLogger("test")
@@ -270,6 +365,59 @@ def test_peak_target_updated_only_exits_without_entry_target(tmp_path):
     assert actions[0].action == "SELL"
     assert actions[0].reason.startswith("PEAK_TARGET")
     assert "updated_only" in actions[0].reason
+
+
+def test_hold_expected_sell_date_uses_updated_only_alignment(tmp_path):
+    """HOLD guidance should match updated-only peak semantics for legacy positions."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+    entry_date = now - timedelta(days=6)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=50,  # avoid soft/hard exits in this test
+        max_holding_days_hard=60,
+        extend_hold_min_pred_return=10.0,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=True,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=0,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=1000.0,
+        positions=[Position(ticker="AAPL", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.02], "pred_peak_days": [1.0]}, index=["AAPL"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02], "pred_peak_days": [1.0]}, index=["AAPL"])
+    prices = pd.Series({"AAPL": 102.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+        features=screened,
+    )
+
+    holds = [a for a in plan.actions if a.action == "HOLD" and a.ticker == "AAPL"]
+    assert len(holds) == 1
+    assert holds[0].expected_sell_date is not None
+    assert "updated_only" in holds[0].expected_sell_date
+    assert "0td left" in holds[0].expected_sell_date
 
 
 def test_peak_full_liquidation_emits_sell(tmp_path):

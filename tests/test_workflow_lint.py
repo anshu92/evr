@@ -33,6 +33,51 @@ def test_train_workflow_cache_keys_are_not_run_id_based():
     assert "key: ${{ runner.os }}-screener-model-${{ github.run_id }}" not in text
 
 
+def test_daily_workflow_writes_health_summary_counters():
+    text = Path(".github/workflows/daily-stock-screener.yml").read_text(encoding="utf-8")
+    assert "id: health_counters" in text
+    assert "Write workflow summary" in text
+    assert "GITHUB_STEP_SUMMARY" in text
+    assert "cache/reward_log.json" in text
+    assert "cache/action_reward_log.json" in text
+    assert "screener_portfolio_state.json" in text
+    assert "reports/trade_actions.json" in text
+    assert "steps.health_counters.outputs.state_age_hours" in text
+
+
+def test_cache_prune_workflow_exists_and_targets_daily_cache_keys():
+    workflow_path = Path(".github/workflows/prune-actions-caches.yml")
+    assert workflow_path.exists()
+    text = workflow_path.read_text(encoding="utf-8")
+    assert "schedule:" in text
+    assert "workflow_dispatch:" in text
+    assert "actions: write" in text
+    assert "actions/github-script@v7" in text
+    assert "-daily-screener-data-" in text
+    assert "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}" in text
+    assert "keep_latest" in text
+    assert "max_age_days" in text
+    assert "GITHUB_STEP_SUMMARY" in text
+
+
+def test_daily_coverage_workflow_exists_and_checks_session_windows():
+    workflow_path = Path(".github/workflows/verify-daily-session-coverage.yml")
+    assert workflow_path.exists()
+    text = workflow_path.read_text(encoding="utf-8")
+    assert "schedule:" in text
+    assert "cron: '15 22 * * 1-5'" in text
+    assert "workflow_dispatch:" in text
+    assert "daily-stock-screener.yml" in text
+    assert "PRE_MARKET" in text
+    assert "MID_DAY" in text
+    assert "PRE_CLOSE" in text
+    assert "listWorkflowRuns" in text
+    assert "Missing session windows" in text
+    assert "issues: write" in text
+    assert "Daily Screener Coverage Gap -" in text
+    assert "GITHUB_STEP_SUMMARY" in text
+
+
 def test_docs_match_weekly_training_schedule():
     readme = Path("README.md").read_text(encoding="utf-8").lower()
     workflows_doc = Path("docs/GITHUB_WORKFLOWS.md").read_text(encoding="utf-8").lower()

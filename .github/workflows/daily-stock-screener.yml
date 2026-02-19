@@ -278,6 +278,138 @@ jobs:
           }
           JSON
 
+      - name: Compute workflow health counters
+        if: always()
+        id: health_counters
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+
+          def load_json(path: str):
+              p = Path(path)
+              if not p.exists():
+                  return None
+              try:
+                  return json.loads(p.read_text(encoding="utf-8"))
+              except Exception:
+                  return None
+
+
+          def parse_iso_utc(value):
+              if not value:
+                  return None
+              s = str(value)
+              if s.endswith("Z"):
+                  s = f"{s[:-1]}+00:00"
+              try:
+                  dt = datetime.fromisoformat(s)
+              except ValueError:
+                  return None
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc)
+
+
+          telemetry = load_json("reports/telemetry/actions_telemetry.json") or {}
+          state = load_json("screener_portfolio_state.json") or {}
+          reward_log = load_json("cache/reward_log.json") or {}
+          action_reward_log = load_json("cache/action_reward_log.json") or {}
+          reward_policy = load_json("cache/reward_policy.json") or {}
+          trade_actions = load_json("reports/trade_actions.json")
+          if not isinstance(trade_actions, list):
+              trade_actions = []
+
+          positions = state.get("positions")
+          if not isinstance(positions, list):
+              positions = []
+          open_positions = 0
+          closed_positions = 0
+          for position in positions:
+              if not isinstance(position, dict):
+                  continue
+              status = str(position.get("status", "OPEN")).upper()
+              if status == "OPEN":
+                  open_positions += 1
+              else:
+                  closed_positions += 1
+
+          last_updated = parse_iso_utc(state.get("last_updated"))
+          if last_updated is None:
+              state_age_hours = "na"
+          else:
+              age_hours = (datetime.now(timezone.utc) - last_updated).total_seconds() / 3600.0
+              state_age_hours = f"{age_hours:.2f}"
+
+          reward_entries = reward_log.get("entries") if isinstance(reward_log, dict) else None
+          action_entries = action_reward_log.get("entries") if isinstance(action_reward_log, dict) else None
+          reward_entry_count = len(reward_entries) if isinstance(reward_entries, list) else 0
+          action_entry_count = len(action_entries) if isinstance(action_entries, list) else 0
+          action_scored_count = 0
+          if isinstance(action_entries, list):
+              action_scored_count = sum(
+                  1
+                  for entry in action_entries
+                  if isinstance(entry, dict) and entry.get("action_reward") is not None
+              )
+
+          policy_state = reward_policy.get("policy_state") if isinstance(reward_policy, dict) else {}
+          if not isinstance(policy_state, dict):
+              policy_state = {}
+          policy_updates = int(policy_state.get("n_updates", 0) or 0)
+
+          action_counts = {"BUY": 0, "SELL": 0, "SELL_PARTIAL": 0, "HOLD": 0}
+          for action in trade_actions:
+              if not isinstance(action, dict):
+                  continue
+              action_name = str(action.get("action", "")).upper()
+              if action_name in action_counts:
+                  action_counts[action_name] += 1
+
+          outputs = {
+              "elapsed_minutes": str(telemetry.get("elapsed_minutes", "na")),
+              "cache_hits": str(telemetry.get("cache_hits", "na")),
+              "cache_total": str(telemetry.get("cache_total", "na")),
+              "cache_hit_ratio": str(telemetry.get("cache_hit_ratio", "na")),
+              "open_positions": str(open_positions),
+              "closed_positions": str(closed_positions),
+              "state_age_hours": state_age_hours,
+              "reward_entries": str(reward_entry_count),
+              "action_reward_entries": str(action_entry_count),
+              "action_reward_scored": str(action_scored_count),
+              "policy_updates": str(policy_updates),
+              "buy_count": str(action_counts["BUY"]),
+              "sell_count": str(action_counts["SELL"]),
+              "sell_partial_count": str(action_counts["SELL_PARTIAL"]),
+              "hold_count": str(action_counts["HOLD"]),
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              for key, value in outputs.items():
+                  fh.write(f"{key}={value}\n")
+          PY
+
+      - name: Write workflow summary
+        if: always()
+        run: |
+          {
+            echo "### Daily Screener Health Summary"
+            echo ""
+            echo "- Run status: \`${{ job.status }}\`"
+            echo "- Runtime (minutes): \`${{ steps.health_counters.outputs.elapsed_minutes }}\`"
+            echo "- Cache hit ratio: \`${{ steps.health_counters.outputs.cache_hit_ratio }}\` (\`${{ steps.health_counters.outputs.cache_hits }}/${{ steps.health_counters.outputs.cache_total }}\`)"
+            echo "- Portfolio state age (hours): \`${{ steps.health_counters.outputs.state_age_hours }}\`"
+            echo "- Open/closed positions: \`${{ steps.health_counters.outputs.open_positions }}/${{ steps.health_counters.outputs.closed_positions }}\`"
+            echo "- Trade actions (BUY/SELL/SELL_PARTIAL/HOLD): \`${{ steps.health_counters.outputs.buy_count }}/${{ steps.health_counters.outputs.sell_count }}/${{ steps.health_counters.outputs.sell_partial_count }}/${{ steps.health_counters.outputs.hold_count }}\`"
+            echo "- Reward log entries: \`${{ steps.health_counters.outputs.reward_entries }}\`"
+            echo "- Action reward entries (scored): \`${{ steps.health_counters.outputs.action_reward_entries }} (${{ steps.health_counters.outputs.action_reward_scored }})\`"
+            echo "- Reward policy updates: \`${{ steps.health_counters.outputs.policy_updates }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Save universe/data/state cache
         if: always()
         uses: actions/cache/save@v4

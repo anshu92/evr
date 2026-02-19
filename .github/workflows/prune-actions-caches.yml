@@ -1,0 +1,117 @@
+name: Prune Daily Screener Caches
+
+on:
+  schedule:
+    # Weekly cleanup of run-unique daily cache keys.
+    - cron: '15 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, report cache candidates but do not delete"
+        required: true
+        default: true
+        type: boolean
+      keep_latest:
+        description: "Minimum number of most-recent daily cache entries to keep"
+        required: true
+        default: "30"
+      max_age_days:
+        description: "Delete daily cache entries older than this age in days"
+        required: true
+        default: "21"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: prune-daily-screener-caches
+  cancel-in-progress: true
+
+jobs:
+  prune_caches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+      KEEP_LATEST: ${{ inputs.keep_latest || '30' }}
+      MAX_AGE_DAYS: ${{ inputs.max_age_days || '21' }}
+    steps:
+      - name: Prune old daily-screener cache entries
+        id: prune
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const dryRun = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
+            const keepLatest = Math.max(1, Number(process.env.KEEP_LATEST || "30"));
+            const maxAgeDays = Math.max(1, Number(process.env.MAX_AGE_DAYS || "21"));
+            const keyMarker = "-daily-screener-data-";
+            const nowMs = Date.now();
+
+            const allCaches = await github.paginate(
+              "GET /repos/{owner}/{repo}/actions/caches",
+              { owner, repo, per_page: 100 }
+            );
+            const matches = allCaches
+              .filter((c) => String(c.key || "").includes(keyMarker))
+              .sort((a, b) => {
+                const aTs = Date.parse(a.last_accessed_at || a.created_at || 0);
+                const bTs = Date.parse(b.last_accessed_at || b.created_at || 0);
+                return bTs - aTs;
+              });
+
+            const candidates = [];
+            for (let i = 0; i < matches.length; i += 1) {
+              const cache = matches[i];
+              const ts = Date.parse(cache.last_accessed_at || cache.created_at || 0);
+              const ageDays = Number.isFinite(ts)
+                ? (nowMs - ts) / (1000 * 60 * 60 * 24)
+                : Number.POSITIVE_INFINITY;
+              const overRetention = i >= keepLatest;
+              const staleByAge = ageDays > maxAgeDays;
+              if (overRetention || staleByAge) {
+                candidates.push({ ...cache, ageDays });
+              }
+            }
+
+            let deletedCount = 0;
+            let reclaimedBytes = 0;
+            for (const cache of candidates) {
+              const size = Number(cache.size_in_bytes || 0);
+              reclaimedBytes += size;
+              core.info(
+                `candidate id=${cache.id} key=${cache.key} age_days=${cache.ageDays.toFixed(1)} size=${size}`
+              );
+              if (dryRun) {
+                continue;
+              }
+              await github.request(
+                "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
+                { owner, repo, cache_id: cache.id }
+              );
+              deletedCount += 1;
+            }
+
+            core.setOutput("dry_run", String(dryRun));
+            core.setOutput("keep_latest", String(keepLatest));
+            core.setOutput("max_age_days", String(maxAgeDays));
+            core.setOutput("matched_count", String(matches.length));
+            core.setOutput("candidate_count", String(candidates.length));
+            core.setOutput("deleted_count", String(deletedCount));
+            core.setOutput("reclaimed_bytes", String(reclaimedBytes));
+
+      - name: Write summary
+        run: |
+          {
+            echo "### Daily Cache Prune Summary"
+            echo ""
+            echo "- Dry run: \`${{ steps.prune.outputs.dry_run }}\`"
+            echo "- Keep latest entries: \`${{ steps.prune.outputs.keep_latest }}\`"
+            echo "- Max age days: \`${{ steps.prune.outputs.max_age_days }}\`"
+            echo "- Matched daily cache entries: \`${{ steps.prune.outputs.matched_count }}\`"
+            echo "- Deletion candidates: \`${{ steps.prune.outputs.candidate_count }}\`"
+            echo "- Deleted entries: \`${{ steps.prune.outputs.deleted_count }}\`"
+            echo "- Reclaimed bytes (candidates): \`${{ steps.prune.outputs.reclaimed_bytes }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

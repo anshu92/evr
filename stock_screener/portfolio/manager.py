@@ -726,6 +726,33 @@ class PortfolioManager:
                 )
                 continue
 
+            # Soft tenure guardrail: once the adaptive soft horizon is reached,
+            # rotate capital unless the position still has strong forward signal.
+            if days >= adjusted_max_hold:
+                extend_reasons: list[str] = []
+
+                if self.extend_hold_min_pred_return is not None and pred_return is not None:
+                    pr_val = float(pred_return.get(p.ticker, float("nan")))
+                    if not pd.isna(pr_val) and pr_val >= float(self.extend_hold_min_pred_return):
+                        extend_reasons.append("pred_return")
+
+                if self.extend_hold_min_score is not None and score is not None:
+                    sc_val = float(score.get(p.ticker, float("nan")))
+                    if not pd.isna(sc_val) and sc_val >= float(self.extend_hold_min_score):
+                        extend_reasons.append("score")
+
+                if not extend_reasons:
+                    actions.append(
+                        self._sell_position(
+                            state,
+                            p,
+                            price_cad=px,
+                            reason=f"SOFT_MAX_HOLD(day{adjusted_max_hold})",
+                            days_held=days,
+                        )
+                    )
+                    continue
+
             # Adaptive peak-target exit: combine entry-time and today's predictions.
             # pred_peak_days is in trading days (model trained on trading-day rows).
             if self.peak_based_exit:
@@ -1257,7 +1284,13 @@ class PortfolioManager:
             if entry_peak is not None or today_peak is not None:
                 # Convert trading-day offsets to actual calendar sell dates.
                 entry_sell_dt = _add_trading_days(p.entry_date, entry_peak, market=market) if entry_peak and p else None
-                today_sell_dt = _add_trading_days(now, today_peak, market=market) if today_peak else None
+                if today_peak:
+                    if entry_peak is None:
+                        today_sell_dt = _add_trading_days(now, max(0, today_peak - 1), market=market)
+                    else:
+                        today_sell_dt = _add_trading_days(now, today_peak, market=market)
+                else:
+                    today_sell_dt = None
 
                 # Pick the earlier date (adaptive: react to new info)
                 if entry_sell_dt and today_sell_dt:
@@ -1272,7 +1305,7 @@ class PortfolioManager:
                     source = "entry"
                 else:
                     sell_dt = today_sell_dt
-                    source = "updated"
+                    source = "updated_only" if entry_peak is None else "updated"
 
                 days_left = _trading_days_between(now, sell_dt, market=market)
                 expected_sell = f"{sell_dt.strftime('%Y-%m-%d')} ({source}, {days_left}td left)"

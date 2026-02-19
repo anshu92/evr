@@ -14,6 +14,8 @@ Primary code/workflow references:
 - `.github/workflows/daily-stock-screener.yml`
 - `.github/workflows/train-stock-screener-model.yml`
 - `.github/workflows/reset-portfolio-state.yml`
+- `.github/workflows/prune-actions-caches.yml`
+- `.github/workflows/verify-daily-session-coverage.yml`
 - `stock_screener/pipeline/daily.py`
 - `stock_screener/portfolio/manager.py`
 - `stock_screener/portfolio/state.py`
@@ -28,7 +30,8 @@ Daily workflow (`.github/workflows/daily-stock-screener.yml`):
 - Restores caches for pip, data/state, and models (`.github/workflows/daily-stock-screener.yml:49`, `.github/workflows/daily-stock-screener.yml:58`, `.github/workflows/daily-stock-screener.yml:70`)
 - Pulls latest train artifact by querying workflow runs (`.github/workflows/daily-stock-screener.yml:80`)
 - Executes `python -m stock_screener.cli daily` (`.github/workflows/daily-stock-screener.yml:227`)
-- Uploads run artifacts, sends email, opens issue on failure (`.github/workflows/daily-stock-screener.yml:258`, `.github/workflows/daily-stock-screener.yml:281`, `.github/workflows/daily-stock-screener.yml:297`)
+- Emits telemetry + workflow health counters to summary (`.github/workflows/daily-stock-screener.yml:252`, `.github/workflows/daily-stock-screener.yml:281`, `.github/workflows/daily-stock-screener.yml:392`)
+- Uploads run artifacts, sends email, opens issue on failure (`.github/workflows/daily-stock-screener.yml:405`, `.github/workflows/daily-stock-screener.yml:439`, `.github/workflows/daily-stock-screener.yml:455`)
 
 Training workflow (`.github/workflows/train-stock-screener-model.yml`):
 
@@ -39,6 +42,17 @@ Training workflow (`.github/workflows/train-stock-screener-model.yml`):
 Reset workflow (`.github/workflows/reset-portfolio-state.yml`):
 
 - Manual cache purge + fresh state seeding (`.github/workflows/reset-portfolio-state.yml:31`, `.github/workflows/reset-portfolio-state.yml:69`, `.github/workflows/reset-portfolio-state.yml:93`)
+
+Cache prune workflow (`.github/workflows/prune-actions-caches.yml`):
+
+- Weekly and manual cache GC for run-unique daily data keys
+- Keeps recent keys and removes stale/overflow entries
+
+Session coverage workflow (`.github/workflows/verify-daily-session-coverage.yml`):
+
+- Weekday post-close verification of expected daily session windows
+- Validates at least one successful run in each window (`PRE_MARKET`, `MID_DAY`, `PRE_CLOSE`)
+- Opens an issue if any expected session window is missing
 
 ### 2) Daily Pipeline Execution (`run_daily`)
 
@@ -73,23 +87,28 @@ Action lifecycle in `PortfolioManager`:
 | Severity | Issue | Evidence | Impact | Status |
 |---|---|---|---|
 | Critical | Mutable state was cached under a stable exact key via a single `actions/cache@v4` step, risking stale state on exact-key hits. | Daily workflow cache strategy plus state staleness guard in `stock_screener/pipeline/daily.py:1000` | Portfolio state/reward state could appear frozen across runs. | Fixed in this revision (restore/save split + run-unique save key). |
-| High | Holding-period settings (`MAX_HOLDING_DAYS`, `MAX_HOLDING_DAYS_HARD`) were not enforced as hard exits in `apply_exits`. | `stock_screener/portfolio/manager.py` exit path before this fix | Positions could stay open indefinitely if other exits did not trigger. | Fixed in this revision (`HARD_MAX_HOLD(...)` liquidation rule). |
-| Medium | Peak-target logic could fail to act for legacy positions missing `entry_pred_peak_days`. | `stock_screener/portfolio/manager.py` peak-target branch before this fix | Legacy holdings might never trigger updated-only peak exits. | Fixed in this revision (`updated_only` actionable boundary). |
+| High | Holding-period settings were not enforced as explicit tenure exits before other rules. | `stock_screener/portfolio/manager.py` exit path before this fix | Positions could stay open too long and capital could recycle slowly. | Fixed in this revision (`SOFT_MAX_HOLD(...)` + `HARD_MAX_HOLD(...)`). |
+| Medium | Peak-target logic and HOLD guidance were inconsistent for legacy positions missing `entry_pred_peak_days`. | `stock_screener/portfolio/manager.py` peak-target + HOLD expected-sell path before this fix | Guidance could disagree with execution timing. | Fixed in this revision (`updated_only` actionable boundary and aligned HOLD sell-date semantics). |
 | Medium | Model artifact lookup scanned only 5 runs and did not explicitly prefer default branch. | `.github/workflows/daily-stock-screener.yml` artifact lookup script before this fix | Possible suboptimal artifact selection. | Fixed in this revision (default-branch filter + paginated search). |
-| Medium | Documentation drift existed around workflow count and exit behavior. | Prior docs state | Misaligned operational expectations. | Fixed in this revision (`README.md`, `docs/GITHUB_WORKFLOWS.md`). |
+| Medium | Run-unique daily cache keys had no automated pruning strategy. | Daily cache save key includes `${{ github.run_id }}` | Unbounded cache growth and avoidable Actions storage pressure. | Fixed in this revision (`prune-actions-caches.yml`). |
+| Medium | Workflow summary lacked state/reward/action health counters. | Prior daily workflow summary behavior | Slower operational triage when runs degrade. | Fixed in this revision (`$GITHUB_STEP_SUMMARY` counters). |
+| Medium | No automated check ensured each weekday daily session window completed successfully. | Prior workflow set had no post-close coverage verifier | Silent missed runs could leave the day partially unmanaged. | Fixed in this revision (`verify-daily-session-coverage.yml`). |
+| Medium | Documentation drift existed around workflow count and exit behavior. | Prior docs state | Misaligned operational expectations. | Fixed in this revision (`README.md`, `docs/GITHUB_WORKFLOWS.md`, this audit). |
 
 ## Logical Improvements (Current State)
 
 Implemented in this revision:
 
 1. Daily mutable cache switched to restore/save pattern with run-unique save key.
-2. Hard max-hold liquidation enforced in `PortfolioManager.apply_exits`.
+2. Soft and hard tenure exits enforced in `PortfolioManager.apply_exits`.
 3. Updated-only peak exit boundary added for legacy positions without entry peak metadata.
-4. Model artifact lookup hardened to default branch and paginated run search.
-5. Workflow/README docs aligned to current behavior.
+4. HOLD expected-sell-date logic aligned with updated-only peak semantics.
+5. Model artifact lookup hardened to default branch and paginated run search.
+6. Daily workflow now emits state/reward/action health counters in `$GITHUB_STEP_SUMMARY`.
+7. Weekly/manual cache-prune workflow added for run-unique daily cache keys.
+8. Weekday session-coverage verifier added for `PRE_MARKET` / `MID_DAY` / `PRE_CLOSE` windows.
+9. Workflow docs aligned to current behavior.
 
 Remaining recommended improvements:
 
-1. Add `concurrency` group to the daily workflow to prevent schedule overlap.
-2. Emit explicit state-age/reward-log counters in workflow summary for easier ops triage.
-3. Consider a soft max-hold rule (`SOFT_MAX_HOLD`) as a second-layer tenure guardrail.
+1. Optional: route session-coverage alerts to chat/incident tooling in addition to GitHub issues.

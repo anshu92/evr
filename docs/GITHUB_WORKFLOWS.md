@@ -1,10 +1,12 @@
 ## GitHub Workflows
 
-This repository currently uses three GitHub Actions workflows:
+This repository currently uses five GitHub Actions workflows:
 
 - `daily-stock-screener.yml`: weekday daily portfolio run and email
 - `train-stock-screener-model.yml`: weekly model training/promotion
 - `reset-portfolio-state.yml`: manual cache/state reset utility
+- `prune-actions-caches.yml`: weekly cache GC for run-unique daily data keys
+- `verify-daily-session-coverage.yml`: weekday self-check for missed daily session windows
 
 Detailed pipeline audit: `docs/PORTFOLIO_PIPELINE_AUDIT.md`
 
@@ -24,9 +26,10 @@ Core flow:
 3. Find the latest successful training artifact and download model files.
 4. Run `python -m stock_screener.cli daily --log-level INFO`.
 5. Emit telemetry to `reports/telemetry/actions_telemetry.json`.
-6. Upload run artifacts (`reports/`, `cache/last_run_meta.json`, `screener_portfolio_state.json`).
-7. Email the HTML report and CSV/JSON attachments.
-8. Open a GitHub issue if the workflow fails.
+6. Compute state/reward/action health counters and write `$GITHUB_STEP_SUMMARY`.
+7. Upload run artifacts (`reports/`, `cache/last_run_meta.json`, `screener_portfolio_state.json`).
+8. Email the HTML report and CSV/JSON attachments.
+9. Open a GitHub issue if the workflow fails.
 
 Runtime/controls:
 
@@ -34,6 +37,7 @@ Runtime/controls:
 - `STRICT_FEATURE_PARITY=1`
 - `USE_ML=1` with fallback behavior when model is unavailable
 - Dynamic no-trade-band and turnover controls are enabled by default
+- Concurrency guard enabled: one daily run at a time (`concurrency.group: daily-stock-screener`)
 
 ## Training Workflow
 
@@ -71,6 +75,37 @@ Core flow:
 3. Seed a reset cache key for next daily run.
 4. Upload reset state artifact and summary.
 
+## Cache Prune Workflow
+
+File: `.github/workflows/prune-actions-caches.yml`
+
+Schedule/trigger:
+
+- Weekly on Sunday `03:15 UTC`
+- Manual `workflow_dispatch` with `dry_run`, `keep_latest`, and `max_age_days`
+
+Core flow:
+
+1. List all Actions caches and filter daily mutable keys (`-daily-screener-data-`).
+2. Keep most-recent keys and remove stale/overflow keys.
+3. Write prune metrics to `$GITHUB_STEP_SUMMARY`.
+
+## Session Coverage Workflow
+
+File: `.github/workflows/verify-daily-session-coverage.yml`
+
+Schedule/trigger:
+
+- Weekdays at `22:15 UTC` (after the pre-close run should have finished)
+- Manual `workflow_dispatch` with optional `date_utc` override
+
+Core flow:
+
+1. Pull completed successful runs for `daily-stock-screener.yml` on the target UTC day.
+2. Bucket successful runs into expected windows: `PRE_MARKET`, `MID_DAY`, `PRE_CLOSE`.
+3. Fail if any window is missing and optionally open an ops issue.
+4. Write coverage metrics to `$GITHUB_STEP_SUMMARY`.
+
 ## State, Caches, and Artifacts
 
 - Portfolio state path in daily runs: `screener_portfolio_state.json`.
@@ -81,6 +116,7 @@ Core flow:
   - restore via `actions/cache/restore@v4`
   - save via `actions/cache/save@v4` with run-unique key suffix
   - restore key prefix remains stable for cross-run recovery
+- Weekly cache GC prevents unbounded growth of run-unique daily cache entries.
 
 Important:
 
