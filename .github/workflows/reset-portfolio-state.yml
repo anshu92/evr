@@ -1,0 +1,133 @@
+name: Reset Persistent Portfolio State
+
+on:
+  workflow_dispatch:
+    inputs:
+      initial_cash_cad:
+        description: "Starting cash balance for the reset portfolio (CAD)"
+        required: true
+        default: "500"
+      dry_run:
+        description: "If true, list matching caches but do not delete them"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  reset_portfolio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      INITIAL_CASH_CAD: ${{ inputs.initial_cash_cad }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Purge daily screener data caches
+        id: purge_caches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const dryRun = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
+            const allCaches = await github.paginate(
+              "GET /repos/{owner}/{repo}/actions/caches",
+              { owner, repo, per_page: 100 }
+            );
+            const matches = allCaches.filter((c) =>
+              String(c.key || "").includes("-daily-screener-data-")
+            );
+
+            core.info(`Found ${matches.length} daily-screener-data cache entr${matches.length === 1 ? "y" : "ies"}.`);
+            let deleted = 0;
+            for (const cache of matches) {
+              core.info(`Matched cache id=${cache.id} key=${cache.key} size=${cache.size_in_bytes}`);
+              if (dryRun) {
+                continue;
+              }
+              await github.request(
+                "DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}",
+                {
+                  owner,
+                  repo,
+                  cache_id: cache.id,
+                }
+              );
+              deleted += 1;
+            }
+
+            core.setOutput("matched_count", String(matches.length));
+            core.setOutput("deleted_count", String(deleted));
+            core.setOutput("dry_run", String(dryRun));
+
+      - name: Prepare fresh portfolio state
+        if: steps.purge_caches.outputs.dry_run != 'true'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          cash = float(os.environ["INITIAL_CASH_CAD"])
+          now = datetime.now(timezone.utc).isoformat()
+          state = {
+              "cash_cad": cash,
+              "positions": [],
+              "last_updated": now,
+              "pnl_history": [],
+          }
+          with open("screener_portfolio_state.json", "w", encoding="utf-8") as fh:
+              json.dump(state, fh, indent=2, sort_keys=True)
+          with open("screener_portfolio_state.json.bak", "w", encoding="utf-8") as fh:
+              json.dump(state, fh, indent=2, sort_keys=True)
+          PY
+          mkdir -p cache data_cache
+          ls -la screener_portfolio_state.json
+
+      - name: Seed reset cache for daily workflow
+        if: steps.purge_caches.outputs.dry_run != 'true'
+        id: cache_seed
+        uses: actions/cache@v4
+        with:
+          path: |
+            cache/
+            data_cache/
+            screener_portfolio_state.json
+          key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/daily-stock-screener.yml') }}
+
+      - name: Validate reset cache seed
+        if: steps.purge_caches.outputs.dry_run != 'true' && steps.cache_seed.outputs.cache-hit == 'true'
+        run: |
+          echo "::error::Exact daily cache key already existed after purge. Portfolio reset was not applied."
+          exit 1
+
+      - name: Upload reset state artifact
+        if: steps.purge_caches.outputs.dry_run != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reset-portfolio-state-${{ github.run_number }}
+          path: |
+            screener_portfolio_state.json
+            screener_portfolio_state.json.bak
+          retention-days: 14
+
+      - name: Write summary
+        run: |
+          {
+            echo "### Portfolio Reset Summary"
+            echo ""
+            echo "- Dry run: \`${{ steps.purge_caches.outputs.dry_run }}\`"
+            echo "- Matched daily data caches: \`${{ steps.purge_caches.outputs.matched_count }}\`"
+            echo "- Deleted daily data caches: \`${{ steps.purge_caches.outputs.deleted_count }}\`"
+            if [ "${{ steps.purge_caches.outputs.dry_run }}" != "true" ]; then
+              echo "- Reset initial cash (CAD): \`${{ inputs.initial_cash_cad }}\`"
+              echo "- Seed cache exact hit: \`${{ steps.cache_seed.outputs.cache-hit }}\`"
+              echo "- Next \`daily-stock-screener\` run will start from this reset state."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
