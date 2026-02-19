@@ -59,6 +59,10 @@ def render_reports(
     # CSV of portfolio weights
     csv_cols = [
         "weight",
+        "actual_weight",
+        "target_weight",
+        "shares",
+        "position_value_cad",
         "score",
         "last_close_cad",
         "ret_60d",
@@ -151,7 +155,7 @@ def render_reports(
     lines.extend(_top_table(screened, n=min(25, len(screened))))
     lines.append("")
 
-    lines.append("PORTFOLIO WEIGHTS (inverse-vol, capped)")
+    lines.append("PORTFOLIO HOLDINGS (actual vs target weights)")
     lines.append("-" * 78)
     weights_view = weights.copy()
     fx_rate = _to_float(fx_usdcad_rate)
@@ -159,17 +163,21 @@ def render_reports(
         weights_view["last_close_usd"] = pd.to_numeric(weights_view["last_close_cad"], errors="coerce") / float(fx_rate)
     else:
         weights_view["last_close_usd"] = pd.NA
-    if "shares" in weights_view.columns and "last_close_cad" in weights_view.columns:
+    if "position_value_cad" not in weights_view.columns and "shares" in weights_view.columns and "last_close_cad" in weights_view.columns:
         weights_view["position_value_cad"] = pd.to_numeric(weights_view["last_close_cad"], errors="coerce") * pd.to_numeric(
             weights_view["shares"], errors="coerce"
         )
     else:
-        weights_view["position_value_cad"] = pd.NA
+        weights_view["position_value_cad"] = weights_view.get("position_value_cad", pd.NA)
     if fx_rate is not None and fx_rate > 0:
         weights_view["position_value_usd"] = pd.to_numeric(weights_view["position_value_cad"], errors="coerce") / float(fx_rate)
     else:
         weights_view["position_value_usd"] = pd.NA
     weights_view["weight"] = weights_view["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
+    if "actual_weight" in weights_view.columns:
+        weights_view["actual_weight"] = weights_view["actual_weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
+    if "target_weight" in weights_view.columns:
+        weights_view["target_weight"] = weights_view["target_weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_view["last_close_cad"] = weights_view["last_close_cad"].map(_fmt_money)
     weights_view["last_close_usd"] = weights_view["last_close_usd"].map(_fmt_money)
     if "shares" in weights_view.columns:
@@ -188,6 +196,8 @@ def render_reports(
     weights_view["ret_60d"] = weights_view["ret_60d"].map(_fmt_pct)
     weights_view["vol_60d_ann"] = weights_view["vol_60d_ann"].map(_fmt_pct)
     weights_cols = [
+        "actual_weight",
+        "target_weight",
         "weight",
         "shares",
         "position_value_cad",
@@ -268,9 +278,16 @@ def render_reports(
         prev = portfolio_pnl_history[-2] if len(portfolio_pnl_history) >= 2 else None
         first = portfolio_pnl_history[0]
         
+        latest_asof = latest.get("asof_utc")
+        prev_asof = prev.get("asof_utc") if prev else None
         equity = _to_float(latest.get("equity_cad"))
         prev_equity = _to_float(prev.get("equity_cad")) if prev else None
         first_equity = _to_float(first.get("equity_cad"))
+        cash = _to_float(latest.get("cash_cad"))
+        open_market_value = _to_float(latest.get("open_market_value_cad"))
+        realized_pl = _to_float(latest.get("realized_pl_cad"))
+        unrealized_pl = _to_float(latest.get("unrealized_pl_cad"))
+        net_pl = _to_float(latest.get("net_pl_cad"))
         
         # Calculate returns
         all_time_return = None
@@ -282,9 +299,18 @@ def render_reports(
         if equity is not None and prev_equity is not None and prev_equity > 0:
             day_to_day_return = (equity - prev_equity) / prev_equity
         
+        if latest_asof:
+            lines.append(f"Snapshot: {latest_asof}")
+        if prev_asof:
+            lines.append(f"Previous Snapshot: {prev_asof}")
         lines.append(f"Current Equity: {_fmt_money(equity) if equity is not None else 'N/A'}")
         if fx_rate is not None and fx_rate > 0 and equity is not None:
             lines.append(f"Current Equity USD: {_fmt_money(equity / fx_rate)}")
+        lines.append(f"Cash: {_fmt_money(cash) if cash is not None else 'N/A'}")
+        lines.append(f"Invested Market Value: {_fmt_money(open_market_value) if open_market_value is not None else 'N/A'}")
+        lines.append(f"Realized P&L: {_fmt_money(realized_pl) if realized_pl is not None else 'N/A'}")
+        lines.append(f"Unrealized P&L: {_fmt_money(unrealized_pl) if unrealized_pl is not None else 'N/A'}")
+        lines.append(f"Net P&L: {_fmt_money(net_pl) if net_pl is not None else 'N/A'}")
         lines.append("")
         lines.append(f"All-Time Return: {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
         lines.append(f"Day-to-Day Return: {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
@@ -339,7 +365,10 @@ def render_reports(
             .replace("'", "&#39;")
         )
 
-    _base_cols = ["ticker", "weight", "score", "last_close_cad", "ret_60d", "vol_60d_ann"]
+    _base_cols = [
+        "ticker", "actual_weight", "target_weight", "weight", "shares",
+        "position_value_cad", "score", "last_close_cad", "ret_60d", "vol_60d_ann",
+    ]
     _reset = weights.reset_index()
     if "ticker" not in _reset.columns and len(_reset.columns) > 0:
         _reset = _reset.rename(columns={_reset.columns[0]: "ticker"})
@@ -360,13 +389,22 @@ def render_reports(
         weights_table["shares"] = weights_table["ticker"].astype(str).map(shares)
     else:
         weights_table["shares"] = pd.NA
-    weights_table["position_value_cad"] = pd.to_numeric(weights_table["last_close_cad"], errors="coerce") * pd.to_numeric(
-        weights_table["shares"], errors="coerce"
-    )
+    if "position_value_cad" in weights.columns:
+        pos_val = weights["position_value_cad"].copy()
+        pos_val.index = weights.index.astype(str)
+        weights_table["position_value_cad"] = weights_table["ticker"].astype(str).map(pos_val)
+    else:
+        weights_table["position_value_cad"] = pd.to_numeric(weights_table["last_close_cad"], errors="coerce") * pd.to_numeric(
+            weights_table["shares"], errors="coerce"
+        )
     if fx_rate is not None and fx_rate > 0:
         weights_table["position_value_usd"] = pd.to_numeric(weights_table["position_value_cad"], errors="coerce") / float(fx_rate)
     else:
         weights_table["position_value_usd"] = pd.NA
+    if "actual_weight" in weights_table.columns:
+        weights_table["actual_weight"] = weights_table["actual_weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
+    if "target_weight" in weights_table.columns:
+        weights_table["target_weight"] = weights_table["target_weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_table["weight"] = weights_table["weight"].map(lambda x: _fmt_pct(x).replace("+", ""))
     weights_table["last_close_cad"] = weights_table["last_close_cad"].map(_fmt_money)
     weights_table["last_close_usd"] = weights_table["last_close_usd"].map(_fmt_money)
@@ -384,11 +422,30 @@ def render_reports(
     weights_table["vol_60d_ann"] = weights_table["vol_60d_ann"].map(_fmt_pct)
     weights_table["score"] = weights_table["score"].map(_fmt_num)
     _html_cols = [
-        "ticker", "weight", "shares", "position_value_cad", "position_value_usd",
-        "score", "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann",
+        "ticker", "actual_weight", "target_weight", "weight", "shares",
+        "position_value_cad", "position_value_usd", "score",
+        "last_close_cad", "last_close_usd", "ret_60d", "vol_60d_ann",
     ]
     _html_cols = [c for c in _html_cols if c in weights_table.columns]
     weights_table = weights_table[_html_cols].copy()
+    col_labels = {
+        "ticker": "Ticker",
+        "actual_weight": "Actual Weight",
+        "target_weight": "Target Weight",
+        "weight": "Weight",
+        "shares": "Shares",
+        "position_value_cad": "Value (CAD)",
+        "position_value_usd": "Value (USD)",
+        "score": "Score",
+        "last_close_cad": "Price (CAD)",
+        "last_close_usd": "Price (USD)",
+        "ret_60d": "Ret 60d",
+        "vol_60d_ann": "Vol 60d (ann)",
+    }
+    headers_html = "".join(
+        f"<th style='text-align:left;padding:6px 8px;border-bottom:2px solid #111827;'>{_html_escape(col_labels.get(c, c))}</th>"
+        for c in weights_table.columns
+    )
 
     rows_html = "\n".join(
         "<tr>"
@@ -514,9 +571,16 @@ def render_reports(
         prev = portfolio_pnl_history[-2] if len(portfolio_pnl_history) >= 2 else None
         first = portfolio_pnl_history[0]
         
+        latest_asof = latest.get("asof_utc")
+        prev_asof = prev.get("asof_utc") if prev else None
         equity = _to_float(latest.get("equity_cad"))
         prev_equity = _to_float(prev.get("equity_cad")) if prev else None
         first_equity = _to_float(first.get("equity_cad"))
+        cash = _to_float(latest.get("cash_cad"))
+        open_market_value = _to_float(latest.get("open_market_value_cad"))
+        realized_pl = _to_float(latest.get("realized_pl_cad"))
+        unrealized_pl = _to_float(latest.get("unrealized_pl_cad"))
+        net_pl = _to_float(latest.get("net_pl_cad"))
         
         # Calculate returns
         all_time_return = None
@@ -530,9 +594,18 @@ def render_reports(
         
         fx_rate = _to_float(fx_usdcad_rate)
         equity_parts: list[str] = []
+        if latest_asof:
+            equity_parts.append(f"<strong>Snapshot:</strong> {_html_escape(str(latest_asof))}")
+        if prev_asof:
+            equity_parts.append(f"<strong>Previous Snapshot:</strong> {_html_escape(str(prev_asof))}")
         equity_parts.append(f"<strong>Current Equity:</strong> {_fmt_money(equity) if equity is not None else 'N/A'}")
         if fx_rate is not None and fx_rate > 0 and equity is not None:
             equity_parts.append(f"<strong>Current Equity USD:</strong> {_fmt_money(equity / fx_rate)}")
+        equity_parts.append(f"<strong>Cash:</strong> {_fmt_money(cash) if cash is not None else 'N/A'}")
+        equity_parts.append(f"<strong>Invested Market Value:</strong> {_fmt_money(open_market_value) if open_market_value is not None else 'N/A'}")
+        equity_parts.append(f"<strong>Realized P&L:</strong> {_fmt_money(realized_pl) if realized_pl is not None else 'N/A'}")
+        equity_parts.append(f"<strong>Unrealized P&L:</strong> {_fmt_money(unrealized_pl) if unrealized_pl is not None else 'N/A'}")
+        equity_parts.append(f"<strong>Net P&L:</strong> {_fmt_money(net_pl) if net_pl is not None else 'N/A'}")
         
         return_parts: list[str] = []
         return_parts.append(f"<strong>All-Time Return:</strong> {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
@@ -615,21 +688,10 @@ def render_reports(
 
   {target_weights_html_block}
 
-  <h3 style="margin: 0 0 10px 0;">Recommended Portfolio Weights</h3>
+  <h3 style="margin: 0 0 10px 0;">Current Portfolio Holdings</h3>
   <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
     <thead>
-      <tr>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Ticker</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Weight</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Shares</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Value (CAD)</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Value (USD)</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Score</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Price (CAD)</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Price (USD)</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Ret 60d</th>
-        <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Vol 60d (ann)</th>
-      </tr>
+      <tr>{headers_html}</tr>
     </thead>
     <tbody>
       {rows_html}

@@ -1681,13 +1681,47 @@ def run_daily(cfg: Config, logger) -> None:
                 len(missing_holdings),
                 shown,
             )
-    # Attach current holdings sizing for reporting (shares + position value). Keep fractional shares.
+    # Attach current holdings sizing for reporting (shares + actual/live weights).
+    # Keep model/optimizer recommendation as target_weight so the report can show
+    # both "what we hold now" and "what model currently prefers".
     shares_by_ticker = {str(p.ticker).upper(): float(p.shares) for p in open_positions}
+    market_value_by_ticker: dict[str, float] = {}
+    open_mkt_value_total = 0.0
+    for p in open_positions:
+        px = float(prices_cad.get(p.ticker, float("nan")))
+        if pd.isna(px) or px <= 0:
+            continue
+        mv = float(px) * float(p.shares)
+        key = str(p.ticker).upper()
+        market_value_by_ticker[key] = market_value_by_ticker.get(key, 0.0) + mv
+        open_mkt_value_total += mv
+    equity_cad_live = float(state.cash_cad) + float(open_mkt_value_total)
+
     holdings_weights = holdings_weights.copy()
+    if "weight" in holdings_weights.columns:
+        holdings_weights["target_weight"] = holdings_weights["weight"]
+    else:
+        holdings_weights["target_weight"] = pd.NA
     holdings_weights["shares"] = [
         shares_by_ticker.get(str(t).upper(), pd.NA)
         for t in holdings_weights.index.astype(str)
     ]
+    holdings_weights["position_value_cad"] = [
+        market_value_by_ticker.get(str(t).upper(), pd.NA)
+        for t in holdings_weights.index.astype(str)
+    ]
+    if equity_cad_live > 0:
+        holdings_weights["actual_weight"] = pd.to_numeric(
+            holdings_weights["position_value_cad"], errors="coerce"
+        ) / float(equity_cad_live)
+    else:
+        holdings_weights["actual_weight"] = pd.NA
+    # Keep backwards compatibility for downstream code that expects `weight`:
+    # prefer actual holdings weight when available.
+    holdings_weights["weight"] = holdings_weights["actual_weight"].where(
+        pd.notna(holdings_weights["actual_weight"]),
+        holdings_weights["target_weight"],
+    )
     run_meta["portfolio_state_after_planning"] = {
         "open_positions": int(len(open_positions)),
         "closed_positions": int(len([p for p in state.positions if p.status != "OPEN"])),
