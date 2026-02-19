@@ -1,66 +1,94 @@
 ## GitHub Workflows
 
-This repo has **two** GitHub Actions workflows:
+This repository currently uses three GitHub Actions workflows:
 
-- **Train model** (weekly): `.github/workflows/train-stock-screener-model.yml`
-- **Daily trading run** (3x per weekday): `.github/workflows/daily-stock-screener.yml`
+- `daily-stock-screener.yml`: weekday daily portfolio run and email
+- `train-stock-screener-model.yml`: weekly model training/promotion
+- `reset-portfolio-state.yml`: manual cache/state reset utility
 
-Both workflows use **Actions cache** (no repo commits).
+Detailed pipeline audit: `docs/PORTFOLIO_PIPELINE_AUDIT.md`
 
-### 1) Train model workflow (weekly)
+## Daily Workflow
 
-- **What it does**:
-  - Trains the single stock-ranking ML model (`models/ensemble/manifest.json` + members)
-  - Uses a **5-day label horizon** (`LABEL_HORIZON_DAYS=5`) to match the max holding period
-  - Uploads the model artifact and also stores it in cache for the daily workflow
+File: `.github/workflows/daily-stock-screener.yml`
 
-- **Schedule**:
-  - Runs weekly on **Sunday at 02:00 UTC**.
-  - Can be run any time via `workflow_dispatch`.
+Schedule:
 
-### 2) Daily trading workflow (weekdays)
+- Weekdays at `12:00 UTC`, `15:00 UTC`, and `19:30 UTC`
+- Manual trigger via `workflow_dispatch`
 
-- **What it does**:
-  - Builds a **US + TSX/TSXV** ticker universe
-  - Downloads prices, computes features in **CAD**
-  - Ranks candidates (ML if available; baseline fallback otherwise)
-  - Produces a **stateful** trading plan with:
-    - **SELL** when `days_held >= 5` (`TIME_EXIT`)
-    - Optional `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` exits if configured
-    - **BUY** to fill portfolio slots from top-ranked names
-    - **HOLD** for positions that remain in the target set
-  - Emails `reports/daily_email.html` and attaches:
-    - `reports/daily_report.txt`
-    - `reports/portfolio_weights.csv`
-    - `reports/trade_actions.json`
+Core flow:
 
-- **Runtime budget controls**:
-  - `MAX_DAILY_RUNTIME_MINUTES=12` (default)
-  - strict feature schema parity (`STRICT_FEATURE_PARITY=1`)
-  - fallback model training disabled by default (`ALLOW_FALLBACK_TRAINING=0`)
+1. Checkout + Python setup.
+2. Restore caches for pip, data/state, and model directory.
+3. Find the latest successful training artifact and download model files.
+4. Run `python -m stock_screener.cli daily --log-level INFO`.
+5. Emit telemetry to `reports/telemetry/actions_telemetry.json`.
+6. Upload run artifacts (`reports/`, `cache/last_run_meta.json`, `screener_portfolio_state.json`).
+7. Email the HTML report and CSV/JSON attachments.
+8. Open a GitHub issue if the workflow fails.
 
-- **Cache strategy**:
-  - uses stable hash-based cache keys (not per-run IDs) for better cache reuse
-  - telemetry artifact emitted at `reports/telemetry/actions_telemetry.json`
+Runtime/controls:
 
-### Portfolio state
+- `MAX_DAILY_RUNTIME_MINUTES=12`
+- `STRICT_FEATURE_PARITY=1`
+- `USE_ML=1` with fallback behavior when model is unavailable
+- Dynamic no-trade-band and turnover controls are enabled by default
 
-- **State file**: `screener_portfolio_state.json`
-- This file is persisted via **Actions cache** and included in the run artifacts.
+## Training Workflow
 
-### Required secrets
+File: `.github/workflows/train-stock-screener-model.yml`
+
+Schedule:
+
+- Weekly on Sunday `02:00 UTC`
+- Manual trigger via `workflow_dispatch`
+
+Core flow:
+
+1. Checkout + setup + cache restore.
+2. Train model via `python -m stock_screener.cli train-model`.
+3. Evaluate promotion gate result from `models/ensemble/metrics.json`.
+4. Upload model artifact only when promotion gates pass.
+
+Notes:
+
+- Weekly cadence is intentional.
+- Promotion gates can be enforced/relaxed using repo vars and env settings.
+
+## Reset Workflow
+
+File: `.github/workflows/reset-portfolio-state.yml`
+
+Trigger:
+
+- Manual `workflow_dispatch` with `initial_cash_cad` and `dry_run`.
+
+Core flow:
+
+1. List/delete daily data caches.
+2. Create fresh `screener_portfolio_state.json` and `.bak`.
+3. Seed a reset cache key for next daily run.
+4. Upload reset state artifact and summary.
+
+## State, Caches, and Artifacts
+
+- Portfolio state path in daily runs: `screener_portfolio_state.json`.
+- State is also mirrored to `.bak` by runtime code.
+- Daily artifacts include reports and state snapshot for audit/debugging.
+- Reward logs/policy are stored under `cache/` by the pipeline.
+- Mutable portfolio/data cache now uses restore/save semantics:
+  - restore via `actions/cache/restore@v4`
+  - save via `actions/cache/save@v4` with run-unique key suffix
+  - restore key prefix remains stable for cross-run recovery
+
+Important:
+
+- Daily cache restore keys are hash-based and stable; save keys include run-unique suffixes.
+- Detailed design and remaining risks are documented in `docs/PORTFOLIO_PIPELINE_AUDIT.md`.
+
+## Required Secrets
 
 - `EMAIL_USERNAME`
 - `EMAIL_PASSWORD`
-- Optional: `EMAIL_TO` (defaults to `EMAIL_USERNAME`)
-
-### Useful environment variables
-
-- **Universe/screening**:
-  - `MAX_TICKERS`, `TOP_N`, `PORTFOLIO_SIZE`, `WEIGHT_CAP`, `MIN_PRICE_CAD`, `MIN_AVG_DOLLAR_VOLUME_CAD`
-- **Model**:
-  - `USE_ML=1`, `MODEL_PATH=models/ensemble/manifest.json`, `LABEL_HORIZON_DAYS=5`
-- **Trading**:
-  - `MAX_HOLDING_DAYS=5`
-  - Optional: `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`
-  - `PORTFOLIO_STATE_PATH=screener_portfolio_state.json`
+- Optional `EMAIL_TO` (defaults to `EMAIL_USERNAME`)

@@ -99,6 +99,7 @@ jobs:
             cache/
             data_cache/
             screener_portfolio_state.json
+            screener_portfolio_state.json.bak
           key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/daily-stock-screener.yml') }}
 
       - name: Validate reset cache seed

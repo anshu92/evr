@@ -697,7 +697,7 @@ class PortfolioManager:
         now = _utcnow()
         open_positions: list[Position] = [p for p in state.positions if p.status == "OPEN"]
         keep: list[Position] = []
-        adjusted_max_hold, _ = self.compute_dynamic_holding_days(market_vol_regime)
+        adjusted_max_hold, adjusted_hard_hold = self.compute_dynamic_holding_days(market_vol_regime)
         age_urgency_start = self.age_urgency_start_day
         if self.dynamic_holding_enabled and self.max_holding_days > 0:
             ratio = float(adjusted_max_hold) / float(self.max_holding_days)
@@ -712,6 +712,20 @@ class PortfolioManager:
             market = _market_for_ticker(p.ticker)
             days = _trading_days_between(p.entry_date, now, market=market)  # trading days (matches model)
 
+            # Hard liquidation guardrail: never allow positions to run beyond
+            # the hard holding horizon in trading-day units.
+            if days >= adjusted_hard_hold:
+                actions.append(
+                    self._sell_position(
+                        state,
+                        p,
+                        price_cad=px,
+                        reason=f"HARD_MAX_HOLD(day{adjusted_hard_hold})",
+                        days_held=days,
+                    )
+                )
+                continue
+
             # Adaptive peak-target exit: combine entry-time and today's predictions.
             # pred_peak_days is in trading days (model trained on trading-day rows).
             if self.peak_based_exit:
@@ -725,7 +739,7 @@ class PortfolioManager:
                     v = features.loc[p.ticker, "pred_peak_days"]
                     if not pd.isna(v) and float(v) > 0:
                         # Convert "trading days from today" to "trading days from entry"
-                        today_target = days + max(1, int(float(v)))
+                        today_target = days + max(1, int(round(float(v))))
 
                 # Choose the tighter (earlier) target
                 effective_target = None
@@ -741,8 +755,11 @@ class PortfolioManager:
                     effective_target = entry_target
                     exit_source = "entry"
                 elif today_target is not None:
-                    effective_target = today_target
-                    exit_source = "updated"
+                    # Legacy holdings may have no entry-time peak target.
+                    # Use the updated forecast directly and make "1 day remaining"
+                    # actionable in this run.
+                    effective_target = max(1, today_target - 1)
+                    exit_source = "updated_only"
 
                 if effective_target is not None and days >= effective_target:
                     actions.append(self._sell_position(

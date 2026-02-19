@@ -1,6 +1,6 @@
-# Stock Screener (CAD) + Short-Horizon Trading (max 5 days)
+# Stock Screener (CAD) + Short-Horizon Trading (Adaptive Exits)
 
-This repo runs a daily **US + TSX/TSXV** stock screener, recommends a portfolio, and produces explicit **BUY/SELL/HOLD** actions with a **max holding period of 5 days**. It also trains a single ML ranking model weekly (Sunday 02:00 UTC).
+This repo runs a daily **US + TSX/TSXV** stock screener, recommends a portfolio, and produces explicit **BUY/SELL/HOLD** actions with adaptive short-horizon exits (typically 1-5 trading days, strategy dependent). It also trains a single ML ranking model weekly (Sunday 02:00 UTC).
 
 ### What you get each day
 

@@ -2,10 +2,30 @@ from pathlib import Path
 import re
 
 
-def test_daily_workflow_cache_keys_are_not_run_id_based():
+def test_daily_workflow_uses_restore_save_cache_pattern():
     text = Path(".github/workflows/daily-stock-screener.yml").read_text(encoding="utf-8")
     assert "key: ${{ runner.os }}-daily-screener-data-${{ github.run_id }}" not in text
-    assert "key: ${{ runner.os }}-screener-model-${{ github.run_id }}" not in text
+    assert "uses: actions/cache/restore@v4" in text
+    assert "uses: actions/cache/save@v4" in text
+    assert "id: cache_data_restore" in text
+    assert "steps.cache_data_restore.outputs.cache-hit" in text
+    assert (
+        "key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/daily-stock-screener.yml') }}-${{ github.run_id }}"
+        in text
+    )
+
+
+def test_daily_workflow_model_artifact_selection_hardened():
+    text = Path(".github/workflows/daily-stock-screener.yml").read_text(encoding="utf-8")
+    assert "branch: defaultBranch" in text
+    assert "per_page: 50" in text
+
+
+def test_daily_workflow_has_concurrency_guard():
+    text = Path(".github/workflows/daily-stock-screener.yml").read_text(encoding="utf-8")
+    assert "concurrency:" in text
+    assert "group: daily-stock-screener" in text
+    assert "cancel-in-progress: false" in text
 
 
 def test_train_workflow_cache_keys_are_not_run_id_based():

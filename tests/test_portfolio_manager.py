@@ -11,8 +11,8 @@ from stock_screener.portfolio.manager import (
 from stock_screener.portfolio.state import PortfolioState, Position
 
 
-def test_portfolio_manager_no_time_exit():
-    """Positions should not be sold purely for exceeding holding days."""
+def test_portfolio_manager_hard_max_hold_exit():
+    """Positions should be liquidated once hard max holding days is reached."""
     logger = logging.getLogger("test")
     
     manager = PortfolioManager(
@@ -36,9 +36,9 @@ def test_portfolio_manager_no_time_exit():
         logger=logger,
     )
     
-    # Create a position old enough to exceed 5 trading days.
+    # Create a position old enough to exceed hard max holding days.
     now = datetime.now(tz=timezone.utc)
-    entry_date = now - timedelta(days=8)
+    entry_date = now - timedelta(days=21)
     
     state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
     state.positions.append(
@@ -54,9 +54,10 @@ def test_portfolio_manager_no_time_exit():
     
     actions = manager.apply_exits(state, prices)
     
-    # No max-days sell logic: this should remain open.
-    assert len(actions) == 0
-    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 1
+    assert len(actions) == 1
+    assert actions[0].action == "SELL"
+    assert actions[0].reason.startswith("HARD_MAX_HOLD")
+    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 0
 
 
 def test_portfolio_manager_stop_loss():
@@ -216,6 +217,59 @@ def test_portfolio_manager_peak_detection():
     assert actions[0].shares == 5  # 50% of 10
     assert actions[0].entry_price == pytest.approx(100.0)
     assert actions[0].realized_gain_pct == pytest.approx(0.10)
+
+
+def test_peak_target_updated_only_exits_without_entry_target(tmp_path):
+    """Legacy positions without entry peak metadata should still exit on updated peak forecast."""
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+    entry_date = now - timedelta(days=6)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=10,
+        max_holding_days_hard=30,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=True,
+        twr_optimization=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=0,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=1000.0,
+        positions=[
+            Position(
+                ticker="AAPL",
+                entry_price=100.0,
+                entry_date=entry_date,
+                shares=1.0,
+                entry_pred_peak_days=None,  # legacy / missing metadata case
+            )
+        ],
+        last_updated=now,
+    )
+    prices = pd.Series({"AAPL": 110.0})
+    features = pd.DataFrame({"pred_peak_days": [1.0]}, index=["AAPL"])
+
+    actions = manager.apply_exits(state, prices, features=features)
+
+    assert len(actions) == 1
+    assert actions[0].action == "SELL"
+    assert actions[0].reason.startswith("PEAK_TARGET")
+    assert "updated_only" in actions[0].reason
 
 
 def test_peak_full_liquidation_emits_sell(tmp_path):
