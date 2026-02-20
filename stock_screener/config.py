@@ -94,6 +94,9 @@ class Config:
     sector_neutral_selection: bool = True  # Diversify picks across sectors instead of pure top-N
     volatility_targeting: bool = True  # Scale exposure based on market volatility
     target_volatility: float = 0.15  # Target annualized portfolio volatility (15%)
+    instrument_sleeve_constraints_enabled: bool = True  # Keep defensive funds capped so equities retain core allocation
+    instrument_fund_max_weight: float = 0.35  # Max total weight allocated to ETFs/funds
+    instrument_equity_min_weight: float = 0.50  # Min total weight allocated to equities
     
     # Drawdown risk management
     drawdown_management: bool = True  # Reduce exposure when in drawdown
@@ -363,6 +366,9 @@ class Config:
             sector_neutral_selection=os.getenv("SECTOR_NEUTRAL_SELECTION", "1").strip() in {"1", "true", "True"},
             volatility_targeting=os.getenv("VOLATILITY_TARGETING", "1").strip() in {"1", "true", "True"},
             target_volatility=_get_float("TARGET_VOLATILITY", 0.15),
+            instrument_sleeve_constraints_enabled=_get_bool("INSTRUMENT_SLEEVE_CONSTRAINTS_ENABLED", True),
+            instrument_fund_max_weight=_get_float("INSTRUMENT_FUND_MAX_WEIGHT", 0.35),
+            instrument_equity_min_weight=_get_float("INSTRUMENT_EQUITY_MIN_WEIGHT", 0.50),
             drawdown_management=os.getenv("DRAWDOWN_MANAGEMENT", "1").strip() in {"1", "true", "True"},
             max_drawdown_threshold=_get_float("MAX_DRAWDOWN_THRESHOLD", -0.10),
             drawdown_min_scalar=_get_float("DRAWDOWN_MIN_SCALAR", 0.25),

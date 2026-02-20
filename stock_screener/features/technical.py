@@ -230,6 +230,9 @@ def compute_features(
         # Extract fundamental data
         sector = None
         industry = None
+        quote_type = None
+        fund_family = None
+        fund_category = None
         market_cap = float("nan")
         beta = float("nan")
         trailing_pe = float("nan")
@@ -258,6 +261,9 @@ def compute_features(
             row = fundamentals.loc[t]
             sector = row.get("sector") if isinstance(row, pd.Series) else None
             industry = row.get("industry") if isinstance(row, pd.Series) else None
+            quote_type = row.get("quoteType") if isinstance(row, pd.Series) else None
+            fund_family = row.get("fundFamily") if isinstance(row, pd.Series) else None
+            fund_category = row.get("category") if isinstance(row, pd.Series) else None
             market_cap = float(row.get("marketCap")) if row.get("marketCap") is not None else float("nan")
             beta = float(row.get("beta")) if row.get("beta") is not None else float("nan")
             trailing_pe = float(row.get("trailingPE")) if row.get("trailingPE") is not None else float("nan")
@@ -339,6 +345,9 @@ def compute_features(
                 "beta": beta,
                 "sector": sector,  # Raw sector for target encoding
                 "industry": industry,  # Raw industry for target encoding
+                "quote_type": quote_type,
+                "fund_family": fund_family,
+                "fund_category": fund_category,
                 "sector_hash": _hash_to_float(str(sector)) if sector else float("nan"),
                 "industry_hash": _hash_to_float(str(industry)) if industry else float("nan"),
                 "sector_target_enc": float("nan"),  # Placeholder - filled by apply_target_encodings()

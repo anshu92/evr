@@ -116,6 +116,8 @@ Implemented in follow-up revision (2026-02-20):
 12. Portfolio breadth ceiling widened (config cap `12`) and daily workflow defaults updated to `PORTFOLIO_SIZE=8`, `DYNAMIC_SIZE_MAX_POSITIONS=8`, `WEIGHT_CAP=0.20` to reduce structural under-investment.
 13. `LOW_DAILY_RETURN` exits now have a residual-alpha guard (`low_daily_return_hold_min_pred_return`) so positions are not force-exited when live model signal remains strong.
 14. Targeted regression tests added for adaptive entry thresholds, widened portfolio-size cap behavior, and residual-alpha low-daily-return override semantics.
+15. Instrument sleeve constraints added to portfolio construction (`instrument_fund_max_weight`, `instrument_equity_min_weight`) so ETF/fund exposure is capped and equity sleeve retains minimum allocation.
+16. Daily workflow health summary now reports adaptive entry thresholds and instrument sleeve shifts from `cache/last_run_meta.json` for easier production monitoring.
 
 Remaining recommended improvements:
 

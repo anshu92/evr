@@ -34,6 +34,9 @@ def _build_payload(info: dict[str, Any]) -> dict[str, Any]:
     return {
         "sector": _safe_info_value(info, "sector"),
         "industry": _safe_info_value(info, "industry"),
+        "quoteType": _safe_info_value(info, "quoteType"),
+        "fundFamily": _safe_info_value(info, "fundFamily"),
+        "category": _safe_info_value(info, "category"),
         "marketCap": _safe_info_value(info, "marketCap"),
         "beta": _safe_info_value(info, "beta"),
         # Valuation ratios

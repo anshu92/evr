@@ -208,6 +208,9 @@ jobs:
           DYNAMIC_SIZE_MAX_POSITIONS: "8"
           PORTFOLIO_BUDGET_CAD: "500"
           WEIGHT_CAP: "0.20"
+          INSTRUMENT_SLEEVE_CONSTRAINTS_ENABLED: "1"
+          INSTRUMENT_FUND_MAX_WEIGHT: "0.35"
+          INSTRUMENT_EQUITY_MIN_WEIGHT: "0.50"
           MIN_PRICE_CAD: "5.0"
           MIN_AVG_DOLLAR_VOLUME_CAD: "5000000"
           MAX_SCREEN_VOLATILITY: "0.80"
@@ -325,6 +328,7 @@ jobs:
 
           telemetry = load_json("reports/telemetry/actions_telemetry.json") or {}
           state = load_json("screener_portfolio_state.json") or {}
+          run_meta = load_json("cache/last_run_meta.json") or {}
           reward_log = load_json("cache/reward_log.json") or {}
           action_reward_log = load_json("cache/action_reward_log.json") or {}
           reward_policy = load_json("cache/reward_policy.json") or {}
@@ -370,6 +374,33 @@ jobs:
               policy_state = {}
           policy_updates = int(policy_state.get("n_updates", 0) or 0)
 
+          entry_thresholds = run_meta.get("entry_thresholds") if isinstance(run_meta, dict) else {}
+          if not isinstance(entry_thresholds, dict):
+              entry_thresholds = {}
+          entry_dynamic_applied = bool(entry_thresholds.get("dynamic_applied", False))
+          entry_min_conf = entry_thresholds.get("min_confidence")
+          entry_min_pred = entry_thresholds.get("min_pred_return")
+          if entry_min_conf is None:
+              entry_min_conf_str = "na"
+          else:
+              entry_min_conf_str = f"{float(entry_min_conf):.3f}"
+          if entry_min_pred is None:
+              entry_min_pred_str = "na"
+          else:
+              entry_min_pred_str = f"{float(entry_min_pred) * 100.0:.2f}%"
+
+          instrument_sleeves = run_meta.get("instrument_sleeves") if isinstance(run_meta, dict) else {}
+          if not isinstance(instrument_sleeves, dict):
+              instrument_sleeves = {}
+          sleeves_applied = bool(instrument_sleeves.get("applied", False))
+          fund_before = instrument_sleeves.get("fund_weight_before")
+          fund_after = instrument_sleeves.get("fund_weight_after")
+          if fund_before is None or fund_after is None:
+              fund_shift_str = "na"
+          else:
+              fund_shift_str = f"{float(fund_before) * 100.0:.1f}% -> {float(fund_after) * 100.0:.1f}%"
+          sleeves_reason = str(instrument_sleeves.get("reason", "na"))
+
           action_counts = {"BUY": 0, "SELL": 0, "SELL_PARTIAL": 0, "HOLD": 0}
           for action in trade_actions:
               if not isinstance(action, dict):
@@ -394,6 +425,12 @@ jobs:
               "sell_count": str(action_counts["SELL"]),
               "sell_partial_count": str(action_counts["SELL_PARTIAL"]),
               "hold_count": str(action_counts["HOLD"]),
+              "entry_dynamic_applied": str(entry_dynamic_applied).lower(),
+              "entry_min_confidence": entry_min_conf_str,
+              "entry_min_pred_return": entry_min_pred_str,
+              "instrument_sleeves_applied": str(sleeves_applied).lower(),
+              "instrument_fund_shift": fund_shift_str,
+              "instrument_sleeves_reason": sleeves_reason,
           }
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
@@ -413,6 +450,8 @@ jobs:
             echo "- Portfolio state age (hours): \`${{ steps.health_counters.outputs.state_age_hours }}\`"
             echo "- Open/closed positions: \`${{ steps.health_counters.outputs.open_positions }}/${{ steps.health_counters.outputs.closed_positions }}\`"
             echo "- Trade actions (BUY/SELL/SELL_PARTIAL/HOLD): \`${{ steps.health_counters.outputs.buy_count }}/${{ steps.health_counters.outputs.sell_count }}/${{ steps.health_counters.outputs.sell_partial_count }}/${{ steps.health_counters.outputs.hold_count }}\`"
+            echo "- Entry thresholds (dynamic/conf/pred): \`${{ steps.health_counters.outputs.entry_dynamic_applied }}/${{ steps.health_counters.outputs.entry_min_confidence }}/${{ steps.health_counters.outputs.entry_min_pred_return }}\`"
+            echo "- Instrument sleeves (applied/fund shift/reason): \`${{ steps.health_counters.outputs.instrument_sleeves_applied }}/${{ steps.health_counters.outputs.instrument_fund_shift }}/${{ steps.health_counters.outputs.instrument_sleeves_reason }}\`"
             echo "- Reward log entries: \`${{ steps.health_counters.outputs.reward_entries }}\`"
             echo "- Action reward entries (scored): \`${{ steps.health_counters.outputs.action_reward_entries }} (${{ steps.health_counters.outputs.action_reward_scored }})\`"
             echo "- Reward policy updates: \`${{ steps.health_counters.outputs.policy_updates }}\`"

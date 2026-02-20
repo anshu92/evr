@@ -26,7 +26,7 @@ Core flow:
 3. Find the latest successful training artifact and download model files.
 4. Run `python -m stock_screener.cli daily --log-level INFO`.
 5. Emit telemetry to `reports/telemetry/actions_telemetry.json`.
-6. Compute state/reward/action health counters and write `$GITHUB_STEP_SUMMARY`.
+6. Compute state/reward/action health counters and write `$GITHUB_STEP_SUMMARY` (including adaptive entry thresholds and instrument sleeve shifts).
 7. Upload run artifacts (`reports/`, `cache/last_run_meta.json`, `screener_portfolio_state.json`).
 8. Email the HTML report and CSV/JSON attachments.
 9. Open a GitHub issue if the workflow fails.
@@ -37,6 +37,7 @@ Runtime/controls:
 - `STRICT_FEATURE_PARITY=1`
 - `USE_ML=1` with fallback behavior when model is unavailable
 - Portfolio construction defaults: `PORTFOLIO_SIZE=8`, `DYNAMIC_SIZE_MAX_POSITIONS=8`, `WEIGHT_CAP=0.20`
+- Instrument sleeve constraints enabled by default (`INSTRUMENT_FUND_MAX_WEIGHT=0.35`, `INSTRUMENT_EQUITY_MIN_WEIGHT=0.50`)
 - Adaptive entry thresholds enabled (`ENTRY_DYNAMIC_THRESHOLDS_ENABLED=1`) with percentile-based relax-only floors
 - Dynamic no-trade-band and turnover controls are enabled by default
 - Concurrency guard enabled: one daily run at a time (`concurrency.group: daily-stock-screener`)

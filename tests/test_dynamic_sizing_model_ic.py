@@ -61,6 +61,24 @@ def test_entry_dynamic_threshold_defaults_and_env(monkeypatch):
     assert cfg_env.entry_min_pred_return_floor == 0.004
 
 
+def test_instrument_sleeve_defaults_and_env(monkeypatch):
+    monkeypatch.delenv("INSTRUMENT_SLEEVE_CONSTRAINTS_ENABLED", raising=False)
+    monkeypatch.delenv("INSTRUMENT_FUND_MAX_WEIGHT", raising=False)
+    monkeypatch.delenv("INSTRUMENT_EQUITY_MIN_WEIGHT", raising=False)
+    cfg_default = Config.from_env()
+    assert cfg_default.instrument_sleeve_constraints_enabled is True
+    assert cfg_default.instrument_fund_max_weight == 0.35
+    assert cfg_default.instrument_equity_min_weight == 0.50
+
+    monkeypatch.setenv("INSTRUMENT_SLEEVE_CONSTRAINTS_ENABLED", "0")
+    monkeypatch.setenv("INSTRUMENT_FUND_MAX_WEIGHT", "0.25")
+    monkeypatch.setenv("INSTRUMENT_EQUITY_MIN_WEIGHT", "0.65")
+    cfg_env = Config.from_env()
+    assert cfg_env.instrument_sleeve_constraints_enabled is False
+    assert cfg_env.instrument_fund_max_weight == 0.25
+    assert cfg_env.instrument_equity_min_weight == 0.65
+
+
 def test_rotate_on_missing_data_defaults_off_and_reads_env(monkeypatch):
     monkeypatch.delenv("ROTATE_ON_MISSING_DATA", raising=False)
     assert Config.from_env().rotate_on_missing_data is False

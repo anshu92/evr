@@ -313,6 +313,171 @@ def _compute_effective_entry_thresholds(
     return result
 
 
+def _infer_instrument_type_row(row: pd.Series) -> str:
+    """Classify ticker as EQUITY or FUND using fundamentals metadata + fallbacks."""
+    quote_type = str(row.get("quote_type", "") or "").strip().lower()
+    fund_family = str(row.get("fund_family", "") or "").strip().lower()
+    fund_category = str(row.get("fund_category", "") or "").strip().lower()
+    sector = str(row.get("sector", "") or "").strip()
+    industry = str(row.get("industry", "") or "").strip()
+    log_mcap = pd.to_numeric(row.get("log_market_cap"), errors="coerce")
+
+    fund_score = 0
+    equity_score = 0
+
+    if quote_type == "equity":
+        equity_score += 3
+    if any(k in quote_type for k in ("etf", "fund", "mutual")):
+        fund_score += 3
+    if fund_family:
+        fund_score += 1
+    if fund_category:
+        fund_score += 1
+    if sector:
+        equity_score += 1
+    if industry:
+        equity_score += 1
+    if pd.notna(log_mcap):
+        equity_score += 1
+    if pd.isna(log_mcap) and not sector and not industry:
+        fund_score += 1
+
+    return "FUND" if fund_score > equity_score else "EQUITY"
+
+
+def _infer_instrument_types(frame: pd.DataFrame) -> pd.Series:
+    if frame is None or frame.empty:
+        return pd.Series(dtype=object)
+    out = frame.apply(_infer_instrument_type_row, axis=1)
+    return out.astype(str)
+
+
+def _apply_instrument_sleeve_constraints(
+    target_weights: pd.DataFrame,
+    *,
+    screened: pd.DataFrame,
+    cfg: Config,
+    logger,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Cap fund sleeve and enforce minimum equity sleeve without changing gross exposure."""
+    info: dict[str, Any] = {"enabled": bool(getattr(cfg, "instrument_sleeve_constraints_enabled", True))}
+    if target_weights.empty or "weight" not in target_weights.columns:
+        info["applied"] = False
+        info["reason"] = "empty_target_weights"
+        return target_weights, info
+    if not info["enabled"]:
+        info["applied"] = False
+        info["reason"] = "disabled"
+        return target_weights, info
+
+    out = target_weights.copy()
+    w = pd.to_numeric(out["weight"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    invested = float(w.sum())
+    if invested <= 0:
+        info["applied"] = False
+        info["reason"] = "zero_invested_weight"
+        return out, info
+
+    instrument_frame = screened.reindex(out.index) if screened is not None and not screened.empty else out
+    types = _infer_instrument_types(instrument_frame).reindex(out.index).fillna("EQUITY")
+    fund_mask = types == "FUND"
+    equity_mask = ~fund_mask
+
+    if not bool(fund_mask.any()) or not bool(equity_mask.any()):
+        info["applied"] = False
+        info["reason"] = "single_sleeve_only"
+        info["fund_count"] = int(fund_mask.sum())
+        info["equity_count"] = int(equity_mask.sum())
+        return out, info
+
+    max_fund = float(max(0.0, min(1.0, float(getattr(cfg, "instrument_fund_max_weight", 0.35)))))
+    min_equity = float(max(0.0, min(1.0, float(getattr(cfg, "instrument_equity_min_weight", 0.50)))))
+    eff_max_fund = min(max_fund, invested)
+    eff_min_equity = min(min_equity, invested)
+
+    fund_before = float(w[fund_mask].sum())
+    equity_before = float(w[equity_mask].sum())
+    shift_for_fund_cap = max(0.0, fund_before - eff_max_fund)
+    shift_for_equity_floor = max(0.0, eff_min_equity - equity_before)
+    shift = min(fund_before, max(shift_for_fund_cap, shift_for_equity_floor))
+
+    if shift <= 1e-12:
+        info.update(
+            {
+                "applied": False,
+                "reason": "already_within_bounds",
+                "fund_weight_before": fund_before,
+                "equity_weight_before": equity_before,
+                "fund_weight_after": fund_before,
+                "equity_weight_after": equity_before,
+                "invested_weight": invested,
+                "max_fund_weight": eff_max_fund,
+                "min_equity_weight": eff_min_equity,
+                "fund_count": int(fund_mask.sum()),
+                "equity_count": int(equity_mask.sum()),
+            }
+        )
+        return out, info
+
+    fund_weights = w[fund_mask]
+    equity_weights = w[equity_mask]
+    fund_total = float(fund_weights.sum())
+    equity_total = float(equity_weights.sum())
+    if fund_total <= 0:
+        info["applied"] = False
+        info["reason"] = "no_fund_weight"
+        return out, info
+
+    # Remove from fund sleeve proportionally.
+    reduce_ratio = shift / fund_total
+    fund_new = fund_weights * max(0.0, (1.0 - reduce_ratio))
+    out.loc[fund_mask, "weight"] = fund_new
+
+    # Add to equity sleeve proportionally (or evenly when equity sleeve is zero).
+    if equity_total > 0:
+        equity_new = equity_weights + (equity_weights / equity_total) * shift
+    else:
+        n_eq = int(equity_mask.sum())
+        if n_eq <= 0:
+            info["applied"] = False
+            info["reason"] = "no_equity_receivers"
+            return target_weights, info
+        equity_new = pd.Series(shift / n_eq, index=equity_weights.index, dtype=float)
+    out.loc[equity_mask, "weight"] = equity_new
+
+    out["weight"] = pd.to_numeric(out["weight"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    after_sum = float(out["weight"].sum())
+    if after_sum > 0 and abs(after_sum - invested) > 1e-8:
+        out["weight"] = out["weight"] * (invested / after_sum)
+
+    fund_after = float(out.loc[fund_mask, "weight"].sum())
+    equity_after = float(out.loc[equity_mask, "weight"].sum())
+    info.update(
+        {
+            "applied": True,
+            "fund_weight_before": fund_before,
+            "equity_weight_before": equity_before,
+            "fund_weight_after": fund_after,
+            "equity_weight_after": equity_after,
+            "invested_weight": invested,
+            "max_fund_weight": eff_max_fund,
+            "min_equity_weight": eff_min_equity,
+            "fund_count": int(fund_mask.sum()),
+            "equity_count": int(equity_mask.sum()),
+            "shift_weight": shift,
+        }
+    )
+    logger.info(
+        "Instrument sleeve rebalance: fund %.1f%% -> %.1f%%, equity %.1f%% -> %.1f%% (shift=%.1f%%)",
+        fund_before * 100.0,
+        fund_after * 100.0,
+        equity_before * 100.0,
+        equity_after * 100.0,
+        shift * 100.0,
+    )
+    return out, info
+
+
 def _validate_feature_parity(
     features_df: pd.DataFrame,
     selected_features: list[str] | None,
@@ -1274,6 +1439,16 @@ def run_daily(cfg: Config, logger) -> None:
                 logger=logger,
             )
     
+    # Apply instrument sleeve constraints (equity vs fund cap/floor) before
+    # top-level exposure scaling so sleeve proportions persist through scalars.
+    target_weights, sleeve_info = _apply_instrument_sleeve_constraints(
+        target_weights,
+        screened=screened,
+        cfg=cfg,
+        logger=logger,
+    )
+    run_meta["instrument_sleeves"] = sleeve_info
+
     # Apply regime-aware exposure scaling
     cash_from_regime = 0.0
     regime_enabled = getattr(cfg, "regime_exposure_enabled", True)
