@@ -6,7 +6,6 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
-import tempfile
 from typing import Any
 
 try:
@@ -46,6 +45,11 @@ def _backup_path(path: Path) -> Path:
     return Path(str(path) + ".bak")
 
 
+def resolve_portfolio_event_log_path(state_path: str | Path) -> Path:
+    p = Path(state_path)
+    return Path(str(p) + ".events.jsonl")
+
+
 @contextmanager
 def _state_lock(path: Path, *, exclusive: bool):
     lock_path = Path(str(path) + ".lock")
@@ -79,25 +83,193 @@ def _read_json_dict(path: Path) -> dict[str, Any] | None:
     return data
 
 
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    fd: int | None = None
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        os.fsync(fd)
+    except OSError:
+        return
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _atomic_write_text(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
+    tmp_name = str(path) + ".tmp"
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with open(tmp_name, "w", encoding="utf-8") as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_name, path)
+        os.replace(tmp_name, str(path))
+        _fsync_directory(path.parent)
     finally:
         try:
             if os.path.exists(tmp_name):
                 os.remove(tmp_name)
         except OSError:
             pass
+
+
+def append_portfolio_events(
+    event_log_path: str | Path,
+    events: list[dict[str, Any]],
+) -> int:
+    """Append portfolio action events to a JSONL log with fsync durability."""
+    p = Path(event_log_path)
+    normalized_lines: list[str] = []
+    for raw in events or []:
+        if not isinstance(raw, dict):
+            continue
+        action = str(raw.get("action", "")).strip().upper()
+        ticker = str(raw.get("ticker", "")).strip().upper()
+        if action not in {"BUY", "SELL", "SELL_PARTIAL"}:
+            continue
+        if not ticker:
+            continue
+
+        shares = _opt_float(raw.get("shares"))
+        price_cad = _opt_float(raw.get("price_cad"))
+        if shares is None or shares <= 0:
+            continue
+        if price_cad is None or price_cad <= 0:
+            continue
+
+        event = dict(raw)
+        event["action"] = action
+        event["ticker"] = ticker
+        event["shares"] = float(shares)
+        event["price_cad"] = float(price_cad)
+
+        ts = _dt_from_iso(str(event.get("ts_utc") or "")) or _utcnow()
+        event["ts_utc"] = ts.isoformat()
+        normalized_lines.append(json.dumps(event, sort_keys=True))
+
+    if not normalized_lines:
+        return 0
+
+    with _state_lock(p, exclusive=True):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as fh:
+            for line in normalized_lines:
+                fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        _fsync_directory(p.parent)
+    return len(normalized_lines)
+
+
+def rebuild_portfolio_state_from_events(
+    state_path: str | Path,
+    initial_cash_cad: float = 500.0,
+) -> PortfolioState | None:
+    """Best-effort state reconstruction from append-only action events."""
+    event_path = resolve_portfolio_event_log_path(state_path)
+    if not event_path.exists():
+        return None
+
+    open_positions: dict[str, Position] = {}
+    closed_positions: list[Position] = []
+    cash_cad = float(initial_cash_cad)
+    last_updated = _utcnow()
+    n_events = 0
+
+    with _state_lock(event_path, exclusive=False):
+        try:
+            lines = event_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(event, dict):
+            continue
+
+        action = str(event.get("action", "")).strip().upper()
+        ticker = str(event.get("ticker", "")).strip().upper()
+        if action not in {"BUY", "SELL", "SELL_PARTIAL"} or not ticker:
+            continue
+
+        shares = _opt_float(event.get("shares"))
+        price_cad = _opt_float(event.get("price_cad"))
+        if shares is None or shares <= 0:
+            continue
+        if price_cad is None or price_cad <= 0:
+            continue
+
+        ts = _dt_from_iso(str(event.get("ts_utc") or "")) or _utcnow()
+        reason = str(event.get("reason", action)).strip() or action
+        n_events += 1
+        last_updated = ts
+
+        if action == "BUY":
+            cost = float(price_cad) * float(shares)
+            cash_cad -= cost
+            pos = open_positions.get(ticker)
+            if pos is None:
+                open_positions[ticker] = Position(
+                    ticker=ticker,
+                    entry_price=float(price_cad),
+                    entry_date=ts,
+                    shares=float(shares),
+                )
+                continue
+
+            prev_shares = float(pos.shares)
+            total_shares = prev_shares + float(shares)
+            if total_shares <= 0:
+                continue
+            pos.entry_price = (
+                (float(pos.entry_price) * prev_shares) + (float(price_cad) * float(shares))
+            ) / total_shares
+            pos.shares = total_shares
+            if ts < pos.entry_date:
+                pos.entry_date = ts
+            continue
+
+        pos = open_positions.get(ticker)
+        if pos is None:
+            continue
+
+        sell_shares = min(float(shares), float(pos.shares))
+        if sell_shares <= 0:
+            continue
+        cash_cad += float(price_cad) * sell_shares
+
+        remaining = float(pos.shares) - sell_shares
+        if remaining <= 1e-9:
+            pos.status = f"CLOSED:{reason}"
+            pos.exit_price = float(price_cad)
+            pos.exit_date = ts
+            pos.exit_reason = reason
+            closed_positions.append(pos)
+            del open_positions[ticker]
+            continue
+
+        pos.shares = round(remaining, 8)
+        if action == "SELL_PARTIAL":
+            pos.last_partial_sell_at = ts
+
+    if n_events == 0:
+        return None
+    return PortfolioState(
+        cash_cad=float(cash_cad),
+        positions=list(open_positions.values()) + closed_positions,
+        last_updated=last_updated,
+        pnl_history=[],
+    )
 
 
 @dataclass
@@ -141,6 +313,9 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
     p = Path(path)
     bkp = _backup_path(p)
     if not p.exists() and not bkp.exists():
+        rebuilt = rebuild_portfolio_state_from_events(p, initial_cash_cad=initial_cash_cad)
+        if rebuilt is not None:
+            return rebuilt
         return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
 
     with _state_lock(p, exclusive=False):
@@ -148,6 +323,9 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
         if data is None:
             data = _read_json_dict(bkp)
     if data is None:
+        rebuilt = rebuild_portfolio_state_from_events(p, initial_cash_cad=initial_cash_cad)
+        if rebuilt is not None:
+            return rebuilt
         return PortfolioState(cash_cad=float(initial_cash_cad), positions=[], last_updated=_utcnow(), pnl_history=[])
 
     try:

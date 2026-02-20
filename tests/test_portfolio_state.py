@@ -2,7 +2,15 @@ import json
 from datetime import datetime, timezone, timedelta
 
 from stock_screener.portfolio.manager import _trading_days_between
-from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, PortfolioState, Position
+from stock_screener.portfolio.state import (
+    PortfolioState,
+    Position,
+    append_portfolio_events,
+    load_portfolio_state,
+    rebuild_portfolio_state_from_events,
+    resolve_portfolio_event_log_path,
+    save_portfolio_state,
+)
 
 
 def test_load_state_normalizes_naive_datetimes_to_utc(tmp_path):
@@ -147,3 +155,81 @@ def test_save_load_preserves_last_partial_sell_at(tmp_path):
     assert len(loaded.positions) == 1
     assert loaded.positions[0].last_partial_sell_at is not None
     assert loaded.positions[0].last_partial_sell_at == partial_ts
+
+
+def test_rebuild_state_from_events_round_trip(tmp_path):
+    state_path = tmp_path / "state.json"
+    event_path = resolve_portfolio_event_log_path(state_path)
+    t0 = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)
+    t1 = datetime(2025, 1, 7, 15, 0, tzinfo=timezone.utc)
+    t2 = datetime(2025, 1, 8, 15, 0, tzinfo=timezone.utc)
+
+    append_portfolio_events(
+        event_path,
+        [
+            {
+                "ts_utc": t0.isoformat(),
+                "source": "test",
+                "action": "BUY",
+                "ticker": "AAPL",
+                "shares": 2.0,
+                "price_cad": 100.0,
+                "reason": "TEST_BUY",
+            },
+            {
+                "ts_utc": t1.isoformat(),
+                "source": "test",
+                "action": "SELL_PARTIAL",
+                "ticker": "AAPL",
+                "shares": 0.5,
+                "price_cad": 110.0,
+                "reason": "TEST_PARTIAL",
+            },
+            {
+                "ts_utc": t2.isoformat(),
+                "source": "test",
+                "action": "SELL",
+                "ticker": "AAPL",
+                "shares": 1.5,
+                "price_cad": 120.0,
+                "reason": "TEST_SELL",
+            },
+        ],
+    )
+
+    rebuilt = rebuild_portfolio_state_from_events(state_path, initial_cash_cad=1000.0)
+    assert rebuilt is not None
+    assert rebuilt.cash_cad == 1035.0  # 1000 - 200 + 55 + 180
+    assert rebuilt.last_updated == t2
+    assert len([p for p in rebuilt.positions if p.status == "OPEN"]) == 0
+    closed = [p for p in rebuilt.positions if p.status != "OPEN"]
+    assert len(closed) == 1
+    assert closed[0].ticker == "AAPL"
+    assert closed[0].exit_reason == "TEST_SELL"
+
+
+def test_load_state_falls_back_to_events_when_primary_unreadable(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+    event_path = resolve_portfolio_event_log_path(state_path)
+    ts = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)
+
+    append_portfolio_events(
+        event_path,
+        [
+            {
+                "ts_utc": ts.isoformat(),
+                "source": "test",
+                "action": "BUY",
+                "ticker": "MSFT",
+                "shares": 1.0,
+                "price_cad": 50.0,
+                "reason": "TEST_BUY",
+            }
+        ],
+    )
+
+    loaded = load_portfolio_state(state_path, initial_cash_cad=500.0)
+    assert loaded.cash_cad == 450.0
+    assert len([p for p in loaded.positions if p.status == "OPEN"]) == 1
+    assert loaded.positions[0].ticker == "MSFT"

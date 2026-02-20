@@ -130,6 +130,41 @@ def render_reports(
         lines.append(f"Regressor: {_fmt_ic_summary(reg_summary)}")
         lines.append("")
 
+    projection_audit = run_meta.get("optimizer_projection_audit", {}) if isinstance(run_meta, dict) else {}
+    if isinstance(projection_audit, dict) and projection_audit:
+        lines.append("OPTIMIZER PROJECTION AUDIT")
+        lines.append("-" * 78)
+        pre = projection_audit.get("pre_rebalance_vs_final", {})
+        opt = projection_audit.get("optimizer_vs_final", {})
+        if isinstance(pre, dict):
+            lines.append(
+                "PreRebalance->Final: "
+                f"l1={_fmt_num(pre.get('l1_distance'))} "
+                f"l2={_fmt_num(pre.get('l2_distance'))} "
+                f"changed={pre.get('changed_count', 'N/A')} "
+                f"dropped={pre.get('dropped_count', 'N/A')}"
+            )
+        if isinstance(opt, dict) and opt:
+            lines.append(
+                "Optimizer->Final: "
+                f"l1={_fmt_num(opt.get('l1_distance'))} "
+                f"l2={_fmt_num(opt.get('l2_distance'))} "
+                f"changed={opt.get('changed_count', 'N/A')} "
+                f"dropped={opt.get('dropped_count', 'N/A')}"
+            )
+        notional_drops = projection_audit.get("notional_drops_with_reasons", [])
+        if isinstance(notional_drops, list) and notional_drops:
+            lines.append("Notional gate drops (ticker/reason):")
+            for evt in notional_drops[:15]:
+                if not isinstance(evt, dict):
+                    continue
+                ticker = str(evt.get("ticker", ""))
+                reason = str(evt.get("reason_code", "unknown"))
+                lines.append(f"{ticker}: {reason}")
+            if len(notional_drops) > 15:
+                lines.append(f"... +{len(notional_drops) - 15} more")
+        lines.append("")
+
     def _top_table(df: pd.DataFrame, n: int) -> list[str]:
         cols = [
             "score",

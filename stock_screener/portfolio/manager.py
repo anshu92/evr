@@ -5,7 +5,13 @@ from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 
-from stock_screener.portfolio.state import PortfolioState, Position, save_portfolio_state
+from stock_screener.portfolio.state import (
+    PortfolioState,
+    Position,
+    append_portfolio_events,
+    resolve_portfolio_event_log_path,
+    save_portfolio_state,
+)
 from typing import Any
 
 
@@ -275,6 +281,8 @@ class PortfolioManager:
         min_trade_notional_cad: float = 10.0,
         min_rebalance_weight_delta: float = 0.01,
         rotate_on_missing_data: bool = False,
+        rotation_cooldown_days: int = 2,
+        event_log_path: str | None = None,
     ) -> None:
         self.state_path = state_path
         self.max_holding_days = max(1, int(max_holding_days))
@@ -316,7 +324,28 @@ class PortfolioManager:
         self.min_trade_notional_cad = max(1.0, float(min_trade_notional_cad))
         self.min_rebalance_weight_delta = max(0.0, float(min_rebalance_weight_delta))
         self.rotate_on_missing_data = bool(rotate_on_missing_data)
+        self.rotation_cooldown_days = max(0, int(rotation_cooldown_days))
+        self.event_log_path = (
+            event_log_path if event_log_path else str(resolve_portfolio_event_log_path(state_path))
+        )
         self.logger = logger
+
+    def _action_to_event_payload(self, action: TradeAction, *, source: str, ts_utc: datetime) -> dict[str, Any]:
+        return {
+            "ts_utc": ts_utc.isoformat(),
+            "source": source,
+            "action": str(action.action).upper(),
+            "ticker": str(action.ticker).upper(),
+            "reason": str(action.reason),
+            "shares": float(action.shares),
+            "price_cad": float(action.price_cad),
+            "days_held": action.days_held,
+            "pred_return": action.pred_return,
+            "entry_price": action.entry_price,
+            "realized_gain_pct": action.realized_gain_pct,
+            "replaces_ticker": action.replaces_ticker,
+            "expected_sell_date": action.expected_sell_date,
+        }
 
     def _positions_by_ticker(self, state: PortfolioState) -> dict[str, Position]:
         out: dict[str, Position] = {}
@@ -1014,6 +1043,22 @@ class PortfolioManager:
         # weights is expected to represent the *target* holdings universe, but we may rotate.
         now = _utcnow()
         actions: list[TradeAction] = []
+        # Enforce one decision per ticker per run:
+        # EXIT | REDUCE | HOLD | INCREASE | ENTER.
+        decision_by_ticker: dict[str, str] = {}
+        decision_rank = {"HOLD": 0, "INCREASE": 1, "ENTER": 2, "REDUCE": 3, "EXIT": 4}
+
+        def _decision_get(ticker: str) -> str | None:
+            return decision_by_ticker.get(str(ticker).strip().upper())
+
+        def _decision_set(ticker: str, decision: str) -> None:
+            key = str(ticker).strip().upper()
+            if not key:
+                return
+            d = str(decision).strip().upper()
+            current = decision_by_ticker.get(key)
+            if current is None or decision_rank.get(d, -1) >= decision_rank.get(current, -1):
+                decision_by_ticker[key] = d
 
         open_by_ticker = self._positions_by_ticker(state)
         open_tickers = set(open_by_ticker.keys())
@@ -1026,6 +1071,9 @@ class PortfolioManager:
             for t in (blocked_buys or set())
             if str(t).strip()
         }
+        for t in open_tickers:
+            if str(t).strip().upper() in blocked_buy_tickers:
+                _decision_set(t, "REDUCE")
 
         # SELL positions not in target - but only if they meet rotation criteria.
         # Avoid excessive turnover by requiring deteriorating fundamentals to rotate out.
@@ -1043,6 +1091,8 @@ class PortfolioManager:
 
         for t, p in list(open_by_ticker.items()):
             if t.upper() not in target_set_upper:
+                if _decision_get(t) in {"EXIT", "REDUCE"}:
+                    continue
                 px = float(prices_cad.get(t, float("nan")))
                 if pd.isna(px) or px <= 0:
                     # No price data – keep position; HOLD action emitted later.
@@ -1050,6 +1100,8 @@ class PortfolioManager:
                 # Use trading days consistently for tenure-aware rotation checks.
                 market = _market_for_ticker(t)
                 days = _trading_days_between(p.entry_date, now, market=market)
+                if days < self.rotation_cooldown_days:
+                    continue
                 
                 # Get current predictions for this ticker (if available in screened)
                 ticker_data = screened[screened.index == t] if t in screened.index else None
@@ -1119,6 +1171,7 @@ class PortfolioManager:
                 
                 if should_rotate:
                     actions.append(self._sell_position(state, p, price_cad=px, reason=rotation_reason, days_held=days))
+                    _decision_set(t, "EXIT")
                     open_tickers.discard(t)
 
         # Update state positions after rotation sells.
@@ -1153,6 +1206,8 @@ class PortfolioManager:
                 if t_norm in open_tickers:
                     continue
                 if t_norm in blocked_buy_tickers:
+                    continue
+                if _decision_get(t_norm) in {"EXIT", "REDUCE"}:
                     continue
                 px = float(prices_cad.get(t_norm, prices_cad.get(t, float("nan"))))
                 if pd.isna(px) or px <= 0:
@@ -1244,6 +1299,7 @@ class PortfolioManager:
                         replaces_ticker=rotation_sell_queue.pop(0) if rotation_sell_queue else None,
                     )
                 )
+                _decision_set(t_norm, "ENTER")
                 open_tickers.add(t_norm)
                 slots -= 1
 
@@ -1263,7 +1319,11 @@ class PortfolioManager:
             days = _trading_days_between(p.entry_date, now, market=market) if p else None
 
             in_target = t.upper() in target_set_upper
-            hold_reason = "IN_TARGET" if in_target else "HOLDING"
+            prior_decision = _decision_get(t)
+            if prior_decision == "REDUCE":
+                hold_reason = "REDUCED"
+            else:
+                hold_reason = "IN_TARGET" if in_target else "HOLDING"
 
             # Get pred_return and pred_peak_days -- cascade through progressively
             # broader DataFrames: weights → screened → scored → features (unfiltered).
@@ -1340,6 +1400,8 @@ class PortfolioManager:
                     price_cad=px, days_held=days, pred_return=pred_ret, expected_sell_date=expected_sell
                 )
             )
+            if prior_decision is None:
+                _decision_set(t, "HOLD")
 
         # Build holdings view: join weights with state-derived fields.
         holdings = weights.copy()
@@ -1357,5 +1419,17 @@ class PortfolioManager:
         except Exception as e:
             # P&L tracking should never break the daily run; fall back gracefully.
             self.logger.warning("Could not compute/append portfolio P&L snapshot: %s", e)
+        position_changing_actions = [
+            a for a in actions
+            if str(getattr(a, "action", "")).upper() in {"BUY", "SELL", "SELL_PARTIAL"}
+        ]
+        if position_changing_actions:
+            append_portfolio_events(
+                self.event_log_path,
+                [
+                    self._action_to_event_payload(a, source="build_trade_plan", ts_utc=now)
+                    for a in position_changing_actions
+                ],
+            )
         save_portfolio_state(self.state_path, state)
         return TradePlan(actions=actions, holdings=holdings)

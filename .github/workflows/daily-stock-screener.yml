@@ -68,6 +68,7 @@ jobs:
             data_cache/
             screener_portfolio_state.json
             screener_portfolio_state.json.bak
+            screener_portfolio_state.json.events.jsonl
           key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/daily-stock-screener.yml') }}
           restore-keys: |
             ${{ runner.os }}-daily-screener-data-
@@ -225,8 +226,28 @@ jobs:
           ENTRY_MIN_CONFIDENCE_FLOOR: "0.35"
           ENTRY_PRED_RETURN_PERCENTILE: "0.60"
           ENTRY_MIN_PRED_RETURN_FLOOR: "0.0025"
-          # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
+          ENTRY_DYNAMIC_MIN_CONF_TOP_DECILE_SPREAD: "0.03"
+          ENTRY_DYNAMIC_MIN_PRED_TOP_DECILE_SPREAD: "0.002"
+          ENTRY_STRESS_GUARD_ENABLED: "1"
+          ENTRY_STRESS_MAX_VOL_STRESS: "0.65"
+          ENTRY_STRESS_MIN_BREADTH: "0.45"
+          ENTRY_STRESS_CONFIDENCE_TIGHTEN_ADD: "0.05"
+          ENTRY_STRESS_PRED_RETURN_TIGHTEN_ADD: "0.002"
+          ENTRY_STRESS_HOLD_ONLY_ENABLED: ${{ vars.ENTRY_STRESS_HOLD_ONLY_ENABLED || '0' }}
+          RET_PER_DAY_MIN_PEAK_DAYS: "1.0"
+          RET_PER_DAY_MAX_PEAK_DAYS: "10.0"
+          RET_PER_DAY_SMOOTHING_K: "1.0"
+          RET_PER_DAY_SHIFT_ALERT_ENABLED: "1"
+          RET_PER_DAY_SHIFT_ALERT_MIN_SAMPLES: "20"
+          RET_PER_DAY_MEAN_SHIFT_ALERT_PCT: "0.50"
+          RET_PER_DAY_P90_SHIFT_ALERT_PCT: "0.50"
+          RET_PER_DAY_STD_SHIFT_ALERT_PCT: "0.75"
+          # Use SOTA ML by default. If ML is unavailable, default is HOLD_ONLY
+          # unless ALLOW_BASELINE_TRADING is explicitly enabled.
           USE_ML: "1"
+          # If USE_ML=1 and ML is unavailable, default behavior is HOLD_ONLY
+          # unless this flag is explicitly enabled.
+          ALLOW_BASELINE_TRADING: ${{ vars.ALLOW_BASELINE_TRADING || '0' }}
           MODEL_PATH: "models/ensemble/manifest.json"
           STRICT_FEATURE_PARITY: "1"
           APPLY_PREDICTION_RECALIBRATION: ${{ vars.APPLY_PREDICTION_RECALIBRATION || '1' }}
@@ -234,12 +255,16 @@ jobs:
           TURNOVER_PENALTY_BPS: "15"
           MIN_REBALANCE_WEIGHT_DELTA: "0.015"
           MIN_TRADE_NOTIONAL_CAD: "15"
+          ROTATION_COOLDOWN_DAYS: "2"
           DYNAMIC_NO_TRADE_BAND_ENABLED: "1"
           DYNAMIC_NO_TRADE_UNCERTAINTY_WEIGHT: "1.2"
           DYNAMIC_NO_TRADE_LIQUIDITY_WEIGHT: "0.8"
           DYNAMIC_NO_TRADE_VOL_REGIME_WEIGHT: "0.8"
           DYNAMIC_NO_TRADE_MULTIPLIER_MIN: "1.0"
           DYNAMIC_NO_TRADE_MULTIPLIER_MAX: "3.0"
+          EXPOSURE_POLICY: "allow_cash_no_upscale"
+          TARGET_GROSS_EXPOSURE: "1.0"
+          ALLOW_LEVERAGE: "0"
           # Quick-compounding: sell at predicted peak, redeploy capital fast
           MAX_HOLDING_DAYS: "3"
           MAX_HOLDING_DAYS_HARD: "5"
@@ -377,9 +402,16 @@ jobs:
           entry_thresholds = run_meta.get("entry_thresholds") if isinstance(run_meta, dict) else {}
           if not isinstance(entry_thresholds, dict):
               entry_thresholds = {}
+          strategy_mode = run_meta.get("strategy_mode") if isinstance(run_meta, dict) else {}
+          if not isinstance(strategy_mode, dict):
+              strategy_mode = {}
           entry_dynamic_applied = bool(entry_thresholds.get("dynamic_applied", False))
           entry_min_conf = entry_thresholds.get("min_confidence")
           entry_min_pred = entry_thresholds.get("min_pred_return")
+          strategy_mode_name = str(strategy_mode.get("mode", "na"))
+          strategy_mode_reason = str(strategy_mode.get("reason", "na"))
+          strategy_ml_expected = str(strategy_mode.get("ml_expected", "na")).lower()
+          strategy_ml_available = str(strategy_mode.get("ml_available", "na")).lower()
           if entry_min_conf is None:
               entry_min_conf_str = "na"
           else:
@@ -400,6 +432,85 @@ jobs:
           else:
               fund_shift_str = f"{float(fund_before) * 100.0:.1f}% -> {float(fund_after) * 100.0:.1f}%"
           sleeves_reason = str(instrument_sleeves.get("reason", "na"))
+
+          exposure_after = run_meta.get("exposure_control_after_rebalance") if isinstance(run_meta, dict) else {}
+          if not isinstance(exposure_after, dict):
+              exposure_after = {}
+          exp_policy = str(exposure_after.get("policy", "na"))
+          exp_gross = exposure_after.get("gross_exposure")
+          exp_net = exposure_after.get("net_exposure")
+          exp_cash = exposure_after.get("cash_weight")
+          if exp_gross is None:
+              exp_gross_str = "na"
+          else:
+              exp_gross_str = f"{float(exp_gross) * 100.0:.1f}%"
+          if exp_net is None:
+              exp_net_str = "na"
+          else:
+              exp_net_str = f"{float(exp_net) * 100.0:.1f}%"
+          if exp_cash is None:
+              exp_cash_str = "na"
+          else:
+              exp_cash_str = f"{float(exp_cash) * 100.0:.1f}%"
+
+          retpd = run_meta.get("ret_per_day_signal") if isinstance(run_meta, dict) else {}
+          if not isinstance(retpd, dict):
+              retpd = {}
+          retpd_stats = retpd.get("ret_per_day_stats")
+          if not isinstance(retpd_stats, dict):
+              retpd_stats = {}
+          retpd_mean = retpd_stats.get("mean")
+          retpd_p90 = retpd_stats.get("p90")
+          retpd_clip_share = retpd.get("peak_days_clip_share")
+          retpd_alerts = retpd.get("shift_alerts")
+          if not isinstance(retpd_alerts, list):
+              retpd_alerts = []
+          if retpd_mean is None:
+              retpd_mean_str = "na"
+          else:
+              retpd_mean_str = f"{float(retpd_mean):.5f}"
+          if retpd_p90 is None:
+              retpd_p90_str = "na"
+          else:
+              retpd_p90_str = f"{float(retpd_p90):.5f}"
+          if retpd_clip_share is None:
+              retpd_clip_str = "na"
+          else:
+              retpd_clip_str = f"{float(retpd_clip_share) * 100.0:.1f}%"
+
+          projection = run_meta.get("optimizer_projection_audit") if isinstance(run_meta, dict) else {}
+          if not isinstance(projection, dict):
+              projection = {}
+          pre_proj = projection.get("pre_rebalance_vs_final")
+          if not isinstance(pre_proj, dict):
+              pre_proj = {}
+          opt_proj = projection.get("optimizer_vs_final")
+          if not isinstance(opt_proj, dict):
+              opt_proj = {}
+          pre_l1 = pre_proj.get("l1_distance")
+          pre_l2 = pre_proj.get("l2_distance")
+          opt_l1 = opt_proj.get("l1_distance")
+          opt_l2 = opt_proj.get("l2_distance")
+          notional_drop_events = projection.get("notional_drops_with_reasons")
+          if not isinstance(notional_drop_events, list):
+              notional_drop_events = []
+          if pre_l1 is None:
+              pre_l1_str = "na"
+          else:
+              pre_l1_str = f"{float(pre_l1):.4f}"
+          if pre_l2 is None:
+              pre_l2_str = "na"
+          else:
+              pre_l2_str = f"{float(pre_l2):.4f}"
+          if opt_l1 is None:
+              opt_l1_str = "na"
+          else:
+              opt_l1_str = f"{float(opt_l1):.4f}"
+          if opt_l2 is None:
+              opt_l2_str = "na"
+          else:
+              opt_l2_str = f"{float(opt_l2):.4f}"
+          notional_drop_count = len(notional_drop_events)
 
           action_counts = {"BUY": 0, "SELL": 0, "SELL_PARTIAL": 0, "HOLD": 0}
           for action in trade_actions:
@@ -428,6 +539,23 @@ jobs:
               "entry_dynamic_applied": str(entry_dynamic_applied).lower(),
               "entry_min_confidence": entry_min_conf_str,
               "entry_min_pred_return": entry_min_pred_str,
+              "strategy_mode": strategy_mode_name,
+              "strategy_reason": strategy_mode_reason,
+              "strategy_ml_expected": strategy_ml_expected,
+              "strategy_ml_available": strategy_ml_available,
+              "exposure_policy": exp_policy,
+              "exposure_gross": exp_gross_str,
+              "exposure_net": exp_net_str,
+              "exposure_cash": exp_cash_str,
+              "retpd_mean": retpd_mean_str,
+              "retpd_p90": retpd_p90_str,
+              "retpd_clip_share": retpd_clip_str,
+              "retpd_shift_alerts": str(len(retpd_alerts)),
+              "projection_pre_l1": pre_l1_str,
+              "projection_pre_l2": pre_l2_str,
+              "projection_opt_l1": opt_l1_str,
+              "projection_opt_l2": opt_l2_str,
+              "projection_notional_drops": str(notional_drop_count),
               "instrument_sleeves_applied": str(sleeves_applied).lower(),
               "instrument_fund_shift": fund_shift_str,
               "instrument_sleeves_reason": sleeves_reason,
@@ -450,6 +578,10 @@ jobs:
             echo "- Portfolio state age (hours): \`${{ steps.health_counters.outputs.state_age_hours }}\`"
             echo "- Open/closed positions: \`${{ steps.health_counters.outputs.open_positions }}/${{ steps.health_counters.outputs.closed_positions }}\`"
             echo "- Trade actions (BUY/SELL/SELL_PARTIAL/HOLD): \`${{ steps.health_counters.outputs.buy_count }}/${{ steps.health_counters.outputs.sell_count }}/${{ steps.health_counters.outputs.sell_partial_count }}/${{ steps.health_counters.outputs.hold_count }}\`"
+            echo "- Strategy mode (mode/reason/ml_expected/ml_available): \`${{ steps.health_counters.outputs.strategy_mode }}/${{ steps.health_counters.outputs.strategy_reason }}/${{ steps.health_counters.outputs.strategy_ml_expected }}/${{ steps.health_counters.outputs.strategy_ml_available }}\`"
+            echo "- Exposure (policy/gross/net/cash): \`${{ steps.health_counters.outputs.exposure_policy }}/${{ steps.health_counters.outputs.exposure_gross }}/${{ steps.health_counters.outputs.exposure_net }}/${{ steps.health_counters.outputs.exposure_cash }}\`"
+            echo "- ret_per_day (mean/p90/peak-day-clip/shift-alerts): \`${{ steps.health_counters.outputs.retpd_mean }}/${{ steps.health_counters.outputs.retpd_p90 }}/${{ steps.health_counters.outputs.retpd_clip_share }}/${{ steps.health_counters.outputs.retpd_shift_alerts }}\`"
+            echo "- Weight projection drift (pre L1/L2 | opt L1/L2 | notional drops): \`${{ steps.health_counters.outputs.projection_pre_l1 }}/${{ steps.health_counters.outputs.projection_pre_l2 }} | ${{ steps.health_counters.outputs.projection_opt_l1 }}/${{ steps.health_counters.outputs.projection_opt_l2 }} | ${{ steps.health_counters.outputs.projection_notional_drops }}\`"
             echo "- Entry thresholds (dynamic/conf/pred): \`${{ steps.health_counters.outputs.entry_dynamic_applied }}/${{ steps.health_counters.outputs.entry_min_confidence }}/${{ steps.health_counters.outputs.entry_min_pred_return }}\`"
             echo "- Instrument sleeves (applied/fund shift/reason): \`${{ steps.health_counters.outputs.instrument_sleeves_applied }}/${{ steps.health_counters.outputs.instrument_fund_shift }}/${{ steps.health_counters.outputs.instrument_sleeves_reason }}\`"
             echo "- Reward log entries: \`${{ steps.health_counters.outputs.reward_entries }}\`"
@@ -466,6 +598,7 @@ jobs:
             data_cache/
             screener_portfolio_state.json
             screener_portfolio_state.json.bak
+            screener_portfolio_state.json.events.jsonl
           key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/daily-stock-screener.yml') }}-${{ github.run_id }}
 
       - name: Upload artifacts
@@ -477,6 +610,7 @@ jobs:
             reports/
             cache/last_run_meta.json
             screener_portfolio_state.json
+            screener_portfolio_state.json.events.jsonl
           retention-days: 14
 
       - name: Determine market session

@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 import pandas as pd
@@ -9,6 +10,7 @@ from stock_screener.portfolio.manager import (
     _trading_days_between,
 )
 from stock_screener.portfolio.state import PortfolioState, Position
+from stock_screener.portfolio.state import resolve_portfolio_event_log_path
 
 
 def test_portfolio_manager_hard_max_hold_exit():
@@ -1106,6 +1108,159 @@ def test_rotation_uses_feature_prediction_for_out_of_screen_holdings(monkeypatch
     sells = [a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]
     assert len(sells) == 1
     assert sells[0].reason == "ROTATION:NEG_PRED"
+
+
+def test_rotation_respects_min_hold_cooldown(monkeypatch, tmp_path):
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 7, 15, 0, tzinfo=timezone.utc)
+    entry_date = datetime(2025, 1, 6, 15, 0, tzinfo=timezone.utc)  # 1 trading day held
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        rotation_cooldown_days=2,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="OLD", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.02], "score": [0.9]}, index=["NEW"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["NEW"])
+    prices = pd.Series({"OLD": 101.0, "NEW": 100.0})
+    features = pd.DataFrame({"pred_return": [-0.05]}, index=["OLD"])  # would rotate without cooldown
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+        features=features,
+    )
+
+    assert len([a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]) == 0
+    assert len([a for a in plan.actions if a.action == "HOLD" and a.ticker == "OLD"]) == 1
+
+
+def test_rotation_skips_ticker_pre_decided_by_exit_pass(monkeypatch, tmp_path):
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 10, 15, 0, tzinfo=timezone.utc)
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path=str(tmp_path / "state.json"),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        rotation_cooldown_days=0,
+        logger=logger,
+    )
+
+    state = PortfolioState(
+        cash_cad=0.0,
+        positions=[Position(ticker="OLD", entry_price=100.0, entry_date=entry_date, shares=1.0)],
+        last_updated=now,
+    )
+    screened = pd.DataFrame({"pred_return": [0.02], "score": [0.9]}, index=["NEW"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["NEW"])
+    prices = pd.Series({"OLD": 101.0, "NEW": 100.0})
+    features = pd.DataFrame({"pred_return": [-0.05]}, index=["OLD"])
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+        features=features,
+        blocked_buys={"OLD"},  # pre-decided by exit pass in run_daily
+    )
+
+    assert len([a for a in plan.actions if a.action == "SELL" and a.ticker == "OLD"]) == 0
+    holds = [a for a in plan.actions if a.action == "HOLD" and a.ticker == "OLD"]
+    assert len(holds) == 1
+    assert holds[0].reason == "REDUCED"
+
+
+def test_build_trade_plan_appends_position_events(tmp_path):
+    logger = logging.getLogger("test")
+    now = datetime.now(tz=timezone.utc)
+    state_path = tmp_path / "state.json"
+
+    manager = PortfolioManager(
+        state_path=str(state_path),
+        max_holding_days=5,
+        max_holding_days_hard=10,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=1,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(cash_cad=100.0, positions=[], last_updated=now)
+    screened = pd.DataFrame({"pred_return": [0.02]}, index=["AAPL"])
+    weights = pd.DataFrame({"weight": [1.0], "pred_return": [0.02]}, index=["AAPL"])
+    prices = pd.Series({"AAPL": 50.0})
+
+    plan = manager.build_trade_plan(
+        state=state,
+        screened=screened,
+        weights=weights,
+        prices_cad=prices,
+    )
+    assert len([a for a in plan.actions if a.action == "BUY" and a.ticker == "AAPL"]) == 1
+
+    event_path = resolve_portfolio_event_log_path(state_path)
+    assert event_path.exists()
+    lines = [ln for ln in event_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) >= 1
+    payload = json.loads(lines[-1])
+    assert payload["action"] == "BUY"
+    assert payload["ticker"] == "AAPL"
 
 
 def test_trading_days_between_uses_market_calendar():

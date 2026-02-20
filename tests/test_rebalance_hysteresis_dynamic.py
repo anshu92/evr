@@ -200,3 +200,172 @@ def test_rebalance_controls_can_disable_turnover_shrinkage():
 
     assert float(with_shrink.loc["BBB", "weight"]) < float(without_shrink.loc["BBB", "weight"])
     assert float(without_shrink.loc["BBB", "weight"]) == pytest.approx(0.50, abs=1e-9)
+
+
+def test_rebalance_controls_allow_cash_policy_does_not_upscale_underinvested_weights():
+    logger = logging.getLogger("test")
+    state = PortfolioState(
+        cash_cad=450.0,
+        positions=[],
+        last_updated=datetime.now(tz=timezone.utc),
+    )
+    prices = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    target = pd.DataFrame({"weight": [0.30, 0.20]}, index=["AAA", "BBB"])
+    screened = pd.DataFrame(index=["AAA", "BBB"])
+
+    out = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=1.0,
+        turnover_penalty_bps=0.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        exposure_policy="allow_cash_no_upscale",
+        target_gross_exposure=1.0,
+        allow_leverage=False,
+    )
+    assert float(out["weight"].sum()) == pytest.approx(0.50, abs=1e-9)
+
+
+def test_rebalance_controls_can_normalize_to_target_gross_when_configured():
+    logger = logging.getLogger("test")
+    state = PortfolioState(
+        cash_cad=450.0,
+        positions=[],
+        last_updated=datetime.now(tz=timezone.utc),
+    )
+    prices = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    target = pd.DataFrame({"weight": [0.30, 0.20]}, index=["AAA", "BBB"])
+    screened = pd.DataFrame(index=["AAA", "BBB"])
+
+    out = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=1.0,
+        turnover_penalty_bps=0.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        exposure_policy="normalize_to_target_gross",
+        target_gross_exposure=1.0,
+        allow_leverage=False,
+    )
+    assert float(out["weight"].sum()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_rebalance_controls_normalize_policy_respects_no_leverage_cap():
+    logger = logging.getLogger("test")
+    state = PortfolioState(
+        cash_cad=450.0,
+        positions=[],
+        last_updated=datetime.now(tz=timezone.utc),
+    )
+    prices = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    target = pd.DataFrame({"weight": [0.30, 0.20]}, index=["AAA", "BBB"])
+    screened = pd.DataFrame(index=["AAA", "BBB"])
+
+    out = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=1.0,
+        turnover_penalty_bps=0.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        exposure_policy="normalize_to_target_gross",
+        target_gross_exposure=1.2,
+        allow_leverage=False,
+    )
+    assert float(out["weight"].sum()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_rebalance_controls_emits_notional_drop_reason_codes_in_diagnostics():
+    logger = logging.getLogger("test")
+    state = PortfolioState(
+        cash_cad=100.0,
+        positions=[],
+        last_updated=datetime.now(tz=timezone.utc),
+    )
+    prices = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    target = pd.DataFrame({"weight": [0.05, 0.95]}, index=["AAA", "BBB"])
+    screened = pd.DataFrame(index=["AAA", "BBB"])
+
+    out, diag = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=20.0,
+        turnover_penalty_bps=0.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        return_diagnostics=True,
+    )
+    assert isinstance(out, pd.DataFrame)
+    assert isinstance(diag, dict)
+    assert diag.get("path") in {"cold_start", "cold_start_seed"}
+    drops = [d for d in diag.get("dropped_by_notional_gate", []) if isinstance(d, dict)]
+    assert any(str(d.get("ticker")) == "AAA" and str(d.get("reason_code")) == "cold_start_min_notional" for d in drops)
+
+
+def test_rebalance_controls_reports_hysteresis_notional_drop_in_diagnostics():
+    logger = logging.getLogger("test")
+    state = _build_state()  # ~1000 CAD in AAA, no cash
+    prices = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    target = pd.DataFrame({"weight": [0.99, 0.01]}, index=["AAA", "BBB"])
+    screened = pd.DataFrame(index=["AAA", "BBB"])
+
+    out, diag = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=20.0,
+        turnover_penalty_bps=0.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        return_diagnostics=True,
+    )
+    assert isinstance(out, pd.DataFrame)
+    assert isinstance(diag, dict)
+    drops = [d for d in diag.get("dropped_by_notional_gate", []) if isinstance(d, dict)]
+    assert any(str(d.get("ticker")) == "BBB" and str(d.get("reason_code")) == "hysteresis_notional" for d in drops)

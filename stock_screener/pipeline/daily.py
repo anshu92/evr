@@ -38,7 +38,13 @@ from stock_screener.modeling.model import (
 )
 from stock_screener.modeling.transform import normalize_features_cross_section, calibrate_predictions
 from stock_screener.portfolio.manager import PortfolioManager, TradeAction, TradePlan
-from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state, compute_drawdown_scalar
+from stock_screener.portfolio.state import (
+    append_portfolio_events,
+    compute_drawdown_scalar,
+    load_portfolio_state,
+    resolve_portfolio_event_log_path,
+    save_portfolio_state,
+)
 from stock_screener.reward.tracker import RewardEntry, RewardLog, ActionRewardEntry, ActionRewardLog
 from stock_screener.reward.feedback import (
     compute_online_ic, compute_ensemble_reward_weights, compute_prediction_bias,
@@ -241,6 +247,170 @@ def _check_runtime_budget(started_utc: datetime, cfg: Config, logger, stage: str
         )
 
 
+def _series_distribution_stats(series: pd.Series | None) -> dict[str, Any]:
+    if series is None:
+        return {"n": 0}
+    s = pd.to_numeric(series, errors="coerce")
+    s = s.replace([float("inf"), float("-inf")], pd.NA).dropna()
+    if s.empty:
+        return {"n": 0}
+    return {
+        "n": int(len(s)),
+        "mean": float(s.mean()),
+        "std": float(s.std(ddof=0)),
+        "min": float(s.min()),
+        "p10": float(s.quantile(0.10)),
+        "p50": float(s.quantile(0.50)),
+        "p90": float(s.quantile(0.90)),
+        "max": float(s.max()),
+    }
+
+
+def _compute_ret_per_day_signal(
+    features: pd.DataFrame,
+    *,
+    cfg: Config,
+    logger,
+    previous_run_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "enabled": False,
+        "reason": "missing_columns",
+        "shift_alert_triggered": False,
+        "shift_alerts": [],
+    }
+    if features is None or features.empty:
+        info["reason"] = "empty_features"
+        return info
+    if "pred_return" not in features.columns or "pred_peak_days" not in features.columns:
+        return info
+
+    pred_return = pd.to_numeric(features["pred_return"], errors="coerce")
+    peak_raw = pd.to_numeric(features["pred_peak_days"], errors="coerce")
+    if pred_return.notna().sum() <= 0 or peak_raw.notna().sum() <= 0:
+        info["reason"] = "no_valid_pred_return_or_peak_days"
+        return info
+
+    min_days = float(max(0.1, getattr(cfg, "ret_per_day_min_peak_days", 1.0)))
+    max_days = float(max(min_days, getattr(cfg, "ret_per_day_max_peak_days", 10.0)))
+    smoothing_k = float(max(0.0, getattr(cfg, "ret_per_day_smoothing_k", 1.0)))
+
+    peak_clamped = peak_raw.clip(lower=min_days, upper=max_days)
+    denom = peak_clamped + smoothing_k
+    ret_per_day = pred_return / denom
+    ret_per_day = pd.to_numeric(ret_per_day, errors="coerce").replace([float("inf"), float("-inf")], pd.NA)
+
+    features["pred_peak_days_raw"] = peak_raw
+    features["pred_peak_days"] = peak_clamped
+    features["ret_per_day"] = ret_per_day
+
+    clip_low = int((peak_raw < min_days).fillna(False).sum())
+    clip_high = int((peak_raw > max_days).fillna(False).sum())
+    valid_peak = int(peak_raw.notna().sum())
+    clipped_total = clip_low + clip_high
+    clip_share = float(clipped_total / valid_peak) if valid_peak > 0 else 0.0
+
+    peak_raw_stats = _series_distribution_stats(peak_raw)
+    peak_clamped_stats = _series_distribution_stats(peak_clamped)
+    ret_stats = _series_distribution_stats(ret_per_day)
+
+    info.update(
+        {
+            "enabled": True,
+            "reason": "ok",
+            "formula": "ret_per_day = pred_return / (clamp(pred_peak_days, min_days, max_days) + k)",
+            "min_peak_days": min_days,
+            "max_peak_days": max_days,
+            "smoothing_k": smoothing_k,
+            "peak_days_clip_low_count": clip_low,
+            "peak_days_clip_high_count": clip_high,
+            "peak_days_clip_total_count": clipped_total,
+            "peak_days_clip_share": clip_share,
+            "pred_peak_days_raw_stats": peak_raw_stats,
+            "pred_peak_days_clamped_stats": peak_clamped_stats,
+            "ret_per_day_stats": ret_stats,
+            "shift_alert_triggered": False,
+            "shift_alerts": [],
+        }
+    )
+
+    logger.info(
+        "ret_per_day guardrails: min_days=%.2f max_days=%.2f k=%.2f clipped=%d/%d (%.1f%%)",
+        min_days,
+        max_days,
+        smoothing_k,
+        clipped_total,
+        valid_peak,
+        clip_share * 100.0,
+    )
+    logger.info(
+        "ret_per_day dist: mean=%.5f p10=%.5f p50=%.5f p90=%.5f max=%.5f n=%d",
+        float(ret_stats.get("mean", float("nan"))),
+        float(ret_stats.get("p10", float("nan"))),
+        float(ret_stats.get("p50", float("nan"))),
+        float(ret_stats.get("p90", float("nan"))),
+        float(ret_stats.get("max", float("nan"))),
+        int(ret_stats.get("n", 0)),
+    )
+
+    alert_enabled = bool(getattr(cfg, "ret_per_day_shift_alert_enabled", True))
+    min_n = int(max(5, getattr(cfg, "ret_per_day_shift_alert_min_samples", 20)))
+    if not alert_enabled:
+        return info
+
+    prev_stats = None
+    if isinstance(previous_run_meta, dict):
+        prev_signal = previous_run_meta.get("ret_per_day_signal")
+        if isinstance(prev_signal, dict):
+            candidate = prev_signal.get("ret_per_day_stats")
+            if isinstance(candidate, dict):
+                prev_stats = candidate
+
+    info["previous_stats_available"] = bool(isinstance(prev_stats, dict))
+    if not isinstance(prev_stats, dict):
+        return info
+    if int(ret_stats.get("n", 0)) < min_n or int(prev_stats.get("n", 0)) < min_n:
+        info["shift_alert_reason"] = "insufficient_samples"
+        return info
+
+    metric_thresholds = {
+        "mean": float(max(0.0, getattr(cfg, "ret_per_day_mean_shift_alert_pct", 0.50))),
+        "p90": float(max(0.0, getattr(cfg, "ret_per_day_p90_shift_alert_pct", 0.50))),
+        "std": float(max(0.0, getattr(cfg, "ret_per_day_std_shift_alert_pct", 0.75))),
+    }
+    alerts: list[dict[str, Any]] = []
+    for metric, threshold in metric_thresholds.items():
+        curr = ret_stats.get(metric)
+        prev = prev_stats.get(metric)
+        if curr is None or prev is None:
+            continue
+        try:
+            curr_f = float(curr)
+            prev_f = float(prev)
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(curr_f) or pd.isna(prev_f):
+            continue
+        denom = max(abs(prev_f), 1e-9)
+        rel_shift = abs(curr_f - prev_f) / denom
+        if rel_shift >= threshold:
+            alerts.append(
+                {
+                    "metric": metric,
+                    "previous": prev_f,
+                    "current": curr_f,
+                    "relative_shift": float(rel_shift),
+                    "threshold": float(threshold),
+                }
+            )
+
+    if alerts:
+        info["shift_alert_triggered"] = True
+        info["shift_alerts"] = alerts
+        logger.warning("ret_per_day distribution shift alert(s): %s", alerts)
+    return info
+
+
 def _compute_effective_entry_thresholds(
     screened: pd.DataFrame,
     *,
@@ -254,53 +424,165 @@ def _compute_effective_entry_thresholds(
     """
     min_conf = getattr(cfg, "entry_min_confidence", None)
     min_pred = getattr(cfg, "entry_min_pred_return", None)
+    conf_floor = float(getattr(cfg, "entry_min_confidence_floor", 0.35))
+    conf_floor = float(max(0.0, min(1.0, conf_floor)))
+    pred_floor = float(getattr(cfg, "entry_min_pred_return_floor", 0.0025))
+
+    if min_conf is not None:
+        min_conf = max(conf_floor, float(min_conf))
+    if min_pred is not None:
+        min_pred = max(pred_floor, float(min_pred))
+
     result: dict[str, Any] = {
         "min_confidence": min_conf,
         "min_pred_return": min_pred,
         "dynamic_applied": False,
+        "dynamic_blocked_reasons": [],
+        "stress_guard_triggered": False,
+        "hold_only_recommended": False,
+        "floors": {
+            "min_confidence_floor": conf_floor,
+            "min_pred_return_floor": pred_floor,
+        },
     }
 
     if screened is None or screened.empty:
         return result
-    if not bool(getattr(cfg, "entry_dynamic_thresholds_enabled", True)):
+
+    # Stress guard: tighten thresholds under weak market conditions and optionally
+    # escalate to HOLD_ONLY.
+    stress_guard_enabled = bool(getattr(cfg, "entry_stress_guard_enabled", True))
+    max_vol_stress = float(max(0.0, min(1.0, getattr(cfg, "entry_stress_max_vol_stress", 0.65))))
+    min_breadth = float(max(0.0, min(1.0, getattr(cfg, "entry_stress_min_breadth", 0.45))))
+    conf_tighten_add = float(max(0.0, getattr(cfg, "entry_stress_confidence_tighten_add", 0.05)))
+    pred_tighten_add = float(max(0.0, getattr(cfg, "entry_stress_pred_return_tighten_add", 0.002)))
+    hold_only_on_stress = bool(getattr(cfg, "entry_stress_hold_only_enabled", False))
+
+    vol_regime = None
+    if "market_vol_regime" in screened.columns:
+        v = pd.to_numeric(screened["market_vol_regime"], errors="coerce").dropna()
+        if not v.empty:
+            vol_regime = float(v.iloc[0])
+    vol_stress = None
+    if vol_regime is not None and pd.notna(vol_regime):
+        vol_stress = float(max(0.0, min(1.0, (float(vol_regime) - 1.0) / 0.8)))
+
+    market_breadth = None
+    if "market_breadth" in screened.columns:
+        b = pd.to_numeric(screened["market_breadth"], errors="coerce").dropna()
+        if not b.empty:
+            market_breadth = float(b.iloc[0])
+
+    high_vol_stress = bool(vol_stress is not None and vol_stress >= max_vol_stress)
+    poor_breadth = bool(market_breadth is not None and market_breadth <= min_breadth)
+    stress_triggered = bool(stress_guard_enabled and (high_vol_stress or poor_breadth))
+    stress_reasons: list[str] = []
+    if high_vol_stress:
+        stress_reasons.append("vol_stress_high")
+    if poor_breadth:
+        stress_reasons.append("breadth_poor")
+
+    result["stress_guard"] = {
+        "enabled": stress_guard_enabled,
+        "triggered": stress_triggered,
+        "vol_regime": vol_regime,
+        "vol_stress": vol_stress,
+        "vol_stress_threshold": max_vol_stress,
+        "market_breadth": market_breadth,
+        "breadth_threshold": min_breadth,
+        "reasons": stress_reasons,
+        "hold_only_enabled": hold_only_on_stress,
+    }
+    result["stress_guard_triggered"] = stress_triggered
+
+    if stress_triggered:
+        if min_conf is None:
+            result["min_confidence"] = conf_floor + conf_tighten_add
+        else:
+            result["min_confidence"] = max(conf_floor, float(min_conf) + conf_tighten_add)
+        if min_pred is None:
+            result["min_pred_return"] = pred_floor + pred_tighten_add
+        else:
+            result["min_pred_return"] = max(pred_floor, float(min_pred) + pred_tighten_add)
+        result["stress_tightening_applied"] = True
+        if hold_only_on_stress:
+            result["hold_only_recommended"] = True
+        logger.warning(
+            "Entry stress guard triggered (%s): tightened thresholds to conf>=%.3f pred_return>=%.2f%%",
+            ",".join(stress_reasons) if stress_reasons else "stress_signal",
+            float(result["min_confidence"]) if result["min_confidence"] is not None else float("nan"),
+            float(result["min_pred_return"]) * 100.0 if result["min_pred_return"] is not None else float("nan"),
+        )
+
+    dynamic_enabled = bool(getattr(cfg, "entry_dynamic_thresholds_enabled", True))
+    if not dynamic_enabled:
+        result["dynamic_blocked_reasons"].append("disabled")
         return result
 
     min_candidates = max(5, int(getattr(cfg, "entry_dynamic_min_candidates", 20)))
     if len(screened) < min_candidates:
+        result["dynamic_blocked_reasons"].append("insufficient_candidates")
+        return result
+
+    if stress_triggered:
+        result["dynamic_blocked_reasons"].append("stress_guard_triggered")
         return result
 
     dynamic_updates: dict[str, float] = {}
+    separation: dict[str, Any] = {}
+    min_conf_spread = float(max(0.0, getattr(cfg, "entry_dynamic_min_conf_top_decile_spread", 0.03)))
+    min_pred_spread = float(max(0.0, getattr(cfg, "entry_dynamic_min_pred_top_decile_spread", 0.002)))
 
     if "pred_confidence" in screened.columns:
         conf = pd.to_numeric(screened["pred_confidence"], errors="coerce").dropna()
         if len(conf) >= min_candidates:
-            conf_pct = float(getattr(cfg, "entry_confidence_percentile", 0.35))
-            conf_pct = float(max(0.0, min(1.0, conf_pct)))
-            conf_floor = float(getattr(cfg, "entry_min_confidence_floor", 0.35))
-            conf_floor = float(max(0.0, min(1.0, conf_floor)))
-            dyn_conf = float(conf.quantile(conf_pct))
-            if min_conf is None:
-                eff_conf = max(conf_floor, dyn_conf)
+            conf_top_dec = float(conf.quantile(0.90))
+            conf_med = float(conf.quantile(0.50))
+            conf_spread = float(conf_top_dec - conf_med)
+            separation["conf_top_decile"] = conf_top_dec
+            separation["conf_median"] = conf_med
+            separation["conf_top_decile_spread"] = conf_spread
+            separation["conf_min_required_spread"] = min_conf_spread
+            if conf_spread >= min_conf_spread:
+                conf_pct = float(getattr(cfg, "entry_confidence_percentile", 0.35))
+                conf_pct = float(max(0.0, min(1.0, conf_pct)))
+                dyn_conf = float(conf.quantile(conf_pct))
+                if min_conf is None:
+                    eff_conf = max(conf_floor, dyn_conf)
+                else:
+                    eff_conf = max(conf_floor, min(float(min_conf), dyn_conf))
+                if min_conf is None or eff_conf < float(min_conf) - 1e-12:
+                    dynamic_updates["min_confidence"] = float(eff_conf)
+                    result["min_confidence"] = float(eff_conf)
             else:
-                eff_conf = max(conf_floor, min(float(min_conf), dyn_conf))
-            if min_conf is None or eff_conf < float(min_conf) - 1e-12:
-                dynamic_updates["min_confidence"] = float(eff_conf)
-                result["min_confidence"] = float(eff_conf)
+                result["dynamic_blocked_reasons"].append("confidence_spread_too_low")
 
     if "pred_return" in screened.columns:
         pred = pd.to_numeric(screened["pred_return"], errors="coerce").dropna()
         if len(pred) >= min_candidates:
-            pred_pct = float(getattr(cfg, "entry_pred_return_percentile", 0.60))
-            pred_pct = float(max(0.0, min(1.0, pred_pct)))
-            pred_floor = float(getattr(cfg, "entry_min_pred_return_floor", 0.0025))
-            dyn_pred = float(pred.quantile(pred_pct))
-            if min_pred is None:
-                eff_pred = max(pred_floor, dyn_pred)
+            pred_top_dec = float(pred.quantile(0.90))
+            pred_med = float(pred.quantile(0.50))
+            pred_spread = float(pred_top_dec - pred_med)
+            separation["pred_top_decile"] = pred_top_dec
+            separation["pred_median"] = pred_med
+            separation["pred_top_decile_spread"] = pred_spread
+            separation["pred_min_required_spread"] = min_pred_spread
+            if pred_spread >= min_pred_spread:
+                pred_pct = float(getattr(cfg, "entry_pred_return_percentile", 0.60))
+                pred_pct = float(max(0.0, min(1.0, pred_pct)))
+                dyn_pred = float(pred.quantile(pred_pct))
+                if min_pred is None:
+                    eff_pred = max(pred_floor, dyn_pred)
+                else:
+                    eff_pred = max(pred_floor, min(float(min_pred), dyn_pred))
+                if min_pred is None or eff_pred < float(min_pred) - 1e-12:
+                    dynamic_updates["min_pred_return"] = float(eff_pred)
+                    result["min_pred_return"] = float(eff_pred)
             else:
-                eff_pred = max(pred_floor, min(float(min_pred), dyn_pred))
-            if min_pred is None or eff_pred < float(min_pred) - 1e-12:
-                dynamic_updates["min_pred_return"] = float(eff_pred)
-                result["min_pred_return"] = float(eff_pred)
+                result["dynamic_blocked_reasons"].append("pred_return_spread_too_low")
+
+    if separation:
+        result["separation"] = separation
 
     if dynamic_updates:
         result["dynamic_applied"] = True
@@ -310,6 +592,8 @@ def _compute_effective_entry_thresholds(
             float(result["min_confidence"]) if result["min_confidence"] is not None else float("nan"),
             float(result["min_pred_return"]) * 100.0 if result["min_pred_return"] is not None else float("nan"),
         )
+    elif not result["dynamic_blocked_reasons"]:
+        result["dynamic_blocked_reasons"].append("no_relaxation_needed")
     return result
 
 
@@ -524,6 +808,180 @@ def _apply_uncertainty_weighting(
     return out.sort_values("weight", ascending=False)
 
 
+def _compute_exposure_metrics(
+    weights: pd.DataFrame,
+    *,
+    target_gross: float = 1.0,
+) -> dict[str, float]:
+    if weights is None or weights.empty or "weight" not in weights.columns:
+        return {
+            "gross_exposure": 0.0,
+            "net_exposure": 0.0,
+            "cash_weight": float(target_gross),
+        }
+    w = pd.to_numeric(weights["weight"], errors="coerce").fillna(0.0)
+    gross = float(w.abs().sum())
+    net = float(w.sum())
+    cash = float(target_gross) - gross
+    return {
+        "gross_exposure": gross,
+        "net_exposure": net,
+        "cash_weight": cash,
+    }
+
+
+def _weights_to_series(weights: pd.DataFrame | None) -> pd.Series:
+    if weights is None or weights.empty or "weight" not in weights.columns:
+        return pd.Series(dtype=float)
+    out = pd.to_numeric(weights["weight"], errors="coerce").fillna(0.0)
+    out.index = out.index.astype(str)
+    if out.index.has_duplicates:
+        out = out.groupby(level=0).sum()
+    return out.astype(float).sort_index()
+
+
+def _compute_weight_distance_metrics(
+    reference_weights: pd.DataFrame | None,
+    final_weights: pd.DataFrame | None,
+    *,
+    top_n: int = 10,
+) -> dict[str, Any]:
+    ref = _weights_to_series(reference_weights)
+    fin = _weights_to_series(final_weights)
+    idx = ref.index.union(fin.index)
+    if len(idx) == 0:
+        return {
+            "l1_distance": 0.0,
+            "l2_distance": 0.0,
+            "max_abs_diff": 0.0,
+            "changed_count": 0,
+            "dropped_count": 0,
+            "entered_count": 0,
+            "dropped_tickers": [],
+            "entered_tickers": [],
+            "top_abs_drift": [],
+        }
+
+    ref_a = ref.reindex(idx).fillna(0.0).astype(float)
+    fin_a = fin.reindex(idx).fillna(0.0).astype(float)
+    delta = fin_a - ref_a
+    abs_delta = delta.abs()
+
+    changed = abs_delta[abs_delta > 1e-12]
+    dropped = sorted(idx[(ref_a > 1e-12) & (fin_a <= 1e-12)].astype(str).tolist())
+    entered = sorted(idx[(ref_a <= 1e-12) & (fin_a > 1e-12)].astype(str).tolist())
+
+    top = (
+        pd.DataFrame(
+            {
+                "ticker": idx.astype(str),
+                "reference_weight": ref_a.values,
+                "final_weight": fin_a.values,
+                "abs_diff": abs_delta.values,
+            }
+        )
+        .sort_values("abs_diff", ascending=False)
+        .head(max(1, int(top_n)))
+    )
+    top_records = []
+    for rec in top.to_dict(orient="records"):
+        if float(rec.get("abs_diff", 0.0)) <= 1e-12:
+            continue
+        top_records.append(
+            {
+                "ticker": str(rec["ticker"]),
+                "reference_weight": float(rec["reference_weight"]),
+                "final_weight": float(rec["final_weight"]),
+                "abs_diff": float(rec["abs_diff"]),
+            }
+        )
+
+    return {
+        "l1_distance": float(abs_delta.sum()),
+        "l2_distance": float((delta.pow(2).sum()) ** 0.5),
+        "max_abs_diff": float(abs_delta.max()) if len(abs_delta) else 0.0,
+        "changed_count": int(len(changed)),
+        "dropped_count": int(len(dropped)),
+        "entered_count": int(len(entered)),
+        "dropped_tickers": dropped,
+        "entered_tickers": entered,
+        "top_abs_drift": top_records,
+    }
+
+
+def _enforce_exposure_policy(
+    weights: pd.DataFrame,
+    *,
+    exposure_policy: str,
+    target_gross_exposure: float,
+    allow_leverage: bool,
+    logger,
+    context: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    out = weights.copy()
+    policy_raw = str(exposure_policy or "allow_cash_no_upscale").strip().lower()
+    policy = policy_raw if policy_raw in {"allow_cash_no_upscale", "normalize_to_target_gross"} else "allow_cash_no_upscale"
+    configured_target_gross = max(0.0, float(target_gross_exposure))
+    effective_target_gross = configured_target_gross if bool(allow_leverage) else min(1.0, configured_target_gross)
+    hard_gross_cap = effective_target_gross
+
+    before = _compute_exposure_metrics(out, target_gross=effective_target_gross)
+    changed = False
+    reason = "none"
+
+    if out.empty or "weight" not in out.columns:
+        after = _compute_exposure_metrics(out, target_gross=effective_target_gross)
+        return out, {
+            "policy": policy,
+            "target_gross_exposure": configured_target_gross,
+            "effective_target_gross_exposure": effective_target_gross,
+            "allow_leverage": bool(allow_leverage),
+            "changed": changed,
+            "reason": reason,
+            "before": before,
+            "after": after,
+        }
+
+    gross_before = float(before["gross_exposure"])
+    if policy == "normalize_to_target_gross":
+        if gross_before > 0 and abs(gross_before - effective_target_gross) > 1e-12:
+            out["weight"] = pd.to_numeric(out["weight"], errors="coerce").fillna(0.0) * (effective_target_gross / gross_before)
+            changed = True
+            reason = "scaled_to_target_gross"
+    else:
+        if gross_before > hard_gross_cap + 1e-12:
+            out["weight"] = pd.to_numeric(out["weight"], errors="coerce").fillna(0.0) * (hard_gross_cap / gross_before)
+            changed = True
+            reason = "downscaled_infeasible_gross"
+        else:
+            reason = "cash_allowed_no_upscale"
+
+    after = _compute_exposure_metrics(out, target_gross=effective_target_gross)
+    logger.info(
+        "Exposure policy (%s @ %s, target=%.4f effective=%.4f): gross %.4f -> %.4f, net %.4f -> %.4f, cash %.4f -> %.4f",
+        policy,
+        context,
+        configured_target_gross,
+        effective_target_gross,
+        float(before["gross_exposure"]),
+        float(after["gross_exposure"]),
+        float(before["net_exposure"]),
+        float(after["net_exposure"]),
+        float(before["cash_weight"]),
+        float(after["cash_weight"]),
+    )
+    return out, {
+        "policy": policy,
+        "target_gross_exposure": configured_target_gross,
+        "effective_target_gross_exposure": effective_target_gross,
+        "allow_leverage": bool(allow_leverage),
+        "changed": changed,
+        "reason": reason,
+        "before": before,
+        "after": after,
+    }
+
+
 def _apply_rebalance_controls(
     target_weights: pd.DataFrame,
     *,
@@ -541,10 +999,106 @@ def _apply_rebalance_controls(
     band_mult_min: float,
     band_mult_max: float,
     logger,
+    exposure_policy: str = "allow_cash_no_upscale",
+    target_gross_exposure: float = 1.0,
+    allow_leverage: bool = False,
     apply_turnover_shrinkage: bool = True,
-) -> pd.DataFrame:
+    return_diagnostics: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "input_weight_count": int(len(target_weights)) if target_weights is not None else 0,
+        "output_weight_count": 0,
+        "path": "unknown",
+        "equity_cad": 0.0,
+        "min_rebalance_weight_delta": 0.0,
+        "min_trade_notional_cad": 0.0,
+        "dynamic_band_enabled": bool(dynamic_band_enabled),
+        "apply_turnover_shrinkage": bool(apply_turnover_shrinkage),
+        "gate_reason_counts": {},
+        "dropped_tickers": [],
+        "dropped_by_notional_gate": [],
+        "hysteresis_kept_count": 0,
+        "fallback_used": False,
+    }
+
+    def _increment_reason(reason_code: str) -> None:
+        code = str(reason_code or "unknown")
+        counts = diagnostics["gate_reason_counts"]
+        counts[code] = int(counts.get(code, 0)) + 1
+
+    def _record_drop(
+        *,
+        ticker: str,
+        reason_code: str,
+        target_weight: float,
+        current_weight: float,
+        delta_weight: float,
+        trade_notional_cad: float | None = None,
+        delta_threshold: float | None = None,
+        notional_threshold_cad: float | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "ticker": str(ticker),
+            "reason_code": str(reason_code),
+            "target_weight": float(target_weight),
+            "current_weight": float(current_weight),
+            "delta_weight": float(delta_weight),
+        }
+        if trade_notional_cad is not None:
+            event["trade_notional_cad"] = float(trade_notional_cad)
+        if delta_threshold is not None:
+            event["delta_threshold"] = float(delta_threshold)
+        if notional_threshold_cad is not None:
+            event["notional_threshold_cad"] = float(notional_threshold_cad)
+        diagnostics["dropped_tickers"].append(event)
+        if "notional" in str(reason_code):
+            diagnostics["dropped_by_notional_gate"].append(event)
+
+    def _finalize(
+        out: pd.DataFrame,
+        *,
+        path: str,
+        exposure_info: dict[str, Any] | None = None,
+        fallback_used: bool = False,
+    ) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]:
+        out_sorted = out.sort_values("weight", ascending=False) if isinstance(out, pd.DataFrame) and "weight" in out.columns else out
+        diagnostics["path"] = str(path)
+        diagnostics["fallback_used"] = bool(fallback_used)
+        diagnostics["output_weight_count"] = int(len(out_sorted)) if isinstance(out_sorted, pd.DataFrame) else 0
+        diagnostics["hysteresis_kept_count"] = int(diagnostics.get("hysteresis_kept_count", 0))
+        if isinstance(exposure_info, dict):
+            diagnostics["exposure_policy"] = exposure_info
+
+        # Deterministic ordering + de-duplication for audit logs.
+        dropped_events = diagnostics.get("dropped_tickers", [])
+        if isinstance(dropped_events, list) and dropped_events:
+            uniq: dict[tuple[str, str], dict[str, Any]] = {}
+            for evt in dropped_events:
+                if not isinstance(evt, dict):
+                    continue
+                ticker = str(evt.get("ticker", "")).upper()
+                reason = str(evt.get("reason_code", "unknown"))
+                key = (ticker, reason)
+                prev = uniq.get(key)
+                if prev is None or float(evt.get("target_weight", 0.0) or 0.0) > float(prev.get("target_weight", 0.0) or 0.0):
+                    evt_copy = dict(evt)
+                    evt_copy["ticker"] = ticker
+                    uniq[key] = evt_copy
+            ordered = [uniq[k] for k in sorted(uniq.keys())]
+            diagnostics["dropped_tickers"] = ordered
+            diagnostics["dropped_by_notional_gate"] = [
+                e for e in ordered if "notional" in str(e.get("reason_code", ""))
+            ]
+        else:
+            diagnostics["dropped_tickers"] = []
+            diagnostics["dropped_by_notional_gate"] = []
+
+        if return_diagnostics:
+            return out_sorted, diagnostics
+        return out_sorted
+
     if target_weights.empty:
-        return target_weights
+        return _finalize(target_weights, path="empty_target_weights")
 
     min_delta = max(0.0, float(min_rebalance_weight_delta))
     min_notional = max(1.0, float(min_trade_notional_cad))
@@ -556,6 +1110,8 @@ def _apply_rebalance_controls(
     dyn_v_w = max(0.0, float(vol_regime_weight))
     dyn_min = max(0.2, float(band_mult_min))
     dyn_max = max(dyn_min, float(band_mult_max))
+    diagnostics["min_rebalance_weight_delta"] = float(min_delta)
+    diagnostics["min_trade_notional_cad"] = float(min_notional)
 
     if penalty_bps > 0 and not apply_turnover_shrink:
         logger.info(
@@ -575,29 +1131,45 @@ def _apply_rebalance_controls(
         open_total += val
 
     equity = float(state.cash_cad) + float(open_total)
+    diagnostics["equity_cad"] = float(equity)
     if equity <= 0:
-        return target_weights
+        return _finalize(target_weights, path="non_positive_equity")
 
     current_weights = {t: v / equity for t, v in open_values.items() if v > 0}
 
     # Cold start: no open holdings means there is no turnover to suppress.
-    # Keep only entries that clear minimum trade notional, then normalize.
+    # Keep only entries that clear minimum trade notional.
     if not current_weights:
         cold = target_weights.copy()
         if "weight" not in cold.columns:
-            return cold
+            return _finalize(cold, path="cold_start_missing_weight_column")
         cold = cold[cold["weight"].fillna(0.0) > 0.0].copy()
         if cold.empty:
-            return cold
+            return _finalize(cold, path="cold_start_no_positive_targets")
+        cold_before_notional = set(cold.index.astype(str))
         cold = cold[(cold["weight"].astype(float) * equity) >= min_notional].copy()
+        dropped_cold_notional = sorted(cold_before_notional - set(cold.index.astype(str)))
+        for t in dropped_cold_notional:
+            tw = _lookup_frame_metric(target_weights, t, "weight")
+            tw = float(tw) if tw is not None else 0.0
+            _record_drop(
+                ticker=t,
+                reason_code="cold_start_min_notional",
+                target_weight=tw,
+                current_weight=0.0,
+                delta_weight=tw,
+                trade_notional_cad=tw * equity,
+                delta_threshold=min_delta,
+                notional_threshold_cad=min_notional,
+            )
         if cold.empty:
             top = target_weights.sort_values("weight", ascending=False).head(1).copy()
             if top.empty:
-                return top
+                return _finalize(top, path="cold_start_seed_missing")
             top_w = float(top["weight"].iloc[0])
             top_notional = top_w * equity
             if top_w <= 0 or top_notional < 1.0:
-                return target_weights.iloc[0:0].copy()
+                return _finalize(target_weights.iloc[0:0].copy(), path="cold_start_seed_below_minimum")
             if top_notional < min_notional:
                 logger.warning(
                     "Rebalance cold start: top allocation %.2f CAD is below min trade notional %.2f; "
@@ -606,17 +1178,32 @@ def _apply_rebalance_controls(
                     min_notional,
                 )
             logger.info("Rebalance cold start: keeping top position to avoid empty portfolio.")
-            return top
-        total = float(cold["weight"].sum())
-        if total > 1.0:
-            cold["weight"] = cold["weight"] / total
+            top, exposure_info = _enforce_exposure_policy(
+                top,
+                exposure_policy=exposure_policy,
+                target_gross_exposure=target_gross_exposure,
+                allow_leverage=allow_leverage,
+                logger=logger,
+                context="rebalance_cold_start_seed",
+            )
+            _increment_reason("cold_start_seed_kept")
+            return _finalize(top, path="cold_start_seed", exposure_info=exposure_info)
+        cold, exposure_info = _enforce_exposure_policy(
+            cold,
+            exposure_policy=exposure_policy,
+            target_gross_exposure=target_gross_exposure,
+            allow_leverage=allow_leverage,
+            logger=logger,
+            context="rebalance_cold_start",
+        )
         logger.info(
             "Rebalance cold start: bypassed hysteresis, kept %d entries (equity=%.2f, min_notional=%.2f)",
             len(cold),
             equity,
             min_notional,
         )
-        return cold.sort_values("weight", ascending=False)
+        _increment_reason("cold_start_targets_kept")
+        return _finalize(cold, path="cold_start", exposure_info=exposure_info)
 
     adjusted = target_weights.copy()
     effective_weights: dict[str, float] = {}
@@ -659,19 +1246,40 @@ def _apply_rebalance_controls(
         notional_threshold = min_notional * dyn_mult
         trade_notional = delta * equity
 
-        if delta < delta_threshold or trade_notional < notional_threshold:
+        reason_code = "target_applied"
+        if delta < delta_threshold:
             effective = cur_w
             skipped_small += 1
+            reason_code = "hysteresis_delta"
+        elif trade_notional < notional_threshold:
+            effective = cur_w
+            skipped_small += 1
+            reason_code = "hysteresis_notional"
         else:
             effective = tgt_w
             if apply_turnover_shrink and penalty_bps > 0:
                 # Transaction-cost-aware shrinkage of turnover-heavy moves.
                 turnover_penalty = penalty_bps * dyn_mult * 1e-4 * delta
                 effective = max(0.0, tgt_w - turnover_penalty)
+                reason_code = "turnover_shrinkage"
 
         # Avoid initiating tiny new positions.
-        if cur_w <= 0 and effective * equity < notional_threshold:
+        if cur_w <= 0 and effective > 0 and effective * equity < notional_threshold:
+            reason_code = "entry_notional_blocked"
             effective = 0.0
+        _increment_reason(reason_code)
+
+        if tgt_w > 1e-12 and cur_w <= 1e-12 and effective <= 1e-12:
+            _record_drop(
+                ticker=t,
+                reason_code=reason_code,
+                target_weight=tgt_w,
+                current_weight=cur_w,
+                delta_weight=delta,
+                trade_notional_cad=trade_notional,
+                delta_threshold=delta_threshold,
+                notional_threshold_cad=notional_threshold,
+            )
         effective_weights[t] = effective
 
     if skipped_small > 0:
@@ -687,6 +1295,7 @@ def _apply_rebalance_controls(
                 "Rebalance hysteresis kept %d small-delta/notional changes",
                 skipped_small,
             )
+    diagnostics["hysteresis_kept_count"] = int(skipped_small)
 
     for t, w in effective_weights.items():
         if t not in adjusted.index:
@@ -699,18 +1308,52 @@ def _apply_rebalance_controls(
         fallback = target_weights.copy()
         if "weight" in fallback.columns:
             fallback = fallback[fallback["weight"].fillna(0.0) > 0.0].copy()
+            fallback_before_notional = set(fallback.index.astype(str))
             fallback = fallback[(fallback["weight"].astype(float) * equity) >= min_notional].copy()
+            dropped_fallback_notional = sorted(fallback_before_notional - set(fallback.index.astype(str)))
+            for t in dropped_fallback_notional:
+                tw = _lookup_frame_metric(target_weights, t, "weight")
+                tw = float(tw) if tw is not None else 0.0
+                _record_drop(
+                    ticker=t,
+                    reason_code="fallback_min_notional",
+                    target_weight=tw,
+                    current_weight=float(current_weights.get(t, 0.0)),
+                    delta_weight=abs(tw - float(current_weights.get(t, 0.0))),
+                    trade_notional_cad=abs(tw - float(current_weights.get(t, 0.0))) * equity,
+                    delta_threshold=min_delta,
+                    notional_threshold_cad=min_notional,
+                )
             if not fallback.empty:
                 logger.warning(
                     "Rebalance controls removed all targets; falling back to %d feasible target entries",
                     len(fallback),
                 )
-                return fallback.sort_values("weight", ascending=False)
+                fallback, exposure_info = _enforce_exposure_policy(
+                    fallback,
+                    exposure_policy=exposure_policy,
+                    target_gross_exposure=target_gross_exposure,
+                    allow_leverage=allow_leverage,
+                    logger=logger,
+                    context="rebalance_fallback",
+                )
+                _increment_reason("fallback_used")
+                return _finalize(
+                    fallback,
+                    path="fallback_targets",
+                    exposure_info=exposure_info,
+                    fallback_used=True,
+                )
 
-    total = float(adjusted["weight"].sum()) if not adjusted.empty else 0.0
-    if total > 1.0:
-        adjusted["weight"] = adjusted["weight"] / total
-    return adjusted.sort_values("weight", ascending=False)
+    adjusted, exposure_info = _enforce_exposure_policy(
+        adjusted,
+        exposure_policy=exposure_policy,
+        target_gross_exposure=target_gross_exposure,
+        allow_leverage=allow_leverage,
+        logger=logger,
+        context="rebalance_final",
+    )
+    return _finalize(adjusted, path="standard", exposure_info=exposure_info)
 
 
 def _compute_open_position_values(
@@ -728,6 +1371,35 @@ def _compute_open_position_values(
             continue
         values[p.ticker] = values.get(p.ticker, 0.0) + (float(px) * float(p.shares))
     return values
+
+
+def _build_hold_only_target_weights(
+    state,
+    prices_cad: pd.Series,
+    logger,
+) -> pd.DataFrame:
+    """Build target weights from currently open holdings only (no new entries)."""
+    open_values = _compute_open_position_values(state, prices_cad)
+    if not open_values:
+        logger.warning(
+            "Strategy mode HOLD_ONLY: no open positions available; no new buys will be created.",
+        )
+        return pd.DataFrame({"weight": pd.Series(dtype=float)})
+
+    values = pd.Series(open_values, dtype=float).sort_values(ascending=False)
+    total = float(values.sum())
+    if total <= 0:
+        logger.warning(
+            "Strategy mode HOLD_ONLY: open position values are non-positive; no target weights generated.",
+        )
+        return pd.DataFrame({"weight": pd.Series(dtype=float)})
+
+    out = pd.DataFrame({"weight": (values / total).astype(float)})
+    logger.warning(
+        "Strategy mode HOLD_ONLY: restricting targets to %d open holding(s); new buys disabled.",
+        len(out),
+    )
+    return out
 
 
 def _resolve_portfolio_state_path(
@@ -828,11 +1500,64 @@ def _sanitize_trade_actions(actions: list[TradeAction], logger) -> list[TradeAct
     return kept
 
 
+def _position_changing_actions(actions: list[TradeAction]) -> list[TradeAction]:
+    return [
+        a for a in (actions or [])
+        if str(getattr(a, "action", "")).strip().upper() in {"BUY", "SELL", "SELL_PARTIAL"}
+    ]
+
+
+def _trade_actions_to_event_payloads(
+    actions: list[TradeAction],
+    *,
+    source: str,
+    ts_utc: datetime,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for a in _position_changing_actions(actions):
+        payloads.append(
+            {
+                "ts_utc": ts_utc.isoformat(),
+                "source": source,
+                "action": str(a.action).upper(),
+                "ticker": str(a.ticker).upper(),
+                "reason": str(a.reason),
+                "shares": float(a.shares),
+                "price_cad": float(a.price_cad),
+                "days_held": a.days_held,
+                "pred_return": a.pred_return,
+                "entry_price": a.entry_price,
+                "realized_gain_pct": a.realized_gain_pct,
+                "replaces_ticker": a.replaces_ticker,
+                "expected_sell_date": a.expected_sell_date,
+            }
+        )
+    return payloads
+
+
+def _persist_state_transition_or_fail(
+    *,
+    state_path: Path,
+    state,
+    event_log_path: Path,
+    actions: list[TradeAction],
+    source: str,
+) -> int:
+    """Persist action events + state; raise on any failure."""
+    now = datetime.now(tz=timezone.utc)
+    events = _trade_actions_to_event_payloads(actions, source=source, ts_utc=now)
+    if events:
+        append_portfolio_events(event_log_path, events)
+    save_portfolio_state(state_path, state)
+    return len(events)
+
+
 def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
     started_utc = datetime.now(tz=timezone.utc)
     state_path = _resolve_portfolio_state_path(cfg.portfolio_state_path)
+    event_log_path = resolve_portfolio_event_log_path(state_path)
     cache_dir = ensure_dir(cfg.cache_dir)
     data_cache_dir = ensure_dir(cfg.data_cache_dir)
     reports_dir = ensure_dir(cfg.reports_dir)
@@ -842,7 +1567,24 @@ def run_daily(cfg: Config, logger) -> None:
         "run_utc": datetime.now(tz=timezone.utc).isoformat(),
         "config": asdict(cfg),
         "portfolio_state_path": str(state_path),
+        "portfolio_event_log_path": str(event_log_path),
     }
+    previous_run_meta: dict[str, Any] | None = None
+    prev_meta_path = cache_dir / "last_run_meta.json"
+    if prev_meta_path.is_file():
+        try:
+            loaded_prev = read_json(prev_meta_path)
+            if isinstance(loaded_prev, dict):
+                previous_run_meta = loaded_prev
+                run_meta["previous_run_meta_loaded"] = True
+        except Exception as e:
+            logger.warning("Could not load previous run metadata (%s): %s", prev_meta_path, e)
+    if "previous_run_meta_loaded" not in run_meta:
+        run_meta["previous_run_meta_loaded"] = False
+    ml_expected = bool(getattr(cfg, "use_ml", False))
+    allow_baseline_trading = bool(getattr(cfg, "allow_baseline_trading", False))
+    ml_available = False
+    ml_failure_reason: str | None = None
 
     us = fetch_us_universe(cfg=cfg, cache_dir=cache_dir, logger=logger)
     tsx = fetch_tsx_universe(cfg=cfg, cache_dir=cache_dir, logger=logger)
@@ -1107,17 +1849,25 @@ def run_daily(cfg: Config, logger) -> None:
                             features["pred_peak_days"].max(),
                         )
                     
-                    # Compute return-per-day: ranks stocks by how quickly they spike
-                    # pred_return is the predicted peak return (if model trained on peak),
-                    # pred_peak_days is the predicted day of peak
-                    if "pred_peak_days" in features.columns:
-                        safe_days = features["pred_peak_days"].clip(lower=1.0)
-                        features["ret_per_day"] = features["pred_return"] / safe_days
-                        logger.info(
-                            "Return-per-day: mean=%.4f, max=%.4f (optimizing for spike capture)",
-                            features["ret_per_day"].mean(),
-                            features["ret_per_day"].max(),
-                        )
+                    # Compute guarded return-per-day signal from predicted return
+                    # and predicted peak day. This applies clamp + smoothing and
+                    # emits distribution diagnostics + shift alerts.
+                    ret_per_day_info = _compute_ret_per_day_signal(
+                        features,
+                        cfg=cfg,
+                        logger=logger,
+                        previous_run_meta=previous_run_meta,
+                    )
+                    run_meta["ret_per_day_signal"] = ret_per_day_info
+                    if bool(ret_per_day_info.get("shift_alert_triggered", False)):
+                        alerts = run_meta.setdefault("alerts", [])
+                        if isinstance(alerts, list):
+                            alerts.append(
+                                {
+                                    "type": "ret_per_day_distribution_shift",
+                                    "details": ret_per_day_info.get("shift_alerts", []),
+                                }
+                            )
                     
                     logger.info(
                         "ML predictions: mean=%.4f, confidence range=[%.3f, %.3f]",
@@ -1126,12 +1876,62 @@ def run_daily(cfg: Config, logger) -> None:
                         pred_df["pred_confidence"].max(),
                     )
                     logger.info("Loaded ML regressor ensemble from %s (%s members)", cfg.model_path, len(models))
+                    ml_available = True
+                else:
+                    ml_failure_reason = "empty_ensemble"
+                    logger.warning(
+                        "ML manifest loaded but ensemble contains no models; treating ML as unavailable.",
+                    )
             else:
                 model = load_model(cfg.model_path)
                 logger.info("Loaded ML model from %s", cfg.model_path)
                 features["pred_return"] = predict(model, features_ml, feature_cols=selected_features)
+                ml_available = True
         except Exception as e:
+            ml_failure_reason = str(e)
             logger.warning("ML enabled but model could not be loaded/used: %s", e)
+
+    if ml_expected and not ml_available:
+        # Last-resort availability check in case predictions were injected by an
+        # alternative ML path without toggling the explicit flag above.
+        try:
+            ml_available = bool(
+                "pred_return" in features.columns
+                and pd.to_numeric(features["pred_return"], errors="coerce").notna().any()
+            )
+        except Exception:
+            ml_available = False
+
+    if ml_expected:
+        if ml_available:
+            strategy_mode = "ML"
+            strategy_reason = "ml_inference_available"
+        elif allow_baseline_trading:
+            strategy_mode = "BASELINE"
+            strategy_reason = "ml_unavailable_baseline_allowed"
+            logger.warning(
+                "ML expected but unavailable (%s); ALLOW_BASELINE_TRADING=1, continuing in BASELINE mode.",
+                ml_failure_reason or "unknown_reason",
+            )
+        else:
+            strategy_mode = "HOLD_ONLY"
+            strategy_reason = "ml_unavailable_hold_only"
+            logger.warning(
+                "ML expected but unavailable (%s); entering HOLD_ONLY mode (no new buys).",
+                ml_failure_reason or "unknown_reason",
+            )
+    else:
+        strategy_mode = "BASELINE"
+        strategy_reason = "ml_disabled"
+
+    run_meta["strategy_mode"] = {
+        "mode": strategy_mode,
+        "reason": strategy_reason,
+        "ml_expected": ml_expected,
+        "ml_available": ml_available,
+        "allow_baseline_trading": allow_baseline_trading,
+        "ml_failure_reason": ml_failure_reason,
+    }
 
     scored = score_universe(
         features=features,
@@ -1164,6 +1964,21 @@ def run_daily(cfg: Config, logger) -> None:
         cfg=cfg,
         logger=logger,
     )
+    if bool(entry_thresholds.get("hold_only_recommended", False)) and strategy_mode != "HOLD_ONLY":
+        strategy_mode = "HOLD_ONLY"
+        strategy_reason = "entry_stress_guard_hold_only"
+        logger.warning(
+            "Entry stress guard escalated strategy mode to HOLD_ONLY (vol/breadth stress).",
+        )
+    if isinstance(run_meta.get("strategy_mode"), dict):
+        run_meta["strategy_mode"]["mode"] = strategy_mode
+        run_meta["strategy_mode"]["reason"] = strategy_reason
+        run_meta["strategy_mode"]["entry_stress_guard_triggered"] = bool(
+            entry_thresholds.get("stress_guard_triggered", False)
+        )
+        run_meta["strategy_mode"]["entry_stress_hold_only_recommended"] = bool(
+            entry_thresholds.get("hold_only_recommended", False)
+        )
     screened, entry_filter_stats = apply_entry_filters(
         screened,
         min_confidence=entry_thresholds.get("min_confidence"),
@@ -1173,7 +1988,11 @@ def run_daily(cfg: Config, logger) -> None:
         momentum_alignment=getattr(cfg, "entry_momentum_alignment", True),
         logger=logger,
     )
-    if entry_thresholds.get("dynamic_applied"):
+    if (
+        entry_thresholds.get("dynamic_applied")
+        or entry_thresholds.get("stress_guard_triggered")
+        or entry_thresholds.get("dynamic_blocked_reasons")
+    ):
         run_meta["entry_thresholds"] = entry_thresholds
     if entry_filter_stats.get("rejected_count", 0) > 0:
         run_meta["entry_filters"] = entry_filter_stats
@@ -1311,6 +2130,7 @@ def run_daily(cfg: Config, logger) -> None:
 
     # Optional single-pass constrained optimizer (replaces sequential transforms).
     unified_opt_enabled = bool(getattr(cfg, "unified_optimizer_enabled", True))
+    optimizer_weights_snapshot: pd.DataFrame | None = None
     if unified_opt_enabled:
         current_weights = None
         try:
@@ -1344,6 +2164,7 @@ def run_daily(cfg: Config, logger) -> None:
             allow_cash=True,
             logger=logger,
         )
+        optimizer_weights_snapshot = target_weights.copy()
         run_meta["unified_optimizer"] = {
             "enabled": True,
             "risk_penalty": float(getattr(cfg, "optimizer_risk_penalty", 1.0)),
@@ -1728,6 +2549,7 @@ def run_daily(cfg: Config, logger) -> None:
 
     pm = PortfolioManager(
         state_path=str(state_path),
+        event_log_path=str(event_log_path),
         max_holding_days=cfg.max_holding_days,
         max_holding_days_hard=cfg.max_holding_days_hard,
         extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
@@ -1767,6 +2589,7 @@ def run_daily(cfg: Config, logger) -> None:
         min_trade_notional_cad=getattr(cfg, "min_trade_notional_cad", 15.0),
         min_rebalance_weight_delta=getattr(cfg, "min_rebalance_weight_delta", 0.015),
         rotate_on_missing_data=getattr(cfg, "rotate_on_missing_data", False),
+        rotation_cooldown_days=getattr(cfg, "rotation_cooldown_days", 2),
         logger=logger,
     )
     # Extract market volatility regime for dynamic holding period
@@ -1796,10 +2619,19 @@ def run_daily(cfg: Config, logger) -> None:
             logger.info("Blocking same-run re-entry for exited tickers: %s", preview)
         # Persist state immediately after exits so position closures and cash
         # updates are not lost if the pipeline crashes before build_trade_plan.
-        try:
-            save_portfolio_state(state_path, state)
-        except Exception as e:
-            logger.warning("Could not save portfolio state after exits: %s", e)
+        # Persistence failures are fail-stop: continuing would desynchronize
+        # reported actions from recorded portfolio state.
+        n_exit_events = _persist_state_transition_or_fail(
+            state_path=state_path,
+            state=state,
+            event_log_path=event_log_path,
+            actions=exit_actions,
+            source="apply_exits",
+        )
+        run_meta["exit_persistence"] = {
+            "actions": int(len(_position_changing_actions(exit_actions))),
+            "events_appended": int(n_exit_events),
+        }
 
     # Apply rebalance hysteresis and trade-size guards. If unified optimizer is
     # active, it already penalizes turnover in the objective, so avoid a second
@@ -1809,7 +2641,15 @@ def run_daily(cfg: Config, logger) -> None:
         logger.info(
             "Unified optimizer active: disabling post-optimizer turnover shrinkage to avoid duplicate turnover penalties.",
         )
-    target_weights = _apply_rebalance_controls(
+    exposure_policy = str(getattr(cfg, "exposure_policy", "allow_cash_no_upscale"))
+    target_gross_exposure = float(getattr(cfg, "target_gross_exposure", 1.0))
+    allow_leverage = bool(getattr(cfg, "allow_leverage", False))
+    pre_rebalance_weights = target_weights.copy()
+    run_meta["exposure_control_before_rebalance"] = _compute_exposure_metrics(
+        pre_rebalance_weights,
+        target_gross=target_gross_exposure,
+    )
+    rebalance_result = _apply_rebalance_controls(
         target_weights,
         state=state,
         screened=screened,
@@ -1824,9 +2664,82 @@ def run_daily(cfg: Config, logger) -> None:
         vol_regime_weight=getattr(cfg, "dynamic_no_trade_vol_regime_weight", 0.8),
         band_mult_min=getattr(cfg, "dynamic_no_trade_multiplier_min", 1.0),
         band_mult_max=getattr(cfg, "dynamic_no_trade_multiplier_max", 3.0),
+        exposure_policy=exposure_policy,
+        target_gross_exposure=target_gross_exposure,
+        allow_leverage=allow_leverage,
         logger=logger,
         apply_turnover_shrinkage=apply_post_turnover_shrink,
+        return_diagnostics=True,
     )
+    if isinstance(rebalance_result, tuple):
+        target_weights, rebalance_diag = rebalance_result
+    else:
+        target_weights = rebalance_result
+        rebalance_diag = {}
+    run_meta["rebalance_gate_audit"] = rebalance_diag
+
+    pre_rebalance_drift = _compute_weight_distance_metrics(pre_rebalance_weights, target_weights)
+    if isinstance(rebalance_diag, dict):
+        reason_map = {
+            str(evt.get("ticker", "")).upper(): str(evt.get("reason_code", "unknown"))
+            for evt in rebalance_diag.get("dropped_tickers", [])
+            if isinstance(evt, dict)
+        }
+        pre_rebalance_drift["dropped_tickers_with_reasons"] = [
+            {"ticker": str(t), "reason_code": reason_map.get(str(t).upper(), "unknown")}
+            for t in pre_rebalance_drift.get("dropped_tickers", [])
+        ]
+
+    optimizer_vs_final = None
+    if optimizer_weights_snapshot is not None:
+        optimizer_vs_final = _compute_weight_distance_metrics(optimizer_weights_snapshot, target_weights)
+
+    run_meta["optimizer_projection_audit"] = {
+        "optimizer_enabled": bool(unified_opt_enabled),
+        "pre_rebalance_vs_final": pre_rebalance_drift,
+        "optimizer_vs_final": optimizer_vs_final,
+        "notional_drops_with_reasons": (
+            rebalance_diag.get("dropped_by_notional_gate", [])
+            if isinstance(rebalance_diag, dict)
+            else []
+        ),
+    }
+
+    logger.info(
+        "Weight projection audit: pre->final L1=%.4f L2=%.4f dropped=%d notional_drops=%d",
+        float(pre_rebalance_drift.get("l1_distance", 0.0)),
+        float(pre_rebalance_drift.get("l2_distance", 0.0)),
+        int(pre_rebalance_drift.get("dropped_count", 0)),
+        int(len(run_meta["optimizer_projection_audit"]["notional_drops_with_reasons"])),
+    )
+    if isinstance(optimizer_vs_final, dict):
+        logger.info(
+            "Weight projection audit (optimizer->final): L1=%.4f L2=%.4f dropped=%d",
+            float(optimizer_vs_final.get("l1_distance", 0.0)),
+            float(optimizer_vs_final.get("l2_distance", 0.0)),
+            int(optimizer_vs_final.get("dropped_count", 0)),
+        )
+
+    run_meta["exposure_control_after_rebalance"] = {
+        **_compute_exposure_metrics(target_weights, target_gross=target_gross_exposure),
+        "policy": exposure_policy,
+        "target_gross_exposure": target_gross_exposure,
+        "allow_leverage": allow_leverage,
+        "unified_optimizer_enabled": unified_opt_enabled,
+        "post_rebalance_turnover_shrinkage_applied": bool(apply_post_turnover_shrink),
+    }
+
+    # Hard strategy gate: when ML is expected but unavailable and baseline
+    # trading is not explicitly allowed, freeze entries and only manage current
+    # holdings via exit/risk logic.
+    if strategy_mode == "HOLD_ONLY":
+        target_weights = _build_hold_only_target_weights(state, prices_cad, logger)
+        run_meta["hold_only"] = {
+            "enabled": True,
+            "open_positions": int(
+                len([p for p in state.positions if p.status == "OPEN" and p.ticker and p.shares > 0])
+            ),
+        }
 
     # Add pred_return and pred_peak_days to target_weights for email reporting
     if "pred_return" in screened.columns:

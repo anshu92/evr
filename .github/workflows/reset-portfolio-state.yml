@@ -86,6 +86,8 @@ jobs:
               json.dump(state, fh, indent=2, sort_keys=True)
           with open("screener_portfolio_state.json.bak", "w", encoding="utf-8") as fh:
               json.dump(state, fh, indent=2, sort_keys=True)
+          with open("screener_portfolio_state.json.events.jsonl", "w", encoding="utf-8") as fh:
+              fh.write("")
           PY
           mkdir -p cache data_cache
           ls -la screener_portfolio_state.json
@@ -100,6 +102,7 @@ jobs:
             data_cache/
             screener_portfolio_state.json
             screener_portfolio_state.json.bak
+            screener_portfolio_state.json.events.jsonl
           key: ${{ runner.os }}-daily-screener-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/daily-stock-screener.yml') }}
 
       - name: Validate reset cache seed
@@ -116,6 +119,7 @@ jobs:
           path: |
             screener_portfolio_state.json
             screener_portfolio_state.json.bak
+            screener_portfolio_state.json.events.jsonl
           retention-days: 14
 
       - name: Write summary

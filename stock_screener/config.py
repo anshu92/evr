@@ -39,6 +39,7 @@ class Config:
 
     # ML model (optional)
     use_ml: bool = False
+    allow_baseline_trading: bool = False  # If USE_ML and ML unavailable, allow baseline entries (otherwise HOLD_ONLY)
     model_path: str = "models/ensemble/manifest.json"
     label_horizon_days: int = 5
     trade_cost_bps: float = 0.0
@@ -155,6 +156,7 @@ class Config:
     extend_hold_min_pred_return: float | None = 0.03
     extend_hold_min_score: float | None = None
     rotate_on_missing_data: bool = False  # If True, can rotate out holdings with no fresh prediction data
+    rotation_cooldown_days: int = 2  # Min trading days after entry before rotation sells (risk exits still apply)
     portfolio_state_path: str = "screener_portfolio_state.json"
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
@@ -205,6 +207,22 @@ class Config:
     entry_min_confidence_floor: float = 0.35  # Lower bound for dynamic confidence threshold
     entry_pred_return_percentile: float = 0.60  # Dynamic predicted-return threshold percentile
     entry_min_pred_return_floor: float = 0.0025  # Lower bound for dynamic predicted-return threshold (0.25%)
+    entry_dynamic_min_conf_top_decile_spread: float = 0.03  # Require confidence separation before relaxing
+    entry_dynamic_min_pred_top_decile_spread: float = 0.002  # Require return separation before relaxing
+    entry_stress_guard_enabled: bool = True  # Guard dynamic threshold relaxation in stressed regimes
+    entry_stress_max_vol_stress: float = 0.65  # Vol stress cutoff (0-1) above which thresholds tighten
+    entry_stress_min_breadth: float = 0.45  # Breadth floor below which thresholds tighten
+    entry_stress_confidence_tighten_add: float = 0.05  # Additive confidence tightening under stress
+    entry_stress_pred_return_tighten_add: float = 0.002  # Additive return tightening under stress
+    entry_stress_hold_only_enabled: bool = False  # Optional hard gate: force HOLD_ONLY when stress guard triggers
+    ret_per_day_min_peak_days: float = 1.0  # Clamp lower bound for predicted peak-day denominator
+    ret_per_day_max_peak_days: float = 10.0  # Clamp upper bound for predicted peak-day denominator
+    ret_per_day_smoothing_k: float = 1.0  # Smoothing term in ret_per_day denominator
+    ret_per_day_shift_alert_enabled: bool = True  # Alert when ret_per_day distribution shifts sharply run-over-run
+    ret_per_day_shift_alert_min_samples: int = 20  # Minimum sample size required for shift alerts
+    ret_per_day_mean_shift_alert_pct: float = 0.50  # Relative mean shift trigger
+    ret_per_day_p90_shift_alert_pct: float = 0.50  # Relative p90 shift trigger
+    ret_per_day_std_shift_alert_pct: float = 0.75  # Relative std shift trigger
 
     # Reward model (realized-return feedback loop + adaptive policy)
     reward_model_enabled: bool = True
@@ -236,6 +254,9 @@ class Config:
     dynamic_no_trade_vol_regime_weight: float = 0.8
     dynamic_no_trade_multiplier_min: float = 1.0
     dynamic_no_trade_multiplier_max: float = 3.0
+    exposure_policy: str = "allow_cash_no_upscale"  # allow_cash_no_upscale | normalize_to_target_gross
+    target_gross_exposure: float = 1.0
+    allow_leverage: bool = False
 
     # Model promotion gates (statistical + business)
     promotion_gates_enabled: bool = True
@@ -321,6 +342,7 @@ class Config:
             dynamic_size_min_pred_return=_get_float("DYNAMIC_SIZE_MIN_PRED_RETURN", 0.01),
             dynamic_size_max_positions=dyn_max,
             use_ml=os.getenv("USE_ML", "0").strip() in {"1", "true", "True"},
+            allow_baseline_trading=_get_bool("ALLOW_BASELINE_TRADING", False),
             model_path=_get_str("MODEL_PATH", "models/ensemble/manifest.json"),
             label_horizon_days=_get_int("LABEL_HORIZON_DAYS", 5) or 5,
             trade_cost_bps=_get_float("TRADE_COST_BPS", 0.0),
@@ -413,6 +435,7 @@ class Config:
                 _get_float("EXTEND_HOLD_MIN_SCORE", 0.0) if os.getenv("EXTEND_HOLD_MIN_SCORE") not in {None, ""} else None
             ),
             rotate_on_missing_data=_get_bool("ROTATE_ON_MISSING_DATA", False),
+            rotation_cooldown_days=max(0, _get_int("ROTATION_COOLDOWN_DAYS", 2) or 2),
             portfolio_state_path=_get_str("PORTFOLIO_STATE_PATH", "screener_portfolio_state.json"),
             stop_loss_pct=(
                 _get_float("STOP_LOSS_PCT", 0.0) if os.getenv("STOP_LOSS_PCT") not in {None, ""} else None
@@ -473,6 +496,53 @@ class Config:
             entry_min_confidence_floor=_get_float("ENTRY_MIN_CONFIDENCE_FLOOR", 0.35),
             entry_pred_return_percentile=_get_float("ENTRY_PRED_RETURN_PERCENTILE", 0.60),
             entry_min_pred_return_floor=_get_float("ENTRY_MIN_PRED_RETURN_FLOOR", 0.0025),
+            entry_dynamic_min_conf_top_decile_spread=max(
+                0.0,
+                _get_float("ENTRY_DYNAMIC_MIN_CONF_TOP_DECILE_SPREAD", 0.03),
+            ),
+            entry_dynamic_min_pred_top_decile_spread=max(
+                0.0,
+                _get_float("ENTRY_DYNAMIC_MIN_PRED_TOP_DECILE_SPREAD", 0.002),
+            ),
+            entry_stress_guard_enabled=_get_bool("ENTRY_STRESS_GUARD_ENABLED", True),
+            entry_stress_max_vol_stress=float(
+                max(0.0, min(1.0, _get_float("ENTRY_STRESS_MAX_VOL_STRESS", 0.65)))
+            ),
+            entry_stress_min_breadth=float(
+                max(0.0, min(1.0, _get_float("ENTRY_STRESS_MIN_BREADTH", 0.45)))
+            ),
+            entry_stress_confidence_tighten_add=max(
+                0.0,
+                _get_float("ENTRY_STRESS_CONFIDENCE_TIGHTEN_ADD", 0.05),
+            ),
+            entry_stress_pred_return_tighten_add=max(
+                0.0,
+                _get_float("ENTRY_STRESS_PRED_RETURN_TIGHTEN_ADD", 0.002),
+            ),
+            entry_stress_hold_only_enabled=_get_bool("ENTRY_STRESS_HOLD_ONLY_ENABLED", False),
+            ret_per_day_min_peak_days=max(0.1, _get_float("RET_PER_DAY_MIN_PEAK_DAYS", 1.0)),
+            ret_per_day_max_peak_days=max(
+                max(0.1, _get_float("RET_PER_DAY_MIN_PEAK_DAYS", 1.0)),
+                _get_float("RET_PER_DAY_MAX_PEAK_DAYS", 10.0),
+            ),
+            ret_per_day_smoothing_k=max(0.0, _get_float("RET_PER_DAY_SMOOTHING_K", 1.0)),
+            ret_per_day_shift_alert_enabled=_get_bool("RET_PER_DAY_SHIFT_ALERT_ENABLED", True),
+            ret_per_day_shift_alert_min_samples=max(
+                5,
+                _get_int("RET_PER_DAY_SHIFT_ALERT_MIN_SAMPLES", 20) or 20,
+            ),
+            ret_per_day_mean_shift_alert_pct=max(
+                0.0,
+                _get_float("RET_PER_DAY_MEAN_SHIFT_ALERT_PCT", 0.50),
+            ),
+            ret_per_day_p90_shift_alert_pct=max(
+                0.0,
+                _get_float("RET_PER_DAY_P90_SHIFT_ALERT_PCT", 0.50),
+            ),
+            ret_per_day_std_shift_alert_pct=max(
+                0.0,
+                _get_float("RET_PER_DAY_STD_SHIFT_ALERT_PCT", 0.75),
+            ),
             reward_model_enabled=_get_bool("REWARD_MODEL_ENABLED", True),
             reward_log_path=_get_str("REWARD_LOG_PATH", "reward_log.json"),
             reward_policy_path=_get_str("REWARD_POLICY_PATH", "reward_policy.json"),
@@ -500,6 +570,9 @@ class Config:
             dynamic_no_trade_vol_regime_weight=_get_float("DYNAMIC_NO_TRADE_VOL_REGIME_WEIGHT", 0.8),
             dynamic_no_trade_multiplier_min=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MIN", 1.0),
             dynamic_no_trade_multiplier_max=_get_float("DYNAMIC_NO_TRADE_MULTIPLIER_MAX", 3.0),
+            exposure_policy=_get_str("EXPOSURE_POLICY", "allow_cash_no_upscale"),
+            target_gross_exposure=max(0.0, _get_float("TARGET_GROSS_EXPOSURE", 1.0)),
+            allow_leverage=_get_bool("ALLOW_LEVERAGE", False),
             promotion_gates_enabled=_get_bool("PROMOTION_GATES_ENABLED", True),
             enforce_promotion_gates=_get_bool("ENFORCE_PROMOTION_GATES", True),
             promotion_min_return_per_day=_get_float("PROMOTION_MIN_RETURN_PER_DAY", 0.0002),

@@ -9,6 +9,7 @@ This repository currently uses five GitHub Actions workflows:
 - `verify-daily-session-coverage.yml`: weekday self-check for missed daily session windows
 
 Detailed pipeline audit: `docs/PORTFOLIO_PIPELINE_AUDIT.md`
+Complete daily flow chart: `docs/DAILY_RUN_FLOW_CHART.md`
 
 ## Daily Workflow
 
@@ -26,8 +27,8 @@ Core flow:
 3. Find the latest successful training artifact and download model files.
 4. Run `python -m stock_screener.cli daily --log-level INFO`.
 5. Emit telemetry to `reports/telemetry/actions_telemetry.json`.
-6. Compute state/reward/action health counters and write `$GITHUB_STEP_SUMMARY` (including adaptive entry thresholds and instrument sleeve shifts).
-7. Upload run artifacts (`reports/`, `cache/last_run_meta.json`, `screener_portfolio_state.json`).
+6. Compute state/reward/action health counters and write `$GITHUB_STEP_SUMMARY` (including strategy mode, adaptive entry thresholds, ret_per_day distribution/shift telemetry, instrument sleeve shifts, and weight-projection drift/notional-drop telemetry).
+7. Upload run artifacts (`reports/`, `cache/last_run_meta.json`, `screener_portfolio_state.json`, `screener_portfolio_state.json.events.jsonl`).
 8. Email the HTML report and CSV/JSON attachments.
 9. Open a GitHub issue if the workflow fails.
 
@@ -35,11 +36,19 @@ Runtime/controls:
 
 - `MAX_DAILY_RUNTIME_MINUTES=12`
 - `STRICT_FEATURE_PARITY=1`
-- `USE_ML=1` with fallback behavior when model is unavailable
+- `USE_ML=1` with explicit strategy-mode gate when ML is unavailable:
+  - default `HOLD_ONLY` (no new buys)
+  - `BASELINE` only when `ALLOW_BASELINE_TRADING=1`
 - Portfolio construction defaults: `PORTFOLIO_SIZE=8`, `DYNAMIC_SIZE_MAX_POSITIONS=8`, `WEIGHT_CAP=0.20`
 - Instrument sleeve constraints enabled by default (`INSTRUMENT_FUND_MAX_WEIGHT=0.35`, `INSTRUMENT_EQUITY_MIN_WEIGHT=0.50`)
 - Adaptive entry thresholds enabled (`ENTRY_DYNAMIC_THRESHOLDS_ENABLED=1`) with percentile-based relax-only floors
+- Dynamic entry guardrails enabled:
+  - cross-sectional spread minimums (`ENTRY_DYNAMIC_MIN_CONF_TOP_DECILE_SPREAD`, `ENTRY_DYNAMIC_MIN_PRED_TOP_DECILE_SPREAD`)
+  - stress guard tightening on weak regime/breadth (`ENTRY_STRESS_*`)
+  - optional hard entry freeze via `ENTRY_STRESS_HOLD_ONLY_ENABLED=1`
 - Dynamic no-trade-band and turnover controls are enabled by default
+- Rotation churn guard enabled (`ROTATION_COOLDOWN_DAYS=2`)
+- Exposure policy defaults to explicit cash-aware control (`EXPOSURE_POLICY=allow_cash_no_upscale`, `TARGET_GROSS_EXPOSURE=1.0`, `ALLOW_LEVERAGE=0`)
 - Concurrency guard enabled: one daily run at a time (`concurrency.group: daily-stock-screener`)
 
 ## Training Workflow
@@ -74,7 +83,7 @@ Trigger:
 Core flow:
 
 1. List/delete daily data caches.
-2. Create fresh `screener_portfolio_state.json` and `.bak`.
+2. Create fresh `screener_portfolio_state.json`, `.bak`, and empty `.events.jsonl`.
 3. Seed a reset cache key for next daily run.
 4. Upload reset state artifact and summary.
 
@@ -112,7 +121,8 @@ Core flow:
 ## State, Caches, and Artifacts
 
 - Portfolio state path in daily runs: `screener_portfolio_state.json`.
-- State is also mirrored to `.bak` by runtime code.
+- State is mirrored to `.bak` by runtime code.
+- Position-changing events are appended to `screener_portfolio_state.json.events.jsonl`.
 - Daily artifacts include reports and state snapshot for audit/debugging.
 - Reward logs/policy are stored under `cache/` by the pipeline.
 - Mutable portfolio/data cache now uses restore/save semantics:
