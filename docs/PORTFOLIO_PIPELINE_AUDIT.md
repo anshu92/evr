@@ -109,6 +109,14 @@ Implemented in this revision:
 8. Weekday session-coverage verifier added for `PRE_MARKET` / `MID_DAY` / `PRE_CLOSE` windows.
 9. Workflow docs aligned to current behavior.
 
+Implemented in follow-up revision (2026-02-20):
+
+10. Entry confirmation now supports adaptive, relax-only percentile thresholds (`entry_dynamic_*`) with hard floors to avoid over-filtering when prediction distributions compress.
+11. Dynamic portfolio sizing now reuses effective entry thresholds so sizing aggressiveness stays aligned with the active entry gate.
+12. Portfolio breadth ceiling widened (config cap `12`) and daily workflow defaults updated to `PORTFOLIO_SIZE=8`, `DYNAMIC_SIZE_MAX_POSITIONS=8`, `WEIGHT_CAP=0.20` to reduce structural under-investment.
+13. `LOW_DAILY_RETURN` exits now have a residual-alpha guard (`low_daily_return_hold_min_pred_return`) so positions are not force-exited when live model signal remains strong.
+14. Targeted regression tests added for adaptive entry thresholds, widened portfolio-size cap behavior, and residual-alpha low-daily-return override semantics.
+
 Remaining recommended improvements:
 
 1. Optional: route session-coverage alerts to chat/incident tooling in addition to GitHub issues.

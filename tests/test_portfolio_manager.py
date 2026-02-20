@@ -253,6 +253,113 @@ def test_portfolio_manager_take_profit():
     assert actions[0].reason == "TAKE_PROFIT"
 
 
+def test_low_daily_return_exit_is_overridden_when_live_prediction_is_strong(monkeypatch):
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 7, 15, 0, tzinfo=timezone.utc)  # Tuesday
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)  # Friday
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path="test_state.json",
+        max_holding_days=10,
+        max_holding_days_hard=20,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=True,
+        quick_profit_pct=0.10,  # disable quick-profit path for this test
+        quick_profit_days=1,
+        min_daily_return=0.008,  # 0.8%/day
+        low_daily_return_hold_min_pred_return=0.02,
+        momentum_decay_exit=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
+    state.positions.append(
+        Position(
+            ticker="AAPL",
+            entry_price=100.0,
+            entry_date=entry_date,
+            shares=1.0,
+        )
+    )
+
+    prices = pd.Series({"AAPL": 101.0})  # +1% over 2 trading days => 0.5%/day
+    pred_return = pd.Series({"AAPL": 0.03})  # strong enough to hold
+
+    actions = manager.apply_exits(state, prices, pred_return=pred_return)
+
+    assert actions == []
+    assert len([p for p in state.positions if p.status == "OPEN" and p.ticker == "AAPL"]) == 1
+
+
+def test_low_daily_return_exit_still_triggers_when_live_prediction_is_weak(monkeypatch):
+    logger = logging.getLogger("test")
+    now = datetime(2025, 1, 7, 15, 0, tzinfo=timezone.utc)  # Tuesday
+    entry_date = datetime(2025, 1, 3, 15, 0, tzinfo=timezone.utc)  # Friday
+    monkeypatch.setattr("stock_screener.portfolio.manager._utcnow", lambda: now)
+
+    manager = PortfolioManager(
+        state_path="test_state.json",
+        max_holding_days=10,
+        max_holding_days_hard=20,
+        extend_hold_min_pred_return=None,
+        extend_hold_min_score=None,
+        max_positions=5,
+        stop_loss_pct=None,
+        take_profit_pct=None,
+        peak_based_exit=False,
+        twr_optimization=True,
+        quick_profit_pct=0.10,
+        quick_profit_days=1,
+        min_daily_return=0.008,
+        low_daily_return_hold_min_pred_return=0.02,
+        momentum_decay_exit=False,
+        signal_decay_exit_enabled=False,
+        peak_detection_enabled=False,
+        peak_sell_portion_pct=0.5,
+        peak_min_gain_pct=None,
+        peak_min_holding_days=2,
+        peak_pred_return_threshold=None,
+        peak_score_percentile_drop=None,
+        peak_rsi_overbought=None,
+        peak_above_ma_ratio=None,
+        logger=logger,
+    )
+
+    state = PortfolioState(cash_cad=1000.0, positions=[], last_updated=now)
+    state.positions.append(
+        Position(
+            ticker="AAPL",
+            entry_price=100.0,
+            entry_date=entry_date,
+            shares=1.0,
+        )
+    )
+
+    prices = pd.Series({"AAPL": 101.0})
+    pred_return = pd.Series({"AAPL": 0.005})  # too weak to override
+
+    actions = manager.apply_exits(state, prices, pred_return=pred_return)
+
+    assert len(actions) == 1
+    assert actions[0].action == "SELL"
+    assert actions[0].reason == "LOW_DAILY_RETURN"
+
+
 def test_portfolio_manager_peak_detection():
     """Test that peak detection triggers partial exit."""
     logger = logging.getLogger("test")

@@ -40,6 +40,27 @@ def test_dynamic_size_max_positions_is_capped_by_portfolio_size(monkeypatch):
     assert Config.from_env().dynamic_size_max_positions == 3
 
 
+def test_portfolio_size_cap_allows_broader_diversification(monkeypatch):
+    monkeypatch.setenv("PORTFOLIO_SIZE", "50")
+    cfg = Config.from_env()
+    assert cfg.portfolio_size == 12
+    assert cfg.dynamic_size_max_positions == 12
+
+
+def test_entry_dynamic_threshold_defaults_and_env(monkeypatch):
+    monkeypatch.delenv("ENTRY_DYNAMIC_THRESHOLDS_ENABLED", raising=False)
+    monkeypatch.delenv("ENTRY_MIN_PRED_RETURN_FLOOR", raising=False)
+    cfg_default = Config.from_env()
+    assert cfg_default.entry_dynamic_thresholds_enabled is True
+    assert cfg_default.entry_min_pred_return_floor == 0.0025
+
+    monkeypatch.setenv("ENTRY_DYNAMIC_THRESHOLDS_ENABLED", "0")
+    monkeypatch.setenv("ENTRY_MIN_PRED_RETURN_FLOOR", "0.004")
+    cfg_env = Config.from_env()
+    assert cfg_env.entry_dynamic_thresholds_enabled is False
+    assert cfg_env.entry_min_pred_return_floor == 0.004
+
+
 def test_rotate_on_missing_data_defaults_off_and_reads_env(monkeypatch):
     monkeypatch.delenv("ROTATE_ON_MISSING_DATA", raising=False)
     assert Config.from_env().rotate_on_missing_data is False

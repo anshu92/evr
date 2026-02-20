@@ -24,8 +24,8 @@ class Config:
 
     # Screening + portfolio
     top_n: int = 50
-    portfolio_size: int = 5  # Fallback size when dynamic sizing disabled
-    weight_cap: float = 0.10
+    portfolio_size: int = 8  # Fallback size when dynamic sizing disabled
+    weight_cap: float = 0.20
     
     # Dynamic portfolio sizing - fully adaptive based on model metrics and opportunity quality
     # Portfolio can range from 1 to max_positions (capped by portfolio_size) based on:
@@ -35,7 +35,7 @@ class Config:
     dynamic_portfolio_sizing: bool = True  # Enable fully dynamic portfolio sizing
     dynamic_size_min_confidence: float = 0.5  # Minimum confidence threshold
     dynamic_size_min_pred_return: float = 0.01  # Minimum predicted return (1%)
-    dynamic_size_max_positions: int = 5  # Maximum positions (hard-capped by portfolio_size)
+    dynamic_size_max_positions: int = 8  # Maximum positions (hard-capped by portfolio_size)
 
     # ML model (optional)
     use_ml: bool = False
@@ -147,6 +147,7 @@ class Config:
     quick_profit_pct: float = 0.03  # Take profit at 3% gain quickly (redeploy capital)
     quick_profit_days: int = 2  # "Quickly" means within 2 days
     min_daily_return: float = 0.008  # Exit if return/day < 0.8% (redeploy to better picks)
+    low_daily_return_hold_min_pred_return: float | None = 0.01  # Skip LOW_DAILY_RETURN exit when live pred_return remains strong
     momentum_decay_exit: bool = True  # Exit when return momentum decelerates
     extend_hold_min_pred_return: float | None = 0.03
     extend_hold_min_score: float | None = None
@@ -195,6 +196,12 @@ class Config:
     entry_max_volatility: float | None = 0.60  # Max ann vol to enter (stricter than screen cap)
     entry_min_momentum_5d: float | None = -0.05  # Reject stocks with recent sharp drops
     entry_momentum_alignment: bool = True  # Reject bullish signals with bearish price action
+    entry_dynamic_thresholds_enabled: bool = True  # Relax thresholds when prediction distributions are compressed
+    entry_dynamic_min_candidates: int = 20  # Apply dynamic thresholds only when enough names are available
+    entry_confidence_percentile: float = 0.35  # Dynamic confidence threshold percentile
+    entry_min_confidence_floor: float = 0.35  # Lower bound for dynamic confidence threshold
+    entry_pred_return_percentile: float = 0.60  # Dynamic predicted-return threshold percentile
+    entry_min_pred_return_floor: float = 0.0025  # Lower bound for dynamic predicted-return threshold (0.25%)
 
     # Reward model (realized-return feedback loop + adaptive policy)
     reward_model_enabled: bool = True
@@ -287,10 +294,10 @@ class Config:
                 return default
             return raw
 
-        # Hard cap: keep the portfolio to <= 5 tickers.
-        # This enforces the strategy constraint even if an env var attempts to override it.
-        ps = _get_int("PORTFOLIO_SIZE", 5) or 5
-        ps = max(1, min(int(ps), 5))
+        # Hard cap: keep portfolio breadth bounded for execution simplicity while
+        # allowing more diversification than the legacy 5-name cap.
+        ps = _get_int("PORTFOLIO_SIZE", 8) or 8
+        ps = max(1, min(int(ps), 12))
         dyn_max_raw = _get_int("DYNAMIC_SIZE_MAX_POSITIONS", ps) or ps
         dyn_max = max(1, min(int(dyn_max_raw), ps))
 
@@ -305,7 +312,7 @@ class Config:
             max_screen_volatility=_get_float("MAX_SCREEN_VOLATILITY", 0.80),
             top_n=_get_int("TOP_N", 50) or 50,
             portfolio_size=ps,
-            weight_cap=_get_float("WEIGHT_CAP", 0.10),
+            weight_cap=_get_float("WEIGHT_CAP", 0.20),
             dynamic_portfolio_sizing=_get_bool("DYNAMIC_PORTFOLIO_SIZING", True),
             dynamic_size_min_confidence=_get_float("DYNAMIC_SIZE_MIN_CONFIDENCE", 0.5),
             dynamic_size_min_pred_return=_get_float("DYNAMIC_SIZE_MIN_PRED_RETURN", 0.01),
@@ -389,6 +396,11 @@ class Config:
             quick_profit_pct=_get_float("QUICK_PROFIT_PCT", 0.03),
             quick_profit_days=_get_int("QUICK_PROFIT_DAYS", 2) or 2,
             min_daily_return=_get_float("MIN_DAILY_RETURN", 0.008),
+            low_daily_return_hold_min_pred_return=(
+                _get_float("LOW_DAILY_RETURN_HOLD_MIN_PRED_RETURN", 0.0)
+                if os.getenv("LOW_DAILY_RETURN_HOLD_MIN_PRED_RETURN") not in {None, ""}
+                else 0.01
+            ),
             momentum_decay_exit=_get_bool("MOMENTUM_DECAY_EXIT", True),
             extend_hold_min_pred_return=_get_float("EXTEND_HOLD_MIN_PRED_RETURN", 0.03),
             extend_hold_min_score=(
@@ -449,6 +461,12 @@ class Config:
             entry_max_volatility=_get_float("ENTRY_MAX_VOLATILITY", 0.60),
             entry_min_momentum_5d=_get_float("ENTRY_MIN_MOMENTUM_5D", -0.05),
             entry_momentum_alignment=os.getenv("ENTRY_MOMENTUM_ALIGNMENT", "1").strip() in {"1", "true", "True"},
+            entry_dynamic_thresholds_enabled=_get_bool("ENTRY_DYNAMIC_THRESHOLDS_ENABLED", True),
+            entry_dynamic_min_candidates=_get_int("ENTRY_DYNAMIC_MIN_CANDIDATES", 20) or 20,
+            entry_confidence_percentile=_get_float("ENTRY_CONFIDENCE_PERCENTILE", 0.35),
+            entry_min_confidence_floor=_get_float("ENTRY_MIN_CONFIDENCE_FLOOR", 0.35),
+            entry_pred_return_percentile=_get_float("ENTRY_PRED_RETURN_PERCENTILE", 0.60),
+            entry_min_pred_return_floor=_get_float("ENTRY_MIN_PRED_RETURN_FLOOR", 0.0025),
             reward_model_enabled=_get_bool("REWARD_MODEL_ENABLED", True),
             reward_log_path=_get_str("REWARD_LOG_PATH", "reward_log.json"),
             reward_policy_path=_get_str("REWARD_POLICY_PATH", "reward_policy.json"),

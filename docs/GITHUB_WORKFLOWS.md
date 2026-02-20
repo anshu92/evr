@@ -36,6 +36,8 @@ Runtime/controls:
 - `MAX_DAILY_RUNTIME_MINUTES=12`
 - `STRICT_FEATURE_PARITY=1`
 - `USE_ML=1` with fallback behavior when model is unavailable
+- Portfolio construction defaults: `PORTFOLIO_SIZE=8`, `DYNAMIC_SIZE_MAX_POSITIONS=8`, `WEIGHT_CAP=0.20`
+- Adaptive entry thresholds enabled (`ENTRY_DYNAMIC_THRESHOLDS_ENABLED=1`) with percentile-based relax-only floors
 - Dynamic no-trade-band and turnover controls are enabled by default
 - Concurrency guard enabled: one daily run at a time (`concurrency.group: daily-stock-screener`)
 

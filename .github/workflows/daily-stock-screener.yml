@@ -204,9 +204,10 @@ jobs:
           # Safety default to avoid runaway runs; you can override in repo variables if desired.
           MAX_TICKERS: "4000"
           TOP_N: "50"
-          PORTFOLIO_SIZE: "5"
+          PORTFOLIO_SIZE: "8"
+          DYNAMIC_SIZE_MAX_POSITIONS: "8"
           PORTFOLIO_BUDGET_CAD: "500"
-          WEIGHT_CAP: "0.10"
+          WEIGHT_CAP: "0.20"
           MIN_PRICE_CAD: "5.0"
           MIN_AVG_DOLLAR_VOLUME_CAD: "5000000"
           MAX_SCREEN_VOLATILITY: "0.80"
@@ -215,6 +216,12 @@ jobs:
           ENTRY_MIN_PRED_RETURN: "0.01"
           ENTRY_MAX_VOLATILITY: "0.60"
           ENTRY_MIN_MOMENTUM_5D: "-0.05"
+          ENTRY_DYNAMIC_THRESHOLDS_ENABLED: "1"
+          ENTRY_DYNAMIC_MIN_CANDIDATES: "20"
+          ENTRY_CONFIDENCE_PERCENTILE: "0.35"
+          ENTRY_MIN_CONFIDENCE_FLOOR: "0.35"
+          ENTRY_PRED_RETURN_PERCENTILE: "0.60"
+          ENTRY_MIN_PRED_RETURN_FLOOR: "0.0025"
           # Use SOTA ML by default. If no model is present, the pipeline auto-falls back to baseline scoring.
           USE_ML: "1"
           MODEL_PATH: "models/ensemble/manifest.json"
@@ -236,6 +243,7 @@ jobs:
           QUICK_PROFIT_PCT: "0.03"
           QUICK_PROFIT_DAYS: "2"
           MIN_DAILY_RETURN: "0.008"
+          LOW_DAILY_RETURN_HOLD_MIN_PRED_RETURN: "0.01"
           PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
           # Peak detection and partial exit settings
           PEAK_DETECTION_ENABLED: "1"

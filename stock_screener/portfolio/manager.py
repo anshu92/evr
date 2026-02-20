@@ -250,6 +250,7 @@ class PortfolioManager:
         quick_profit_pct: float = 0.05,
         quick_profit_days: int = 3,
         min_daily_return: float = 0.005,
+        low_daily_return_hold_min_pred_return: float | None = 0.01,
         momentum_decay_exit: bool = True,
         signal_decay_exit_enabled: bool = True,
         signal_decay_threshold: float = -0.02,
@@ -291,6 +292,7 @@ class PortfolioManager:
         self.quick_profit_pct = quick_profit_pct
         self.quick_profit_days = max(1, int(quick_profit_days))
         self.min_daily_return = min_daily_return
+        self.low_daily_return_hold_min_pred_return = low_daily_return_hold_min_pred_return
         self.momentum_decay_exit = momentum_decay_exit
         self.signal_decay_exit_enabled = signal_decay_exit_enabled
         self.signal_decay_threshold = signal_decay_threshold
@@ -835,16 +837,31 @@ class PortfolioManager:
                 if days >= 2 and gain > 0:
                     daily_return = gain / days
                     if daily_return < self.min_daily_return:
-                        self.logger.info(
-                            "%s low daily return: %.2f%% total / %d days = %.2f%%/day (min: %.2f%%)",
-                            p.ticker,
-                            gain * 100,
-                            days,
-                            daily_return * 100,
-                            self.min_daily_return * 100,
-                        )
-                        actions.append(self._sell_position(state, p, price_cad=px, reason="LOW_DAILY_RETURN", days_held=days))
-                        continue
+                        skip_low_daily_exit = False
+                        hold_floor = self.low_daily_return_hold_min_pred_return
+                        if hold_floor is not None and pred_return is not None:
+                            pr_val = float(pred_return.get(p.ticker, float("nan")))
+                            if not pd.isna(pr_val) and pr_val >= float(hold_floor):
+                                self.logger.info(
+                                    "%s low daily return override: %.2f%%/day < %.2f%% but pred_return=%.2f%% >= %.2f%%",
+                                    p.ticker,
+                                    daily_return * 100,
+                                    self.min_daily_return * 100,
+                                    pr_val * 100,
+                                    float(hold_floor) * 100,
+                                )
+                                skip_low_daily_exit = True
+                        if not skip_low_daily_exit:
+                            self.logger.info(
+                                "%s low daily return: %.2f%% total / %d days = %.2f%%/day (min: %.2f%%)",
+                                p.ticker,
+                                gain * 100,
+                                days,
+                                daily_return * 100,
+                                self.min_daily_return * 100,
+                            )
+                            actions.append(self._sell_position(state, p, price_cad=px, reason="LOW_DAILY_RETURN", days_held=days))
+                            continue
 
                 # Momentum decay: exit if we're past peak and velocity is slowing
                 if self.momentum_decay_exit and p.highest_price and p.highest_price > p.entry_price:

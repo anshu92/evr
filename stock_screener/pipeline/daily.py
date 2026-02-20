@@ -241,6 +241,78 @@ def _check_runtime_budget(started_utc: datetime, cfg: Config, logger, stage: str
         )
 
 
+def _compute_effective_entry_thresholds(
+    screened: pd.DataFrame,
+    *,
+    cfg: Config,
+    logger,
+) -> dict[str, Any]:
+    """Compute effective entry thresholds with optional dynamic relaxation.
+
+    Dynamic mode is relax-only: it never makes thresholds stricter than explicit
+    config values, and always respects configured floors.
+    """
+    min_conf = getattr(cfg, "entry_min_confidence", None)
+    min_pred = getattr(cfg, "entry_min_pred_return", None)
+    result: dict[str, Any] = {
+        "min_confidence": min_conf,
+        "min_pred_return": min_pred,
+        "dynamic_applied": False,
+    }
+
+    if screened is None or screened.empty:
+        return result
+    if not bool(getattr(cfg, "entry_dynamic_thresholds_enabled", True)):
+        return result
+
+    min_candidates = max(5, int(getattr(cfg, "entry_dynamic_min_candidates", 20)))
+    if len(screened) < min_candidates:
+        return result
+
+    dynamic_updates: dict[str, float] = {}
+
+    if "pred_confidence" in screened.columns:
+        conf = pd.to_numeric(screened["pred_confidence"], errors="coerce").dropna()
+        if len(conf) >= min_candidates:
+            conf_pct = float(getattr(cfg, "entry_confidence_percentile", 0.35))
+            conf_pct = float(max(0.0, min(1.0, conf_pct)))
+            conf_floor = float(getattr(cfg, "entry_min_confidence_floor", 0.35))
+            conf_floor = float(max(0.0, min(1.0, conf_floor)))
+            dyn_conf = float(conf.quantile(conf_pct))
+            if min_conf is None:
+                eff_conf = max(conf_floor, dyn_conf)
+            else:
+                eff_conf = max(conf_floor, min(float(min_conf), dyn_conf))
+            if min_conf is None or eff_conf < float(min_conf) - 1e-12:
+                dynamic_updates["min_confidence"] = float(eff_conf)
+                result["min_confidence"] = float(eff_conf)
+
+    if "pred_return" in screened.columns:
+        pred = pd.to_numeric(screened["pred_return"], errors="coerce").dropna()
+        if len(pred) >= min_candidates:
+            pred_pct = float(getattr(cfg, "entry_pred_return_percentile", 0.60))
+            pred_pct = float(max(0.0, min(1.0, pred_pct)))
+            pred_floor = float(getattr(cfg, "entry_min_pred_return_floor", 0.0025))
+            dyn_pred = float(pred.quantile(pred_pct))
+            if min_pred is None:
+                eff_pred = max(pred_floor, dyn_pred)
+            else:
+                eff_pred = max(pred_floor, min(float(min_pred), dyn_pred))
+            if min_pred is None or eff_pred < float(min_pred) - 1e-12:
+                dynamic_updates["min_pred_return"] = float(eff_pred)
+                result["min_pred_return"] = float(eff_pred)
+
+    if dynamic_updates:
+        result["dynamic_applied"] = True
+        result["dynamic_updates"] = dynamic_updates
+        logger.info(
+            "Dynamic entry thresholds applied: conf>=%.3f pred_return>=%.2f%%",
+            float(result["min_confidence"]) if result["min_confidence"] is not None else float("nan"),
+            float(result["min_pred_return"]) * 100.0 if result["min_pred_return"] is not None else float("nan"),
+        )
+    return result
+
+
 def _validate_feature_parity(
     features_df: pd.DataFrame,
     selected_features: list[str] | None,
@@ -911,17 +983,24 @@ def run_daily(cfg: Config, logger) -> None:
         screened = scored.head(n).copy()
         logger.info("Screened universe: %s tickers (from %s after filters)", len(screened), len(scored))
 
-    # Apply entry confirmation filters
+    # Apply entry confirmation filters with optional dynamic threshold relaxation.
     entry_filter_stats = {}
+    entry_thresholds = _compute_effective_entry_thresholds(
+        screened,
+        cfg=cfg,
+        logger=logger,
+    )
     screened, entry_filter_stats = apply_entry_filters(
         screened,
-        min_confidence=getattr(cfg, "entry_min_confidence", None),
-        min_pred_return=getattr(cfg, "entry_min_pred_return", None),
+        min_confidence=entry_thresholds.get("min_confidence"),
+        min_pred_return=entry_thresholds.get("min_pred_return"),
         max_volatility=getattr(cfg, "entry_max_volatility", None),
         min_momentum_5d=getattr(cfg, "entry_min_momentum_5d", None),
         momentum_alignment=getattr(cfg, "entry_momentum_alignment", True),
         logger=logger,
     )
+    if entry_thresholds.get("dynamic_applied"):
+        run_meta["entry_thresholds"] = entry_thresholds
     if entry_filter_stats.get("rejected_count", 0) > 0:
         run_meta["entry_filters"] = entry_filter_stats
     _check_runtime_budget(started_utc, cfg, logger, "screening")
@@ -944,15 +1023,26 @@ def run_daily(cfg: Config, logger) -> None:
             if model_ic is not None:
                 logger.info("Model holdout IC: %.4f (used for dynamic sizing)", model_ic)
 
+            dyn_min_conf = float(getattr(cfg, "dynamic_size_min_confidence", 0.5))
+            dyn_min_pred = float(getattr(cfg, "dynamic_size_min_pred_return", 0.01))
+            if entry_thresholds.get("min_confidence") is not None:
+                dyn_min_conf = min(dyn_min_conf, float(entry_thresholds["min_confidence"]))
+            if entry_thresholds.get("min_pred_return") is not None:
+                dyn_min_pred = min(dyn_min_pred, float(entry_thresholds["min_pred_return"]))
+
             effective_portfolio_size = compute_dynamic_portfolio_size(
                 screened=screened,
-                min_confidence=getattr(cfg, "dynamic_size_min_confidence", 0.5),
-                min_pred_return=getattr(cfg, "dynamic_size_min_pred_return", 0.01),
+                min_confidence=dyn_min_conf,
+                min_pred_return=dyn_min_pred,
                 max_positions=getattr(cfg, "dynamic_size_max_positions", 50),
                 model_ic=model_ic,
                 logger=logger,
             )
             run_meta["dynamic_portfolio_size"] = effective_portfolio_size
+            run_meta["dynamic_sizing_thresholds"] = {
+                "min_confidence": dyn_min_conf,
+                "min_pred_return": dyn_min_pred,
+            }
         else:
             # Fallback to static portfolio_size when dynamic sizing disabled
             effective_portfolio_size = cfg.portfolio_size
@@ -1469,6 +1559,7 @@ def run_daily(cfg: Config, logger) -> None:
         quick_profit_pct=adaptive_quick_profit_pct,
         quick_profit_days=getattr(cfg, "quick_profit_days", 3),
         min_daily_return=adaptive_min_daily_return,
+        low_daily_return_hold_min_pred_return=getattr(cfg, "low_daily_return_hold_min_pred_return", 0.01),
         momentum_decay_exit=getattr(cfg, "momentum_decay_exit", True),
         signal_decay_exit_enabled=getattr(cfg, "signal_decay_exit_enabled", True),
         signal_decay_threshold=getattr(cfg, "signal_decay_threshold", -0.02),
