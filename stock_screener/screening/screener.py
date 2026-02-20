@@ -51,7 +51,8 @@ def score_universe(
 
     # Score:
     # - If ML predictions are available, blend them in as the primary alpha term.
-    # - Use risk-adjusted ret_per_day (return/day / vol) to prevent vol-chasing.
+    # - ret_per_day is already a cost-aware, time-normalized label from training;
+    #   avoid a second volatility division at screening time.
     # - Otherwise use a robust baseline factor score.
     has_score = "pred_score" in df.columns and pd.to_numeric(df["pred_score"], errors="coerce").notna().any()
     has_ret_per_day = "ret_per_day" in df.columns and pd.to_numeric(df["ret_per_day"], errors="coerce").notna().any()
@@ -67,18 +68,12 @@ def score_universe(
     )
 
     if has_ml:
-        # Priority: risk-adj ret_per_day > pred_score > pred_return
-        # Risk-adjust by dividing by vol to prevent high-vol stocks from dominating.
+        # Priority: ret_per_day > pred_score > pred_return.
+        # Keep risk control mostly at the portfolio layer (weights/vol-targeting)
+        # instead of repeatedly penalizing volatility in the alpha signal.
         if has_ret_per_day:
-            raw_signal = pd.to_numeric(df["ret_per_day"], errors="coerce")
-            # Sharpe-like risk adjustment: return/day / vol
-            if "vol_60d_ann" in df.columns:
-                safe_vol = df["vol_60d_ann"].clip(lower=0.10)
-                ml_signal = raw_signal / safe_vol
-                ml_label = "risk_adj_ret_per_day (return/day/vol)"
-            else:
-                ml_signal = raw_signal
-                ml_label = "ret_per_day (return/day)"
+            ml_signal = pd.to_numeric(df["ret_per_day"], errors="coerce")
+            ml_label = "ret_per_day (cost-aware)"
         elif has_score:
             ml_signal = df["pred_score"]
             ml_label = "pred_score"

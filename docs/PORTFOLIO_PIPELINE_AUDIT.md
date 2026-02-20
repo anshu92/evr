@@ -118,6 +118,8 @@ Implemented in follow-up revision (2026-02-20):
 14. Targeted regression tests added for adaptive entry thresholds, widened portfolio-size cap behavior, and residual-alpha low-daily-return override semantics.
 15. Instrument sleeve constraints added to portfolio construction (`instrument_fund_max_weight`, `instrument_equity_min_weight`) so ETF/fund exposure is capped and equity sleeve retains minimum allocation.
 16. Daily workflow health summary now reports adaptive entry thresholds and instrument sleeve shifts from `cache/last_run_meta.json` for easier production monitoring.
+17. Screening ML path no longer applies an extra `ret_per_day / vol` divisor when `ret_per_day` is available; this removes duplicated per-name volatility penalization while keeping hard vol caps and portfolio-level risk controls (`stock_screener/screening/screener.py`, `tests/test_scoring.py`, `docs/RESEARCH_GROUNDED_SIMPLIFICATION.md`).
+18. With unified optimizer enabled, post-optimizer rebalance no longer applies an additional turnover shrinkage penalty; hysteresis and min-notional gates remain active to avoid duplicate turnover suppression (`stock_screener/pipeline/daily.py`, `tests/test_rebalance_hysteresis_dynamic.py`, `docs/RESEARCH_GROUNDED_SIMPLIFICATION.md`).
 
 Remaining recommended improvements:
 

@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 
 from stock_screener.pipeline.daily import _apply_rebalance_controls
 from stock_screener.portfolio.state import PortfolioState, Position
@@ -151,3 +152,51 @@ def test_rebalance_controls_keep_seed_target_below_min_notional():
     assert not out.empty
     assert "AAA" in out.index
     assert float(out.loc["AAA", "weight"]) > 0.0
+
+
+def test_rebalance_controls_can_disable_turnover_shrinkage():
+    logger = logging.getLogger("test")
+    state = _build_state()
+    prices = pd.Series({"AAA": 100.0, "BBB": 100.0})
+    target = pd.DataFrame({"weight": [0.50, 0.50]}, index=["AAA", "BBB"])
+    screened = pd.DataFrame(index=["AAA", "BBB"])
+
+    with_shrink = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=1.0,
+        turnover_penalty_bps=100.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        apply_turnover_shrinkage=True,
+    )
+    without_shrink = _apply_rebalance_controls(
+        target,
+        state=state,
+        screened=screened,
+        prices_cad=prices,
+        market_vol_regime=1.0,
+        min_rebalance_weight_delta=0.0,
+        min_trade_notional_cad=1.0,
+        turnover_penalty_bps=100.0,
+        dynamic_band_enabled=False,
+        uncertainty_weight=0.0,
+        liquidity_weight=0.0,
+        vol_regime_weight=0.0,
+        band_mult_min=1.0,
+        band_mult_max=1.0,
+        logger=logger,
+        apply_turnover_shrinkage=False,
+    )
+
+    assert float(with_shrink.loc["BBB", "weight"]) < float(without_shrink.loc["BBB", "weight"])
+    assert float(without_shrink.loc["BBB", "weight"]) == pytest.approx(0.50, abs=1e-9)

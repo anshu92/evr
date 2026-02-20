@@ -541,6 +541,7 @@ def _apply_rebalance_controls(
     band_mult_min: float,
     band_mult_max: float,
     logger,
+    apply_turnover_shrinkage: bool = True,
 ) -> pd.DataFrame:
     if target_weights.empty:
         return target_weights
@@ -548,12 +549,18 @@ def _apply_rebalance_controls(
     min_delta = max(0.0, float(min_rebalance_weight_delta))
     min_notional = max(1.0, float(min_trade_notional_cad))
     penalty_bps = max(0.0, float(turnover_penalty_bps))
+    apply_turnover_shrink = bool(apply_turnover_shrinkage)
     dyn_enabled = bool(dynamic_band_enabled)
     dyn_u_w = max(0.0, float(uncertainty_weight))
     dyn_l_w = max(0.0, float(liquidity_weight))
     dyn_v_w = max(0.0, float(vol_regime_weight))
     dyn_min = max(0.2, float(band_mult_min))
     dyn_max = max(dyn_min, float(band_mult_max))
+
+    if penalty_bps > 0 and not apply_turnover_shrink:
+        logger.info(
+            "Rebalance controls: turnover shrinkage disabled; keeping hysteresis/notional guards only.",
+        )
 
     open_values: dict[str, float] = {}
     open_total = 0.0
@@ -656,9 +663,11 @@ def _apply_rebalance_controls(
             effective = cur_w
             skipped_small += 1
         else:
-            # Transaction-cost-aware shrinkage of turnover-heavy moves.
-            turnover_penalty = penalty_bps * dyn_mult * 1e-4 * delta
-            effective = max(0.0, tgt_w - turnover_penalty)
+            effective = tgt_w
+            if apply_turnover_shrink and penalty_bps > 0:
+                # Transaction-cost-aware shrinkage of turnover-heavy moves.
+                turnover_penalty = penalty_bps * dyn_mult * 1e-4 * delta
+                effective = max(0.0, tgt_w - turnover_penalty)
 
         # Avoid initiating tiny new positions.
         if cur_w <= 0 and effective * equity < notional_threshold:
@@ -1792,7 +1801,14 @@ def run_daily(cfg: Config, logger) -> None:
         except Exception as e:
             logger.warning("Could not save portfolio state after exits: %s", e)
 
-    # Apply rebalance hysteresis and transaction-cost-aware turnover controls.
+    # Apply rebalance hysteresis and trade-size guards. If unified optimizer is
+    # active, it already penalizes turnover in the objective, so avoid a second
+    # post-target turnover shrinkage layer.
+    apply_post_turnover_shrink = not unified_opt_enabled
+    if not apply_post_turnover_shrink and float(getattr(cfg, "turnover_penalty_bps", 0.0)) > 0.0:
+        logger.info(
+            "Unified optimizer active: disabling post-optimizer turnover shrinkage to avoid duplicate turnover penalties.",
+        )
     target_weights = _apply_rebalance_controls(
         target_weights,
         state=state,
@@ -1809,6 +1825,7 @@ def run_daily(cfg: Config, logger) -> None:
         band_mult_min=getattr(cfg, "dynamic_no_trade_multiplier_min", 1.0),
         band_mult_max=getattr(cfg, "dynamic_no_trade_multiplier_max", 3.0),
         logger=logger,
+        apply_turnover_shrinkage=apply_post_turnover_shrink,
     )
 
     # Add pred_return and pred_peak_days to target_weights for email reporting

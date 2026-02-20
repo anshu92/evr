@@ -61,3 +61,31 @@ def test_score_universe_empty_after_filters_returns_empty_frame():
     )
     assert scored.empty
     assert "score" in scored.columns
+
+
+def test_score_universe_ret_per_day_uses_signal_without_extra_vol_division():
+    logger = logging.getLogger("test")
+    df = pd.DataFrame(
+        {
+            "n_days": [120, 120],
+            "last_close_cad": [20.0, 20.0],
+            "avg_dollar_volume_cad": [5_000_000.0, 5_000_000.0],
+            "ret_60d": [0.0, 0.0],
+            "ret_120d": [0.0, 0.0],
+            "ma20_ratio": [0.0, 0.0],
+            "vol_60d_ann": [0.20, 0.60],
+            "ret_per_day": [0.020, 0.030],
+        },
+        index=["LOW_VOL", "HIGH_VOL"],
+    )
+
+    scored = score_universe(
+        features=df,
+        min_price_cad=2.0,
+        min_avg_dollar_volume_cad=250_000.0,
+        logger=logger,
+    )
+
+    # Higher return/day should stay dominant even when volatility is higher;
+    # volatility is already handled by separate risk controls.
+    assert list(scored.index) == ["HIGH_VOL", "LOW_VOL"]
