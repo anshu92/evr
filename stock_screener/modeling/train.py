@@ -166,6 +166,9 @@ def _compute_ticker_features(
     fx_ret_5d: pd.Series,
     fx_ret_20d: pd.Series,
     fundamentals: pd.DataFrame | None,
+    open_price: pd.Series | None = None,
+    high_price: pd.Series | None = None,
+    low_price: pd.Series | None = None,
 ) -> pd.DataFrame | None:
     """Compute features for a single ticker. Returns DataFrame or None if invalid."""
     is_tsx = _is_tsx_ticker(t)
@@ -286,6 +289,46 @@ def _compute_ticker_features(
     fx_ret_5d_series = 0.0 if is_tsx else fx_ret_5d
     fx_ret_20d_series = 0.0 if is_tsx else fx_ret_20d
 
+    # --- Intraday/Overnight return decomposition ---
+    open_cad = None
+    if open_price is not None and not open_price.empty:
+        open_cad = open_price * (fx_series if not is_tsx else 1.0)
+    overnight_ret_5d_s = pd.Series(np.nan, index=idx, dtype=float)
+    intraday_ret_5d_s = pd.Series(np.nan, index=idx, dtype=float)
+    overnight_intraday_ratio_s = pd.Series(np.nan, index=idx, dtype=float)
+    if open_cad is not None and len(open_cad) >= 6 and len(close_cad) >= 6:
+        # Overnight: open[t] / close[t-1] - 1
+        overnight_rets = (open_cad / close_cad.shift(1)) - 1.0
+        # Intraday: close[t] / open[t] - 1
+        intraday_rets = (close_cad / open_cad) - 1.0
+        overnight_ret_5d_s = overnight_rets.rolling(5).sum()
+        intraday_ret_5d_s = intraday_rets.rolling(5).sum()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            overnight_intraday_ratio_s = overnight_ret_5d_s / intraday_ret_5d_s.replace(0.0, np.nan)
+
+    # --- Amihud illiquidity ---
+    dollar_vol = close_cad * vol
+    amihud_illiquidity_20d_s = pd.Series(np.nan, index=idx, dtype=float)
+    if len(rets) >= 20:
+        abs_rets = rets.abs()
+        safe_dvol = dollar_vol.replace(0.0, np.nan)
+        amihud_raw = abs_rets / safe_dvol
+        amihud_illiquidity_20d_s = amihud_raw.rolling(20, min_periods=10).mean()
+
+    # --- Corwin-Schultz spread estimate ---
+    spread_estimate_cs_s = pd.Series(np.nan, index=idx, dtype=float)
+    if high_price is not None and low_price is not None and not high_price.empty and not low_price.empty:
+        h = high_price.reindex(idx)
+        l = low_price.reindex(idx)
+        log_hl = np.log(h / l.replace(0.0, np.nan))
+        spread_estimate_cs_s = log_hl.rolling(20, min_periods=10).mean() / np.sqrt(2)
+
+    # --- Liquidity trend ---
+    liquidity_trend_60d_s = pd.Series(np.nan, index=idx, dtype=float)
+    dvol_20 = dollar_vol.rolling(20).mean()
+    dvol_60 = dollar_vol.rolling(60).mean()
+    liquidity_trend_60d_s = dvol_20 / dvol_60.replace(0.0, np.nan)
+
     return pd.DataFrame(
         {
             "date": idx,
@@ -330,6 +373,14 @@ def _compute_ticker_features(
             "industry": industry,
             "sector_hash": sector_hash,
             "industry_hash": industry_hash,
+            # Intraday/overnight decomposition
+            "overnight_ret_5d": overnight_ret_5d_s.values,
+            "intraday_ret_5d": intraday_ret_5d_s.values,
+            "overnight_intraday_ratio": overnight_intraday_ratio_s.values,
+            # Microstructure / liquidity signals
+            "amihud_illiquidity_20d": amihud_illiquidity_20d_s.values,
+            "spread_estimate_cs": spread_estimate_cs_s.values,
+            "liquidity_trend_60d": liquidity_trend_60d_s.values,
             "fx_ret_5d": fx_ret_5d_series.values if hasattr(fx_ret_5d_series, "values") else fx_ret_5d_series,
             "fx_ret_20d": fx_ret_20d_series.values if hasattr(fx_ret_20d_series, "values") else fx_ret_20d_series,
             "n_days": n_days.values,
@@ -377,13 +428,23 @@ def _build_panel_features(
     # PARALLEL FEATURE COMPUTATION: Use joblib if available for ~2-4x speedup
     n_jobs = min(os.cpu_count() or 1, 4)  # Limit to 4 workers to manage memory
     
+    def _extract_series(t: str, field: str) -> pd.Series | None:
+        if (t, field) in prices.columns:
+            return prices[(t, field)].astype(float)
+        return None
+
     if HAS_JOBLIB and len(tickers) > 100:
         # Use threading backend (better for pandas which releases GIL)
         def _process_ticker(t):
             close = prices[(t, "Close")].astype(float)
             vol_series = prices[(t, "Volume")].astype(float) if (t, "Volume") in prices.columns else pd.Series(index=idx, dtype=float)
-            return _compute_ticker_features(t, close, vol_series, idx, fx, fx_ret_5d, fx_ret_20d, fundamentals)
-        
+            return _compute_ticker_features(
+                t, close, vol_series, idx, fx, fx_ret_5d, fx_ret_20d, fundamentals,
+                open_price=_extract_series(t, "Open"),
+                high_price=_extract_series(t, "High"),
+                low_price=_extract_series(t, "Low"),
+            )
+
         frames = Parallel(n_jobs=n_jobs, backend="threading", verbose=0)(
             delayed(_process_ticker)(t) for t in tickers
         )
@@ -394,7 +455,12 @@ def _build_panel_features(
         for t in tickers:
             close = prices[(t, "Close")].astype(float)
             vol_series = prices[(t, "Volume")].astype(float) if (t, "Volume") in prices.columns else pd.Series(index=idx, dtype=float)
-            df = _compute_ticker_features(t, close, vol_series, idx, fx, fx_ret_5d, fx_ret_20d, fundamentals)
+            df = _compute_ticker_features(
+                t, close, vol_series, idx, fx, fx_ret_5d, fx_ret_20d, fundamentals,
+                open_price=_extract_series(t, "Open"),
+                high_price=_extract_series(t, "High"),
+                low_price=_extract_series(t, "Low"),
+            )
             if df is not None:
                 frames.append(df)
 
@@ -438,8 +504,20 @@ def _build_panel_features(
                     # Rank within (date, sector) group
                     panel[out_col] = panel.groupby(["date", "sector"])[col].rank(pct=True)
         
+        # Sector breadth: % of sector peers above 20d MA and dispersion
+        if "sector" in panel.columns and "ma20_ratio" in panel.columns:
+            panel["sector_breadth_20d"] = panel.groupby(["date", "sector"])["ma20_ratio"].transform(
+                lambda x: (x > 0).mean()
+            )
+            panel["sector_momentum_dispersion"] = panel.groupby(["date", "sector"])["ret_20d"].transform(
+                lambda x: x.std()
+            )
+        else:
+            panel["sector_breadth_20d"] = np.nan
+            panel["sector_momentum_dispersion"] = np.nan
+
         panel = add_fundamental_composites(panel, date_col="date")
-    
+
     return panel
 
 
