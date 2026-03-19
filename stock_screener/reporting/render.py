@@ -269,6 +269,9 @@ def render_reports(
         lines.extend(tw_view[target_cols].to_string().splitlines())
         lines.append("")
 
+    # Determine prediction horizon for labeling predicted returns
+    _label_horizon = run_meta.get("label_horizon_days") or (run_meta.get("config", {}).get("label_horizon_days") if isinstance(run_meta, dict) else None)
+
     if trade_actions:
         lines.append("RECOMMENDED ACTIONS (sell at predicted peak)")
         lines.append("-" * 78)
@@ -298,11 +301,12 @@ def render_reports(
                 lines.append(f"{action:>4} {ticker:<12} shares={shares} sell@={px_cad_str}/{px_usd_str} entry@={entry_px_str}/{entry_px_usd_str} gain={realized_str} days_held={days_label} reason={reason}")
             else:
                 pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+                _txt_pred_label = f"pred_ret({_label_horizon}d)" if _label_horizon else "pred_ret"
                 # Calculate target sell price based on predicted return
                 sell_px_cad = float(px_f) * (1 + float(pred_ret)) if px_f is not None and pred_ret is not None else None
                 sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
                 sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
-                lines.append(f"{action:>4} {ticker:<12} shares={shares} price={px_cad_str}/{px_usd_str} pred_ret={pred_ret_str} sell@={sell_px_cad_str}/{sell_px_usd_str} sell_date={sell_date or 'N/A'} reason={reason}")
+                lines.append(f"{action:>4} {ticker:<12} shares={shares} price={px_cad_str}/{px_usd_str} {_txt_pred_label}={pred_ret_str} sell@={sell_px_cad_str}/{sell_px_usd_str} sell_date={sell_date or 'N/A'} reason={reason}")
         lines.append("")
 
     # Portfolio P&L history (stateful; computed from portfolio state positions)
@@ -327,13 +331,33 @@ def render_reports(
         # Calculate returns
         all_time_return = None
         day_to_day_return = None
-        
+
         if equity is not None and first_equity is not None and first_equity > 0:
             all_time_return = (equity - first_equity) / first_equity
-        
+
         if equity is not None and prev_equity is not None and prev_equity > 0:
             day_to_day_return = (equity - prev_equity) / prev_equity
-        
+
+        # Compute time period labels for returns
+        all_time_label = "All-Time Return"
+        day_to_day_label = "Day-to-Day Return"
+        first_asof = first.get("asof_utc")
+        if first_asof and latest_asof:
+            try:
+                from datetime import datetime as _dt
+                _fmt = "%Y-%m-%dT%H:%M:%S" if "T" in str(first_asof) else "%Y-%m-%d"
+                _first_dt = _dt.fromisoformat(str(first_asof).replace("Z", "+00:00")) if hasattr(_dt, "fromisoformat") else _dt.strptime(str(first_asof)[:10], "%Y-%m-%d")
+                _latest_dt = _dt.fromisoformat(str(latest_asof).replace("Z", "+00:00")) if hasattr(_dt, "fromisoformat") else _dt.strptime(str(latest_asof)[:10], "%Y-%m-%d")
+                _n_days = (_latest_dt - _first_dt).days
+                all_time_label = f"All-Time Return ({_n_days}d, since {str(first_asof)[:10]})"
+            except Exception:
+                pass
+        if prev_asof and latest_asof:
+            try:
+                day_to_day_label = f"Day-to-Day Return ({str(prev_asof)[:10]} to {str(latest_asof)[:10]})"
+            except Exception:
+                pass
+
         if latest_asof:
             lines.append(f"Snapshot: {latest_asof}")
         if prev_asof:
@@ -347,8 +371,8 @@ def render_reports(
         lines.append(f"Unrealized P&L: {_fmt_money(unrealized_pl) if unrealized_pl is not None else 'N/A'}")
         lines.append(f"Net P&L: {_fmt_money(net_pl) if net_pl is not None else 'N/A'}")
         lines.append("")
-        lines.append(f"All-Time Return: {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
-        lines.append(f"Day-to-Day Return: {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
+        lines.append(f"{all_time_label}: {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
+        lines.append(f"{day_to_day_label}: {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
         lines.append("")
 
     model_block = ""
@@ -490,6 +514,8 @@ def render_reports(
     )
 
     # Build actions block outside the f-string to avoid complex nested expressions.
+    _pred_ret_label = f"Pred Ret ({_label_horizon}d)" if _label_horizon else "Pred Ret"
+
     fx_rate = _to_float(fx_usdcad_rate)
     if trade_actions:
         # Separate SELL and BUY/HOLD actions for different table formats
@@ -585,7 +611,7 @@ def render_reports(
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Ticker</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Shares</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Price (CAD/USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Pred Ret</th>
+                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">{_html_escape(_pred_ret_label)}</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Sell @ (CAD/USD)</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Sell Date</th>
                 <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Reason</th>
@@ -620,13 +646,32 @@ def render_reports(
         # Calculate returns
         all_time_return = None
         day_to_day_return = None
-        
+
         if equity is not None and first_equity is not None and first_equity > 0:
             all_time_return = (equity - first_equity) / first_equity
-        
+
         if equity is not None and prev_equity is not None and prev_equity > 0:
             day_to_day_return = (equity - prev_equity) / prev_equity
-        
+
+        # Compute time period labels for returns
+        all_time_label_html = "All-Time Return"
+        day_to_day_label_html = "Day-to-Day Return"
+        first_asof = first.get("asof_utc")
+        if first_asof and latest_asof:
+            try:
+                from datetime import datetime as _dt
+                _first_dt = _dt.fromisoformat(str(first_asof).replace("Z", "+00:00")) if hasattr(_dt, "fromisoformat") else _dt.strptime(str(first_asof)[:10], "%Y-%m-%d")
+                _latest_dt = _dt.fromisoformat(str(latest_asof).replace("Z", "+00:00")) if hasattr(_dt, "fromisoformat") else _dt.strptime(str(latest_asof)[:10], "%Y-%m-%d")
+                _n_days = (_latest_dt - _first_dt).days
+                all_time_label_html = f"All-Time Return ({_n_days}d, since {str(first_asof)[:10]})"
+            except Exception:
+                pass
+        if prev_asof and latest_asof:
+            try:
+                day_to_day_label_html = f"Day-to-Day Return ({str(prev_asof)[:10]} &rarr; {str(latest_asof)[:10]})"
+            except Exception:
+                pass
+
         fx_rate = _to_float(fx_usdcad_rate)
         equity_parts: list[str] = []
         if latest_asof:
@@ -641,10 +686,10 @@ def render_reports(
         equity_parts.append(f"<strong>Realized P&L:</strong> {_fmt_money(realized_pl) if realized_pl is not None else 'N/A'}")
         equity_parts.append(f"<strong>Unrealized P&L:</strong> {_fmt_money(unrealized_pl) if unrealized_pl is not None else 'N/A'}")
         equity_parts.append(f"<strong>Net P&L:</strong> {_fmt_money(net_pl) if net_pl is not None else 'N/A'}")
-        
+
         return_parts: list[str] = []
-        return_parts.append(f"<strong>All-Time Return:</strong> {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
-        return_parts.append(f"<strong>Day-to-Day Return:</strong> {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
+        return_parts.append(f"<strong>{all_time_label_html}:</strong> {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
+        return_parts.append(f"<strong>{day_to_day_label_html}:</strong> {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
         
         summary = "<br/>".join(equity_parts + return_parts)
 
