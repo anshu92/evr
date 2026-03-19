@@ -17,6 +17,44 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 
+def compute_adaptive_vol_target(
+    base_target: float,
+    *,
+    recent_ic: float = 0.0,
+    ic_baseline: float = 0.05,
+    ic_sensitivity: float = 0.5,
+    avg_confidence: float = 0.5,
+    vol_min: float = 0.08,
+    vol_max: float = 0.25,
+    logger=None,
+) -> float:
+    """Compute adaptive volatility target based on model IC and confidence.
+
+    When model IC is high and predictions are confident, increase risk budget.
+    When IC is low or model is uncertain, decrease risk budget.
+
+    Formula: target = base * (1 + sensitivity * (recent_ic - baseline_ic)) * confidence_scalar
+    """
+    # IC adjustment: increase target when IC exceeds baseline
+    ic_adj = 1.0 + ic_sensitivity * (recent_ic - ic_baseline)
+    ic_adj = np.clip(ic_adj, 0.5, 2.0)
+
+    # Confidence adjustment: scale by average model confidence (0.5 = neutral)
+    conf_scalar = 0.5 + avg_confidence  # range: 0.5 to 1.5
+    conf_scalar = np.clip(conf_scalar, 0.7, 1.3)
+
+    adaptive_target = base_target * ic_adj * conf_scalar
+    adaptive_target = float(np.clip(adaptive_target, vol_min, vol_max))
+
+    if logger:
+        logger.info(
+            "Adaptive vol target: %.3f (base=%.3f, IC_adj=%.2f, conf_adj=%.2f, IC=%.4f)",
+            adaptive_target, base_target, ic_adj, conf_scalar, recent_ic,
+        )
+
+    return adaptive_target
+
+
 def _cap_weights(w: pd.Series, cap: float, *, allow_cash: bool) -> pd.Series:
     cap = float(cap)
     if cap <= 0 or cap >= 1:
@@ -43,6 +81,156 @@ def _cap_weights(w: pd.Series, cap: float, *, allow_cash: bool) -> pd.Series:
         return w
     total = float(w.sum())
     return w / total if total > 0 else w
+
+
+def compute_hrp_weights(
+    returns: pd.DataFrame,
+    logger,
+    *,
+    alpha_series: pd.Series | None = None,
+    alpha_floor: float = 0.0,
+    weight_cap: float = 0.20,
+    min_obs: int = 40,
+) -> pd.Series:
+    """Compute Hierarchical Risk Parity weights (de Prado, 2016).
+
+    HRP uses hierarchical clustering on the correlation matrix to build a
+    portfolio tree, then allocates inversely to cluster variance. More robust
+    than mean-variance as it doesn't require covariance matrix inversion.
+
+    Args:
+        returns: DataFrame of daily returns (columns = tickers, rows = dates)
+        logger: Logger instance
+        alpha_series: Optional predicted alpha per ticker (for alpha-tilting)
+        alpha_floor: Minimum alpha value (clips below)
+        weight_cap: Maximum weight per position
+        min_obs: Minimum observations required
+
+    Returns:
+        Series of portfolio weights indexed by ticker
+    """
+    if not SCIPY_AVAILABLE:
+        logger.warning("scipy not available; falling back to equal weights for HRP")
+        n = len(returns.columns)
+        return pd.Series(1.0 / n, index=returns.columns) if n > 0 else pd.Series(dtype=float)
+
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    from scipy.spatial.distance import squareform
+
+    # Clean returns
+    rets = returns.dropna(axis=1, how="all")
+    if rets.shape[1] < 2 or rets.shape[0] < min_obs:
+        logger.warning("HRP: insufficient data (%d tickers, %d obs); equal weights", rets.shape[1], rets.shape[0])
+        n = len(returns.columns)
+        return pd.Series(1.0 / n, index=returns.columns) if n > 0 else pd.Series(dtype=float)
+
+    # Fill remaining NaN with 0 (missing days)
+    rets = rets.fillna(0.0)
+
+    # Step 1: Compute correlation and covariance
+    corr = rets.corr()
+    cov = rets.cov()
+
+    # Handle degenerate correlation matrix
+    corr = corr.fillna(0.0)
+    np.fill_diagonal(corr.values, 1.0)
+
+    # Step 2: Distance matrix from correlation
+    # d(i,j) = sqrt(0.5 * (1 - corr(i,j)))
+    dist = np.sqrt(0.5 * (1 - corr.values))
+    np.fill_diagonal(dist, 0.0)
+    # Ensure symmetry and non-negative
+    dist = (dist + dist.T) / 2
+    dist = np.clip(dist, 0, None)
+
+    # Step 3: Hierarchical clustering
+    try:
+        condensed = squareform(dist, checks=False)
+        link = linkage(condensed, method="single")
+    except Exception as e:
+        logger.warning("HRP clustering failed: %s; falling back to equal weights", e)
+        n = len(returns.columns)
+        return pd.Series(1.0 / n, index=returns.columns) if n > 0 else pd.Series(dtype=float)
+
+    # Step 4: Quasi-diagonalization (reorder tickers by cluster)
+    sort_ix = leaves_list(link).astype(int)
+    tickers_ordered = [rets.columns[i] for i in sort_ix]
+
+    # Step 5: Recursive bisection for weight allocation
+    def _get_cluster_var(cov_mat: pd.DataFrame, tickers: list[str]) -> float:
+        """Compute cluster variance using inverse-variance portfolio."""
+        sub_cov = cov_mat.loc[tickers, tickers]
+        diag = np.diag(sub_cov.values)
+        diag = np.where(diag > 0, diag, 1e-8)
+        inv_diag = 1.0 / diag
+        w = inv_diag / inv_diag.sum()
+        return float(w @ sub_cov.values @ w)
+
+    def _recursive_bisection(cov_mat: pd.DataFrame, sorted_tickers: list[str]) -> pd.Series:
+        """Allocate weights via recursive bisection of the dendrogram."""
+        weights = pd.Series(1.0, index=sorted_tickers)
+        cluster_items = [sorted_tickers]
+
+        while cluster_items:
+            next_clusters = []
+            for cluster in cluster_items:
+                if len(cluster) <= 1:
+                    continue
+                mid = len(cluster) // 2
+                left = cluster[:mid]
+                right = cluster[mid:]
+
+                var_left = _get_cluster_var(cov_mat, left)
+                var_right = _get_cluster_var(cov_mat, right)
+
+                # Allocate inversely proportional to variance
+                total_var = var_left + var_right
+                if total_var > 0:
+                    alpha_left = 1 - var_left / total_var
+                else:
+                    alpha_left = 0.5
+                alpha_right = 1 - alpha_left
+
+                weights[left] *= alpha_left
+                weights[right] *= alpha_right
+
+                if len(left) > 1:
+                    next_clusters.append(left)
+                if len(right) > 1:
+                    next_clusters.append(right)
+
+            cluster_items = next_clusters
+
+        return weights
+
+    cov_ordered = cov.loc[tickers_ordered, tickers_ordered]
+    weights = _recursive_bisection(cov_ordered, tickers_ordered)
+
+    # Normalize
+    total = weights.sum()
+    if total > 0:
+        weights = weights / total
+
+    # Optional alpha tilting
+    if alpha_series is not None:
+        alpha = alpha_series.reindex(weights.index).fillna(0.0).clip(lower=float(alpha_floor))
+        if float(alpha.sum()) > 0:
+            weights = weights * alpha
+            total = weights.sum()
+            if total > 0:
+                weights = weights / total
+            logger.info("HRP: applied alpha tilting")
+
+    # Apply weight cap
+    weights = _cap_weights(weights, weight_cap, allow_cash=False)
+
+    # Reindex to original columns (missing tickers get 0)
+    weights = weights.reindex(returns.columns, fill_value=0.0)
+
+    logger.info("HRP weights: %d positions, max=%.3f, min=%.3f",
+                (weights > 0.001).sum(), weights.max(), weights[weights > 0.001].min() if (weights > 0.001).any() else 0)
+
+    return weights
 
 
 def compute_inverse_vol_weights(

@@ -59,6 +59,17 @@ FEATURE_COLUMNS = [
     # HIGH-IMPACT: Trend quality features
     "ret_consistency_20d",
     "up_days_ratio_20d",
+    # Intraday/overnight decomposition
+    "overnight_ret_5d",
+    "intraday_ret_5d",
+    "overnight_intraday_ratio",
+    # Microstructure / liquidity signals
+    "amihud_illiquidity_20d",
+    "spread_estimate_cs",
+    "liquidity_trend_60d",
+    # Sector breadth
+    "sector_breadth_20d",
+    "sector_momentum_dispersion",
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
@@ -97,6 +108,9 @@ FEATURE_COLUMNS = [
     "treasury_10y",  # 10-Year Treasury Yield
     "treasury_13w",  # 13-Week Treasury Bill
     "yield_curve_slope",  # 10Y - 3M yield spread
+    "vix_term_slope",  # VIX term structure slope (contango/backwardation)
+    "vix_change_5d",  # VIX 5-day change
+    "vix_percentile_1y",  # VIX percentile rank over 1 year
     # HIGH-IMPACT: Feature interaction terms
     "sharpe_x_rank",  # Sharpe ratio × momentum rank
     "momentum_vol_interaction",  # Momentum × volatility
@@ -154,6 +168,17 @@ TECHNICAL_FEATURES_ONLY = [
     # HIGH-IMPACT: Trend quality features
     "ret_consistency_20d",
     "up_days_ratio_20d",
+    # Intraday/overnight decomposition
+    "overnight_ret_5d",
+    "intraday_ret_5d",
+    "overnight_intraday_ratio",
+    # Microstructure / liquidity signals
+    "amihud_illiquidity_20d",
+    "spread_estimate_cs",
+    "liquidity_trend_60d",
+    # Sector breadth
+    "sector_breadth_20d",
+    "sector_momentum_dispersion",
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
@@ -186,6 +211,9 @@ TECHNICAL_FEATURES_ONLY = [
     "treasury_10y",
     "treasury_13w",
     "yield_curve_slope",
+    "vix_term_slope",  # VIX term structure slope (contango/backwardation)
+    "vix_change_5d",  # VIX 5-day change
+    "vix_percentile_1y",  # VIX percentile rank over 1 year
     # HIGH-IMPACT: Feature interaction terms
     "sharpe_x_rank",
     "momentum_vol_interaction",

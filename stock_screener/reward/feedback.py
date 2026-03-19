@@ -107,6 +107,111 @@ def compute_ensemble_reward_weights(
     return blended.tolist()
 
 
+def compute_per_model_ic(
+    predictions_by_model: dict[str, pd.Series],
+    realized_returns: pd.Series,
+    *,
+    min_samples: int = 20,
+    ic_window: int = 20,
+    logger=None,
+) -> dict[str, float]:
+    """Compute Spearman rank IC for each individual model in the ensemble.
+
+    Args:
+        predictions_by_model: Dict mapping model name to prediction Series
+        realized_returns: Realized returns Series (same index as predictions)
+        min_samples: Minimum samples required for IC computation
+        ic_window: Rolling window for IC (uses most recent observations)
+        logger: Logger instance
+
+    Returns:
+        Dict mapping model name to IC value
+    """
+    model_ics = {}
+    for name, preds in predictions_by_model.items():
+        try:
+            # Align predictions and realized returns
+            aligned = pd.DataFrame({"pred": preds, "real": realized_returns}).dropna()
+            if len(aligned) < min_samples:
+                model_ics[name] = 0.0
+                continue
+            # Use most recent window
+            recent = aligned.iloc[-ic_window:]
+            ic = float(recent["pred"].corr(recent["real"], method="spearman"))
+            model_ics[name] = ic if np.isfinite(ic) else 0.0
+        except Exception:
+            model_ics[name] = 0.0
+
+    if logger:
+        logger.info("Per-model IC: %s", {k: f"{v:.4f}" for k, v in model_ics.items()})
+
+    return model_ics
+
+
+def compute_adaptive_ensemble_weights(
+    model_ics: dict[str, float],
+    holdout_weights: list[float] | None = None,
+    model_names: list[str] | None = None,
+    *,
+    ic_blend_alpha: float = 0.5,
+    min_weight: float = 0.05,
+    logger=None,
+) -> list[float]:
+    """Compute adaptive ensemble weights from per-model IC.
+
+    Blends realized IC-based weights with holdout weights.
+    Models with higher recent IC get more weight.
+
+    Args:
+        model_ics: Dict mapping model name to realized IC
+        holdout_weights: Original holdout-based weights (None = equal)
+        model_names: Ordered list of model names (determines output order)
+        ic_blend_alpha: Blend factor (0 = all holdout, 1 = all realized IC)
+        min_weight: Minimum weight per model (prevents zero-weight)
+        logger: Logger instance
+
+    Returns:
+        List of blended weights (same order as model_names)
+    """
+    if not model_names:
+        model_names = list(model_ics.keys())
+
+    n_models = len(model_names)
+    if n_models == 0:
+        return []
+
+    # Default holdout weights (equal)
+    if holdout_weights is None:
+        hw = np.ones(n_models) / n_models
+    else:
+        hw = np.array(holdout_weights[:n_models], dtype=float)
+        if len(hw) < n_models:
+            hw = np.pad(hw, (0, n_models - len(hw)), constant_values=1.0 / n_models)
+        total = hw.sum()
+        hw = hw / total if total > 0 else np.ones(n_models) / n_models
+
+    # IC-based weights: softmax of IC values (temperature scaling)
+    ics = np.array([model_ics.get(name, 0.0) for name in model_names], dtype=float)
+    # Shift ICs to be non-negative for weighting (IC can be negative)
+    ics_shifted = ics - ics.min() + 0.01  # Ensure all positive
+    ic_weights = ics_shifted / ics_shifted.sum() if ics_shifted.sum() > 0 else np.ones(n_models) / n_models
+
+    # Blend holdout and IC-based weights
+    alpha = float(np.clip(ic_blend_alpha, 0.0, 1.0))
+    blended = (1 - alpha) * hw + alpha * ic_weights
+
+    # Apply minimum weight floor
+    blended = np.clip(blended, min_weight, None)
+    blended = blended / blended.sum()
+
+    if logger:
+        for name, w_old, w_new in zip(model_names, hw, blended):
+            logger.info("Model %s: holdout_w=%.3f -> adaptive_w=%.3f (IC=%.4f)",
+                       name, w_old, w_new, model_ics.get(name, 0.0))
+
+    return blended.tolist()
+
+
 def build_verified_labels(
     reward_log: RewardLog,
 ) -> pd.DataFrame:

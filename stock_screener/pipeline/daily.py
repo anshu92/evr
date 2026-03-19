@@ -13,7 +13,7 @@ from stock_screener.data.fx import fetch_usdcad
 from stock_screener.data.macro import fetch_macro_indicators
 from stock_screener.data.prices import download_price_history
 from stock_screener.features.technical import compute_features, apply_target_encodings
-from stock_screener.optimization.risk_parity import compute_inverse_vol_weights, compute_correlation_aware_weights, optimize_unified_portfolio, apply_confidence_weighting, apply_volatility_targeting, apply_conviction_sizing, apply_liquidity_adjustment, apply_correlation_limits, apply_beta_adjustment, apply_min_position_filter, apply_max_position_cap, apply_regime_exposure
+from stock_screener.optimization.risk_parity import compute_adaptive_vol_target, compute_inverse_vol_weights, compute_hrp_weights, compute_correlation_aware_weights, optimize_unified_portfolio, apply_confidence_weighting, apply_volatility_targeting, apply_conviction_sizing, apply_liquidity_adjustment, apply_correlation_limits, apply_beta_adjustment, apply_min_position_filter, apply_max_position_cap, apply_regime_exposure
 from stock_screener.reporting.render import render_reports
 from stock_screener.screening.screener import score_universe, select_sector_neutral, apply_entry_filters
 from stock_screener.universe.tsx import fetch_tsx_universe
@@ -2041,7 +2041,43 @@ def run_daily(cfg: Config, logger) -> None:
             effective_portfolio_size = cfg.portfolio_size
 
         # Compute portfolio weights with optional correlation awareness
-        if cfg.use_correlation_weights:
+        if getattr(cfg, "use_hrp_weights", False):
+            from stock_screener.optimization.risk_parity import SCIPY_AVAILABLE as _SCIPY_OK
+            if _SCIPY_OK:
+                logger.info("Using Hierarchical Risk Parity (HRP) weights")
+                # Build returns DataFrame from prices for HRP tickers
+                _hrp_tickers = list(screened["ticker"].unique()) if "ticker" in screened.columns else list(screened.index)
+                _hrp_prices = prices[[t for t in _hrp_tickers if t in prices.columns]]
+                _hrp_returns = _hrp_prices.pct_change().dropna(how="all")
+                _hrp_alpha = None
+                if alpha_col and alpha_col in screened.columns:
+                    _idx = screened["ticker"] if "ticker" in screened.columns else screened.index
+                    _hrp_alpha = pd.Series(screened[alpha_col].values, index=_idx)
+                hrp_w = compute_hrp_weights(
+                    returns=_hrp_returns,
+                    logger=logger,
+                    alpha_series=_hrp_alpha,
+                    weight_cap=cfg.weight_cap,
+                )
+                # Build target_weights DataFrame matching inverse-vol format
+                _top = screened.head(effective_portfolio_size).copy()
+                _tkrs = _top["ticker"].values if "ticker" in _top.columns else _top.index.values
+                _top["weight"] = [float(hrp_w.get(t, 0.0)) for t in _tkrs]
+                # Re-normalize to selected positions only
+                _wsum = _top["weight"].sum()
+                if _wsum > 0:
+                    _top["weight"] = _top["weight"] / _wsum
+                target_weights = _top.sort_values("weight", ascending=False)
+            else:
+                logger.warning("HRP requested but scipy unavailable; falling back to inverse-vol")
+                target_weights = compute_inverse_vol_weights(
+                    features=screened,
+                    portfolio_size=effective_portfolio_size,
+                    weight_cap=cfg.weight_cap,
+                    logger=logger,
+                    alpha_col=alpha_col,
+                )
+        elif cfg.use_correlation_weights:
             logger.info("Using correlation-aware risk parity weights")
             target_weights = compute_correlation_aware_weights(
                 features=screened,
@@ -2301,10 +2337,42 @@ def run_daily(cfg: Config, logger) -> None:
     vol_targeting_enabled = getattr(cfg, "volatility_targeting", True)
     if vol_targeting_enabled:
         target_vol = getattr(cfg, "target_volatility", 0.15)
+
+        # Dynamic risk budgeting: adjust vol target based on model IC and confidence
+        effective_vol_target = target_vol
+        if getattr(cfg, "adaptive_vol_target", False):
+            try:
+                # Get recent IC from reward log if available
+                recent_ic = 0.0
+                avg_conf = 0.5
+                if "pred_confidence" in screened.columns:
+                    avg_conf = float(screened["pred_confidence"].mean())
+                # Try to get IC from reward log (load lightweight copy)
+                try:
+                    _rlog_path = Path(cfg.cache_dir) / cfg.reward_log_path
+                    _rlog = RewardLog.load(_rlog_path)
+                    _online_ic = compute_online_ic(_rlog, window=cfg.reward_ic_window)
+                    recent_ic = float(_online_ic.get("ensemble_ic") or 0.0)
+                except Exception:
+                    pass
+
+                effective_vol_target = compute_adaptive_vol_target(
+                    target_vol,
+                    recent_ic=recent_ic,
+                    ic_baseline=cfg.adaptive_vol_ic_baseline,
+                    ic_sensitivity=cfg.adaptive_vol_ic_sensitivity,
+                    avg_confidence=avg_conf,
+                    vol_min=cfg.adaptive_vol_min,
+                    vol_max=cfg.adaptive_vol_max,
+                    logger=logger,
+                )
+            except Exception as e:
+                logger.warning("Adaptive vol target failed: %s; using base target", e)
+
         target_weights, cash_from_vol_targeting = apply_volatility_targeting(
             target_weights,
             prices=prices,
-            target_vol=target_vol,
+            target_vol=effective_vol_target,
             lookback_days=20,
             min_scalar=0.5,
             max_scalar=1.0,
@@ -2312,7 +2380,9 @@ def run_daily(cfg: Config, logger) -> None:
         )
         run_meta["volatility_targeting"] = {
             "enabled": True,
-            "target_vol": target_vol,
+            "target_vol": effective_vol_target,
+            "base_vol_target": target_vol,
+            "adaptive_vol_enabled": getattr(cfg, "adaptive_vol_target", False),
             "cash_allocation": cash_from_vol_targeting,
         }
 

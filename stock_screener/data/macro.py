@@ -17,6 +17,7 @@ def fetch_macro_indicators(lookback_days: int = 730, logger=None) -> pd.DataFram
     
     indicators = {
         "^VIX": "vix",  # CBOE Volatility Index
+        "^VIX3M": "vix3m",  # CBOE 3-Month Volatility Index
         "^TNX": "treasury_10y",  # 10-Year Treasury Yield
         "^IRX": "treasury_13w",  # 13-Week Treasury Bill
     }
@@ -56,6 +57,24 @@ def fetch_macro_indicators(lookback_days: int = 730, logger=None) -> pd.DataFram
         # Yield curve slope (10Y - 3M)
         df["yield_curve_slope"] = df["treasury_10y"] - df["treasury_13w"]
     
+    # VIX term structure slope (VIX3M - VIX): positive = contango (normal), negative = backwardation (fear)
+    if "vix" in df.columns and "vix3m" in df.columns:
+        df["vix_term_slope"] = df["vix3m"] - df["vix"]
+
+    # VIX 5-day change
+    if "vix" in df.columns:
+        df["vix_change_5d"] = df["vix"].pct_change(5)
+
+    # VIX percentile rank over 252 days
+    if "vix" in df.columns and len(df) >= 252:
+        df["vix_percentile_1y"] = df["vix"].rolling(252).apply(
+            lambda x: float(pd.Series(x).rank(pct=True).iloc[-1]) if len(x) >= 252 else float("nan"),
+            raw=False,
+        )
+    else:
+        # Will be filled as NaN during feature attachment
+        pass
+
     # Forward-fill missing values (holidays, etc.)
     if not df.empty:
         df = df.ffill().bfill()

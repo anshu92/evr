@@ -140,17 +140,27 @@ def compute_features(
         except Exception:
             vol = pd.Series(dtype=float)
 
+        try:
+            open_price = prices[(t, "Open")].astype(float).dropna()
+        except Exception:
+            open_price = pd.Series(dtype=float)
+
         # Enforce feature lookback window.
         if feature_lookback_days and int(feature_lookback_days) > 0 and len(close) > int(feature_lookback_days):
             close = close.iloc[-int(feature_lookback_days) :]
             if vol is not None:
                 vol = vol.reindex(close.index)
 
+        # Enforce feature lookback on open_price too
+        if feature_lookback_days and int(feature_lookback_days) > 0 and len(open_price) > int(feature_lookback_days):
+            open_price = open_price.iloc[-int(feature_lookback_days):]
+
         is_tsx = _is_tsx_ticker(t)
         fx_series = 1.0 if is_tsx else fx.reindex(close.index).ffill()
         fx_factor = float(fx_series.iloc[-1]) if not is_tsx and not fx_series.empty else 1.0
 
         # Convert to CAD (TSX assumed CAD already).
+        open_cad = open_price * (fx_series.reindex(open_price.index).ffill() if not is_tsx else 1.0) if not open_price.empty else pd.Series(dtype=float)
         close_cad = close * fx_series
         last_close_local = float(close.iloc[-1])
         last_close_cad = float(close_cad.iloc[-1])
@@ -223,6 +233,61 @@ def compute_features(
             if ret_std and ret_std > 0:
                 ret_consistency_20d = 1.0 / (1.0 + float(ret_std) * np.sqrt(252))
             up_days_ratio_20d = float((recent_rets > 0).sum() / len(recent_rets))
+
+        # Intraday/Overnight return decomposition
+        overnight_ret_5d = float("nan")
+        intraday_ret_5d = float("nan")
+        overnight_intraday_ratio = float("nan")
+        if not open_cad.empty and len(open_cad) >= 6 and len(close_cad) >= 6:
+            # Align indices
+            common_idx = open_cad.index.intersection(close_cad.index)
+            if len(common_idx) >= 6:
+                oc = open_cad.reindex(common_idx)
+                cc = close_cad.reindex(common_idx)
+                # Overnight return: open[t] / close[t-1] - 1
+                overnight_rets = (oc.iloc[1:].values / cc.iloc[:-1].values) - 1.0
+                # Intraday return: close[t] / open[t] - 1
+                intraday_rets = (cc.values / oc.values) - 1.0
+                if len(overnight_rets) >= 5:
+                    overnight_ret_5d = float(np.nansum(overnight_rets[-5:]))
+                    intraday_ret_5d = float(np.nansum(intraday_rets[-5:]))
+                    if abs(intraday_ret_5d) > 1e-8:
+                        overnight_intraday_ratio = overnight_ret_5d / intraday_ret_5d
+
+        # Full-window dollar volume for Amihud calculation
+        full_dollar_vol = close_cad * vol.reindex(close_cad.index).fillna(0.0)
+
+        # Amihud illiquidity: mean(|return| / dollar_volume) over 20 days
+        amihud_illiquidity_20d = float("nan")
+        if len(rets) >= 20 and not full_dollar_vol.empty and len(full_dollar_vol) >= 20:
+            recent_rets_abs = rets.iloc[-20:].abs()
+            recent_dvol = full_dollar_vol.reindex(recent_rets_abs.index).fillna(0)
+            valid = recent_dvol > 0
+            if valid.sum() >= 10:
+                amihud_illiquidity_20d = float((recent_rets_abs[valid] / recent_dvol[valid]).mean())
+
+        # Corwin-Schultz spread estimator from High/Low prices
+        spread_estimate_cs = float("nan")
+        try:
+            high = prices[(t, "High")].astype(float).dropna()
+            low = prices[(t, "Low")].astype(float).dropna()
+            if len(high) >= 22 and len(low) >= 22:
+                # Use last 20 days
+                h = high.iloc[-20:]
+                l = low.iloc[-20:]
+                # Simplified: use average log(H/L) as spread proxy
+                log_hl = np.log(h.values / l.values)
+                spread_estimate_cs = float(np.mean(log_hl) / np.sqrt(2))
+        except Exception:
+            pass
+
+        # Liquidity trend: ratio of recent 20d avg dollar vol to 60d avg
+        liquidity_trend_60d = float("nan")
+        if not full_dollar_vol.empty and len(full_dollar_vol) >= 60:
+            avg_20 = float(full_dollar_vol.iloc[-20:].mean())
+            avg_60 = float(full_dollar_vol.iloc[-60:].mean())
+            if avg_60 > 0:
+                liquidity_trend_60d = avg_20 / avg_60
 
         fx_ret_5d = float(fx.pct_change(5).iloc[-1]) if not is_tsx and len(fx) >= 6 else 0.0
         fx_ret_20d = float(fx.pct_change(20).iloc[-1]) if not is_tsx and len(fx) >= 21 else 0.0
@@ -338,6 +403,14 @@ def compute_features(
                 # HIGH-IMPACT: Trend quality
                 "ret_consistency_20d": ret_consistency_20d,
                 "up_days_ratio_20d": up_days_ratio_20d,
+                # Intraday/overnight decomposition
+                "overnight_ret_5d": overnight_ret_5d,
+                "intraday_ret_5d": intraday_ret_5d,
+                "overnight_intraday_ratio": overnight_intraday_ratio,
+                # Microstructure / liquidity signals
+                "amihud_illiquidity_20d": amihud_illiquidity_20d,
+                "spread_estimate_cs": spread_estimate_cs,
+                "liquidity_trend_60d": liquidity_trend_60d,
                 # Relative momentum (computed cross-sectionally after all tickers)
                 "relative_momentum_20d": float("nan"),  # Placeholder - filled after DataFrame is built
                 "relative_momentum_60d": float("nan"),  # Placeholder - filled after DataFrame is built
@@ -486,7 +559,7 @@ def compute_features(
         df["zscore_reversal"] = float("nan")
 
     # Attach macro regime features for schema parity (fallback to NaN if unavailable).
-    macro_cols = ["vix", "treasury_10y", "treasury_13w", "yield_curve_slope"]
+    macro_cols = ["vix", "treasury_10y", "treasury_13w", "yield_curve_slope", "vix_term_slope", "vix_change_5d", "vix_percentile_1y"]
     if macro is not None and not macro.empty and "last_date" in df.columns:
         macro_df = macro.copy()
         macro_df.index = pd.to_datetime(macro_df.index).normalize()
@@ -499,6 +572,16 @@ def compute_features(
     else:
         for col in macro_cols:
             df[col] = float("nan")
+
+    # Sector breadth: % of sector peers above 20d MA and dispersion
+    if "sector" in df.columns and "ma20_ratio" in df.columns:
+        sector_breadth = df.groupby("sector")["ma20_ratio"].transform(lambda x: (x > 0).mean())
+        df["sector_breadth_20d"] = sector_breadth
+        sector_disp = df.groupby("sector")["ret_20d"].transform(lambda x: x.std())
+        df["sector_momentum_dispersion"] = sector_disp
+    else:
+        df["sector_breadth_20d"] = float("nan")
+        df["sector_momentum_dispersion"] = float("nan")
 
     # Add fundamental composite scores
     # Note: date_col=None is correct here since compute_features() produces single-date snapshots.

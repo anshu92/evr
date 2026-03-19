@@ -70,6 +70,7 @@ class Config:
     
     # Portfolio optimization
     use_correlation_weights: bool = False  # Requires scipy; set True to enable
+    use_hrp_weights: bool = False  # Hierarchical Risk Parity (requires scipy)
     confidence_weight_floor: float = 0.3
     unified_optimizer_enabled: bool = True  # Single-pass constrained optimizer for final weights
     optimizer_risk_penalty: float = 1.0
@@ -95,6 +96,11 @@ class Config:
     sector_neutral_selection: bool = True  # Diversify picks across sectors instead of pure top-N
     volatility_targeting: bool = True  # Scale exposure based on market volatility
     target_volatility: float = 0.15  # Target annualized portfolio volatility (15%)
+    adaptive_vol_target: bool = False  # Adjust vol target based on model IC and confidence
+    adaptive_vol_ic_sensitivity: float = 0.5  # How much IC affects vol target
+    adaptive_vol_ic_baseline: float = 0.05  # Baseline IC (average expected)
+    adaptive_vol_min: float = 0.08  # Minimum vol target (conservative floor)
+    adaptive_vol_max: float = 0.25  # Maximum vol target (aggressive ceiling)
     instrument_sleeve_constraints_enabled: bool = True  # Keep defensive funds capped so equities retain core allocation
     instrument_fund_max_weight: float = 0.35  # Max total weight allocated to ETFs/funds
     instrument_equity_min_weight: float = 0.50  # Min total weight allocated to equities
@@ -367,6 +373,7 @@ class Config:
             regime_specialist_min_samples=_get_int("REGIME_SPECIALIST_MIN_SAMPLES", 1200) or 1200,
             regime_gating_base_blend=_get_float("REGIME_GATING_BASE_BLEND", 0.25),
             use_correlation_weights=os.getenv("USE_CORRELATION_WEIGHTS", "0").strip() in {"1", "true", "True"},
+            use_hrp_weights=os.getenv("USE_HRP_WEIGHTS", "0").strip() in {"1", "true", "True"},
             confidence_weight_floor=_get_float("CONFIDENCE_WEIGHT_FLOOR", 0.3),
             unified_optimizer_enabled=_get_bool("UNIFIED_OPTIMIZER_ENABLED", True),
             optimizer_risk_penalty=_get_float("OPTIMIZER_RISK_PENALTY", 1.0),
@@ -388,6 +395,11 @@ class Config:
             sector_neutral_selection=os.getenv("SECTOR_NEUTRAL_SELECTION", "1").strip() in {"1", "true", "True"},
             volatility_targeting=os.getenv("VOLATILITY_TARGETING", "1").strip() in {"1", "true", "True"},
             target_volatility=_get_float("TARGET_VOLATILITY", 0.15),
+            adaptive_vol_target=_get_bool("ADAPTIVE_VOL_TARGET", False),
+            adaptive_vol_ic_sensitivity=_get_float("ADAPTIVE_VOL_IC_SENSITIVITY", 0.5),
+            adaptive_vol_ic_baseline=_get_float("ADAPTIVE_VOL_IC_BASELINE", 0.05),
+            adaptive_vol_min=_get_float("ADAPTIVE_VOL_MIN", 0.08),
+            adaptive_vol_max=_get_float("ADAPTIVE_VOL_MAX", 0.25),
             instrument_sleeve_constraints_enabled=_get_bool("INSTRUMENT_SLEEVE_CONSTRAINTS_ENABLED", True),
             instrument_fund_max_weight=_get_float("INSTRUMENT_FUND_MAX_WEIGHT", 0.35),
             instrument_equity_min_weight=_get_float("INSTRUMENT_EQUITY_MIN_WEIGHT", 0.50),
