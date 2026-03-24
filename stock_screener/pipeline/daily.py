@@ -3245,6 +3245,295 @@ def run_daily(cfg: Config, logger) -> None:
         except Exception as e:
             logger.warning("Reward policy save error (non-fatal): %s", e)
 
+    # Persist lightweight cache for intraday monitoring runs
+    try:
+        _open_tickers = [
+            p.ticker for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"
+        ]
+        _screened_tickers = list(screened.index[:cfg.intraday_watchlist_top_n]) if not screened.empty else []
+        _intraday_cache = {
+            "run_utc": datetime.now(tz=timezone.utc).isoformat(),
+            "screened_tickers": _screened_tickers,
+            "held_tickers": _open_tickers,
+        }
+        # Cache predictions and features needed for exit logic
+        for _col in ("pred_return", "pred_confidence", "pred_peak_days", "score",
+                     "vol_60d_ann", "rsi_14", "ma20_ratio", "market_vol_regime"):
+            if _col in screened.columns:
+                _vals = screened[_col].dropna()
+                _intraday_cache[_col] = {str(k): float(v) for k, v in _vals.items()}
+        # Cache target weights for intraday entry support
+        if target_weights is not None and not target_weights.empty and "weight" in target_weights.columns:
+            _tw = target_weights["weight"].dropna()
+            _intraday_cache["target_weights"] = {str(k): float(v) for k, v in _tw.items()}
+            # Also cache pred_return and pred_peak_days from target_weights for BUY actions
+            for _tw_col in ("pred_return", "pred_peak_days"):
+                if _tw_col in target_weights.columns:
+                    _tw_vals = target_weights[_tw_col].dropna()
+                    _intraday_cache[f"target_{_tw_col}"] = {str(k): float(v) for k, v in _tw_vals.items()}
+        # Cache FX rate
+        if fx is not None and not fx.empty:
+            _intraday_cache["fx_usdcad"] = float(fx.iloc[-1])
+        write_json(cache_dir / "intraday_cache.json", _intraday_cache)
+        logger.info("Saved intraday cache: %d held + %d watchlist tickers",
+                   len(_open_tickers), len(_screened_tickers))
+    except Exception as _ic_err:
+        logger.warning("Failed to save intraday cache: %s", _ic_err)
+
     # Persist metadata for debugging/auditing
     write_json(cache_dir / "last_run_meta.json", run_meta)
     logger.info("Wrote reports to %s", reports_dir.resolve())
+
+
+def run_intraday_monitor(cfg, logger) -> None:
+    """Lightweight intraday portfolio monitoring run.
+
+    Downloads fresh intraday prices for current holdings and the daily
+    watchlist.  Runs exit logic for held positions and — when
+    ``intraday_exit_only`` is False — also executes new entries from the
+    daily run's target weights using live prices.
+
+    Designed to complete in <2 minutes.
+    """
+    from pathlib import Path
+    from stock_screener.data.prices import download_intraday_prices, get_latest_prices
+    from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
+    from stock_screener.portfolio.manager import PortfolioManager
+    from stock_screener.reporting.render import render_intraday_report
+    from stock_screener.utils import read_json, write_json, ensure_dir
+
+    started_utc = datetime.now(tz=timezone.utc)
+    cache_dir = ensure_dir(cfg.cache_dir)
+    reports_dir = ensure_dir(cfg.reports_dir)
+
+    # --- Staleness guard ---
+    last_meta = read_json(cache_dir / "last_run_meta.json")
+    if not last_meta:
+        logger.warning("No daily run metadata found; skipping intraday monitor")
+        return
+    last_run_ts = last_meta.get("started_utc") or last_meta.get("run_utc")
+    if last_run_ts:
+        try:
+            last_dt = datetime.fromisoformat(str(last_run_ts).replace("Z", "+00:00"))
+            age_hours = (started_utc - last_dt).total_seconds() / 3600.0
+            if age_hours > cfg.intraday_stale_threshold_hours:
+                logger.warning(
+                    "Daily run is %.1f hours old (threshold=%.1f); skipping intraday monitor",
+                    age_hours, cfg.intraday_stale_threshold_hours,
+                )
+                return
+            logger.info("Daily run age: %.1f hours — within freshness window", age_hours)
+        except Exception as e:
+            logger.warning("Could not parse daily run timestamp: %s", e)
+
+    # --- Load intraday cache from daily run ---
+    intraday_cache = read_json(cache_dir / "intraday_cache.json") or {}
+    watchlist = intraday_cache.get("screened_tickers", [])
+    cached_target_weights = intraday_cache.get("target_weights", {})
+    allow_entries = not cfg.intraday_exit_only and bool(cached_target_weights)
+
+    # --- Load portfolio state ---
+    state = load_portfolio_state(cfg.portfolio_state_path, logger=logger)
+    open_positions = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
+    held_tickers = [p.ticker for p in open_positions]
+
+    if not open_positions and not allow_entries:
+        logger.info("No open positions and entries disabled; nothing to do")
+        render_intraday_report(
+            reports_dir=Path(reports_dir),
+            positions=[],
+            exit_actions=[],
+            entry_actions=[],
+            run_meta={"status": "no_positions", "started_utc": started_utc.isoformat()},
+            logger=logger,
+        )
+        return
+
+    # Build ticker list: held + target tickers (for entries) + watchlist, capped
+    target_tickers = list(cached_target_weights.keys()) if allow_entries else []
+    all_tickers = list(dict.fromkeys(held_tickers + target_tickers + watchlist))[:cfg.intraday_ticker_limit]
+    logger.info("Intraday: %d held, %d target candidates, %d total tickers to download",
+                len(held_tickers), len(target_tickers), len(all_tickers))
+
+    # --- Download intraday prices ---
+    intraday_prices = download_intraday_prices(
+        tickers=all_tickers,
+        period="5d",
+        interval="1h",
+        threads=True,
+        batch_size=50,
+        logger=logger,
+    )
+    if intraday_prices.empty:
+        logger.info("No intraday data available (market may be closed); skipping")
+        render_intraday_report(
+            reports_dir=Path(reports_dir),
+            positions=[{"ticker": p.ticker, "status": "no_data"} for p in open_positions],
+            exit_actions=[],
+            entry_actions=[],
+            run_meta={"status": "no_intraday_data", "started_utc": started_utc.isoformat()},
+            logger=logger,
+        )
+        return
+
+    # --- Derive current prices in CAD for ALL downloaded tickers ---
+    latest_prices = get_latest_prices(intraday_prices)
+    if latest_prices.empty:
+        logger.warning("Could not extract latest prices from intraday data")
+        return
+
+    fx_rate = intraday_cache.get("fx_usdcad", 1.35)
+    prices_cad = pd.Series(dtype=float)
+    for ticker in latest_prices.index:
+        px = float(latest_prices[ticker])
+        is_tsx = str(ticker).upper().endswith(".TO") or str(ticker).upper().endswith(".V")
+        prices_cad[str(ticker)] = px * float(fx_rate) if not is_tsx else px
+
+    if prices_cad.empty:
+        logger.warning("No valid prices after FX conversion")
+        return
+
+    # --- Reconstruct cached data as Series/DataFrames ---
+    cached_pred_return = intraday_cache.get("pred_return", {})
+    pred_return_series = pd.Series(
+        {str(k): float(v) for k, v in cached_pred_return.items()}, dtype=float,
+    ) if cached_pred_return else None
+
+    cached_score = intraday_cache.get("score", {})
+    score_series = pd.Series(
+        {str(k): float(v) for k, v in cached_score.items()}, dtype=float,
+    ) if cached_score else None
+
+    features_dict = {}
+    for col in ("vol_60d_ann", "pred_peak_days", "rsi_14", "ma20_ratio"):
+        cached_vals = intraday_cache.get(col, {})
+        if cached_vals:
+            features_dict[col] = {str(k): float(v) for k, v in cached_vals.items()}
+    features_df = pd.DataFrame(features_dict) if features_dict else pd.DataFrame()
+
+    market_vol_regime_vals = intraday_cache.get("market_vol_regime", {})
+    market_vol_regime = None
+    if isinstance(market_vol_regime_vals, (int, float)):
+        market_vol_regime = float(market_vol_regime_vals)
+    elif isinstance(market_vol_regime_vals, dict) and market_vol_regime_vals:
+        market_vol_regime = float(list(market_vol_regime_vals.values())[0])
+
+    pm = PortfolioManager(cfg)
+
+    # --- Run exit logic for held positions ---
+    exit_actions = []
+    if open_positions:
+        exit_actions = pm.apply_exits(
+            state,
+            prices_cad,
+            pred_return=pred_return_series,
+            score=score_series,
+            features=features_df if not features_df.empty else None,
+            market_vol_regime=market_vol_regime,
+        )
+        logger.info("Exit evaluation: %d actions from %d positions", len(exit_actions), len(held_tickers))
+
+    # --- Update trailing stops with intraday peak ---
+    for p in [pp for pp in state.positions if getattr(pp, "status", "OPEN") == "OPEN"]:
+        if p.ticker in prices_cad and hasattr(p, "update_highest_price"):
+            p.update_highest_price(float(prices_cad[p.ticker]))
+
+    # --- Run entry logic (if enabled) ---
+    entry_actions = []
+    if allow_entries:
+        # Reconstruct a target weights DataFrame from the daily cache
+        tw_data = {"weight": cached_target_weights}
+        cached_target_pred = intraday_cache.get("target_pred_return", {})
+        cached_target_peak = intraday_cache.get("target_pred_peak_days", {})
+        if cached_target_pred:
+            tw_data["pred_return"] = {str(k): float(v) for k, v in cached_target_pred.items()}
+        if cached_target_peak:
+            tw_data["pred_peak_days"] = {str(k): float(v) for k, v in cached_target_peak.items()}
+        target_weights_df = pd.DataFrame(tw_data)
+        target_weights_df.index = target_weights_df.index.astype(str)
+
+        # Reconstruct screened DataFrame (minimal columns for build_trade_plan)
+        screened_data = {}
+        if cached_pred_return:
+            screened_data["pred_return"] = {str(k): float(v) for k, v in cached_pred_return.items()}
+        if cached_score:
+            screened_data["score"] = {str(k): float(v) for k, v in cached_score.items()}
+        screened_df = pd.DataFrame(screened_data) if screened_data else pd.DataFrame()
+
+        # Block tickers that were just exited this run
+        exited_tickers = set()
+        for a in exit_actions:
+            t = getattr(a, "ticker", None) or (a.get("ticker") if isinstance(a, dict) else None)
+            if t:
+                exited_tickers.add(str(t).upper())
+
+        try:
+            trade_plan = pm.build_trade_plan(
+                state=state,
+                screened=screened_df,
+                weights=target_weights_df,
+                prices_cad=prices_cad,
+                scored=screened_df if not screened_df.empty else None,
+                features=features_df if not features_df.empty else None,
+                blocked_buys=exited_tickers,
+            )
+            # Extract only BUY actions from the trade plan
+            for a in trade_plan.actions:
+                action_type = getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else None)
+                if action_type == "BUY":
+                    entry_actions.append(a)
+            if entry_actions:
+                logger.info("Intraday entries: %d BUY actions",  len(entry_actions))
+        except Exception as e:
+            logger.warning("Intraday entry logic failed: %s", e)
+
+    # --- Persist state ---
+    save_portfolio_state(state, cfg.portfolio_state_path, logger=logger)
+
+    # --- Build position data for report ---
+    all_actions = exit_actions + entry_actions
+    position_data = []
+    for p in [pp for pp in state.positions if getattr(pp, "status", "OPEN") == "OPEN"]:
+        px = float(prices_cad.get(p.ticker, float("nan")))
+        pnl_pct = (px / p.entry_price - 1.0) if p.entry_price > 0 and pd.notna(px) else float("nan")
+        position_data.append({
+            "ticker": p.ticker,
+            "entry_price": p.entry_price,
+            "current_price": px,
+            "pnl_pct": pnl_pct,
+            "days_held": (started_utc - p.entry_date).days if hasattr(p, "entry_date") else 0,
+            "trailing_stop": getattr(p, "highest_price", None),
+        })
+
+    # --- Render report ---
+    render_intraday_report(
+        reports_dir=Path(reports_dir),
+        positions=position_data,
+        exit_actions=exit_actions,
+        entry_actions=entry_actions,
+        run_meta={
+            "status": "executed",
+            "started_utc": started_utc.isoformat(),
+            "n_exits": len(exit_actions),
+            "n_entries": len(entry_actions),
+            "n_positions_monitored": len(held_tickers),
+            "entries_enabled": allow_entries,
+        },
+        logger=logger,
+    )
+
+    # --- Save intraday metadata ---
+    elapsed = (datetime.now(tz=timezone.utc) - started_utc).total_seconds()
+    def _action_ticker(a):
+        return getattr(a, "ticker", a.get("ticker", "")) if isinstance(a, dict) else getattr(a, "ticker", "")
+    write_json(cache_dir / "last_intraday_meta.json", {
+        "started_utc": started_utc.isoformat(),
+        "elapsed_seconds": elapsed,
+        "n_positions": len(held_tickers),
+        "n_exits": len(exit_actions),
+        "n_entries": len(entry_actions),
+        "exit_tickers": [_action_ticker(a) for a in exit_actions],
+        "entry_tickers": [_action_ticker(a) for a in entry_actions],
+    })
+    logger.info("Intraday monitor complete: %d exits, %d entries, %d positions (%.1fs)",
+                len(exit_actions), len(entry_actions), len(held_tickers), elapsed)

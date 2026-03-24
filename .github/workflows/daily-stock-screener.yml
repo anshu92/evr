@@ -2,27 +2,29 @@ name: Daily Stock Screener (CAD) + Email
 
 on:
   schedule:
-    # Run 3x per WEEKDAY (Mon-Fri) for timely trading signals.
-    # NYSE hours: 9:30 AM - 4:00 PM ET.
-    # Times chosen so the email arrives with enough time to act in BOTH
-    # winter (EST = UTC-5) and summer (EDT = UTC-4).
+    # Run 2x per WEEKDAY (Mon-Fri).
+    # NYSE hours: 9:30 AM - 4:00 PM ET.  yfinance daily bars update after close.
     #
-    #                          EST (winter)     EDT (summer)
-    # ─────────────────────────────────────────────────────────
-    # PRE-MARKET  12:00 UTC    7:00 AM (-2.5h)  8:00 AM (-1.5h)
-    # MID-DAY     15:00 UTC   10:00 AM (+0.5h) 11:00 AM (+1.5h)
-    # PRE-CLOSE   19:30 UTC    2:30 PM (-1.5h)  3:30 PM (-0.5h)
+    # The model predicts 5-day forward returns from end-of-day closing prices.
+    # Running during market hours adds no information because the daily bar
+    # (the model's input) doesn't update until after 4 PM ET close.
+    #
+    #                             EST (winter)     EDT (summer)
+    # ──────────────────────────────────────────────────────────
+    # POST-CLOSE  21:30 UTC      4:30 PM (+0.5h)  5:30 PM (+1.5h)
+    # PRE-MARKET  13:00 UTC      8:00 AM (-1.5h)  9:00 AM (-0.5h)
+    #
+    # POST-CLOSE is the PRIMARY signal run — uses today's finalized daily bar.
+    # PRE-MARKET is the EXECUTION reminder — same signal, validates overnight
+    # gaps haven't invalidated yesterday's recommendations.
     #
     # Pipeline takes ~5-10 min, so emails arrive well before the action window.
 
-    # PRE-MARKET: 12:00 UTC — review + place orders before 9:30 AM open
-    - cron: '0 12 * * 1-5'
+    # POST-CLOSE: 21:30 UTC — primary signal using today's finalized daily bar
+    - cron: '30 21 * * 1-5'
 
-    # MID-DAY: 15:00 UTC — after opening volatility settles (~30-90 min in)
-    - cron: '0 15 * * 1-5'
-
-    # PRE-CLOSE: 19:30 UTC — last chance for end-of-day positioning
-    - cron: '30 19 * * 1-5'
+    # PRE-MARKET: 13:00 UTC — execution reminder before 9:30 AM open
+    - cron: '0 13 * * 1-5'
   workflow_dispatch:
 
 concurrency:
@@ -617,12 +619,10 @@ jobs:
         id: session
         run: |
           HOUR=$(date -u +%H)
-          if [ "$HOUR" -lt 13 ]; then
-            echo "session=Pre-Market" >> $GITHUB_OUTPUT
-          elif [ "$HOUR" -lt 17 ]; then
-            echo "session=Mid-Day" >> $GITHUB_OUTPUT
+          if [ "$HOUR" -ge 20 ]; then
+            echo "session=Post-Close" >> $GITHUB_OUTPUT
           else
-            echo "session=Pre-Close" >> $GITHUB_OUTPUT
+            echo "session=Pre-Market" >> $GITHUB_OUTPUT
           fi
 
       - name: Send daily email

@@ -20,6 +20,9 @@ def _build_parser() -> argparse.ArgumentParser:
     train.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     eval_model = sub.add_parser("eval-model", help="Evaluate current ML model")
     eval_model.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+
+    intraday = sub.add_parser("intraday", help="Lightweight intraday portfolio monitoring")
+    intraday.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
 
@@ -65,6 +68,17 @@ def main() -> int:
             topn = regressor.get("topn", {}).get("summary") if isinstance(regressor, dict) else None
             if topn:
                 logger.info("Regressor Top-N returns: %s", topn)
+        return 0
+
+    if args.cmd == "intraday":
+        from stock_screener.pipeline.daily import run_intraday_monitor
+        cfg = Config.from_env()
+        started = datetime.now(tz=timezone.utc)
+        logger.info("Starting intraday monitoring at %s", started.isoformat())
+        run_intraday_monitor(cfg=cfg, logger=logger)
+        finished = datetime.now(tz=timezone.utc)
+        elapsed = (finished - started).total_seconds()
+        logger.info("Finished intraday monitoring in %.1fs", elapsed)
         return 0
 
     raise RuntimeError(f"Unknown cmd: {args.cmd}")

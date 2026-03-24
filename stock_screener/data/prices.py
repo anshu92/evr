@@ -156,3 +156,124 @@ def download_price_history(
     return prices
 
 
+def download_intraday_prices(
+    tickers: list[str],
+    period: str = "5d",
+    interval: str = "1h",
+    threads: bool = True,
+    batch_size: int = 50,
+    logger=None,
+) -> pd.DataFrame:
+    """Download intraday price bars for a small set of tickers.
+
+    Designed for lightweight portfolio monitoring runs — downloads only
+    the tickers in the current portfolio + a small watchlist.
+
+    Args:
+        tickers: Tickers to download (typically 50-100).
+        period: yfinance period string (e.g. "5d", "1mo").
+        interval: Bar interval (e.g. "1h", "2h").
+        threads: Enable threaded download.
+        batch_size: Tickers per yfinance batch call.
+        logger: Logger instance.
+
+    Returns:
+        DataFrame with MultiIndex columns ``(ticker, field)`` matching
+        the format returned by ``download_price_history()``.
+        Returns an empty DataFrame if no data is available (e.g. market closed).
+    """
+    clean: list[str] = []
+    for t in tickers:
+        s = sanitize_ticker(t)
+        if s is not None:
+            clean.append(s)
+    clean = list(dict.fromkeys(clean))
+    if not clean:
+        if logger:
+            logger.warning("No valid tickers for intraday download")
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    failures: list[str] = []
+
+    for batch in _chunks(clean, max(1, int(batch_size))):
+        for attempt in range(1, 4):
+            try:
+                df = yf.download(
+                    tickers=" ".join(batch),
+                    period=period,
+                    interval=interval,
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=threads,
+                )
+                if df is not None and not df.empty:
+                    frames.append(df)
+                break
+            except Exception as e:
+                if attempt < 3:
+                    if logger:
+                        logger.warning(
+                            "Intraday download attempt %d/3 failed: %s. Retrying...",
+                            attempt, str(e),
+                        )
+                    sleep(attempt * 1.5)
+                else:
+                    if logger:
+                        logger.error("Intraday download failed after 3 attempts: %s", str(e))
+                    failures.extend(batch)
+        sleep(0.5)
+
+    if not frames:
+        if logger:
+            logger.info("No intraday data available (market may be closed). failures=%d", len(failures))
+        return pd.DataFrame()
+
+    prices = pd.concat(frames, axis=1)
+    prices.index = pd.to_datetime(prices.index)
+    prices = prices.sort_index()
+
+    # Normalize to (ticker, field) MultiIndex — same logic as download_price_history.
+    if not isinstance(prices.columns, pd.MultiIndex):
+        t = clean[0]
+        prices.columns = pd.MultiIndex.from_product([[t], prices.columns])
+    else:
+        fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+        if set(prices.columns.get_level_values(0)).issubset(fields):
+            prices = prices.swaplevel(0, 1, axis=1)
+        prices = prices.sort_index(axis=1)
+
+    if failures and logger:
+        logger.warning("Intraday download failures: %d tickers", len(failures))
+    if logger:
+        logger.info("Downloaded intraday prices: %d tickers, %d bars (%s %s)",
+                     len(prices.columns.levels[0]), len(prices), period, interval)
+    return prices
+
+
+def get_latest_prices(prices: pd.DataFrame) -> pd.Series:
+    """Extract the most recent close price per ticker from a MultiIndex price DataFrame.
+
+    Args:
+        prices: DataFrame with ``(ticker, field)`` MultiIndex columns.
+
+    Returns:
+        Series indexed by ticker with the latest close price.
+    """
+    if prices.empty or not isinstance(prices.columns, pd.MultiIndex):
+        return pd.Series(dtype=float)
+
+    tickers = prices.columns.get_level_values(0).unique()
+    latest: dict[str, float] = {}
+    for t in tickers:
+        try:
+            close = prices[(t, "Close")].dropna()
+            if not close.empty:
+                latest[str(t)] = float(close.iloc[-1])
+        except Exception:
+            continue
+
+    return pd.Series(latest, dtype=float, name="latest_close")
+
+

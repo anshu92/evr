@@ -164,6 +164,14 @@ class Config:
     rotate_on_missing_data: bool = False  # If True, can rotate out holdings with no fresh prediction data
     rotation_cooldown_days: int = 2  # Min trading days after entry before rotation sells (risk exits still apply)
     portfolio_state_path: str = "screener_portfolio_state.json"
+
+    # Intraday monitoring (lightweight exit-only runs during market hours)
+    intraday_enabled: bool = False  # Enable intraday monitoring pipeline
+    intraday_ticker_limit: int = 100  # Max tickers for intraday price download
+    intraday_watchlist_top_n: int = 20  # Top-N from last daily screened to monitor
+    intraday_exit_only: bool = False  # When False, also execute new entries from daily target weights
+    intraday_min_price_move_pct: float = 0.02  # Min price move to trigger action (2%)
+    intraday_stale_threshold_hours: float = 18.0  # Max daily-run age before skipping
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     
@@ -449,6 +457,12 @@ class Config:
             rotate_on_missing_data=_get_bool("ROTATE_ON_MISSING_DATA", False),
             rotation_cooldown_days=max(0, _get_int("ROTATION_COOLDOWN_DAYS", 2) or 2),
             portfolio_state_path=_get_str("PORTFOLIO_STATE_PATH", "screener_portfolio_state.json"),
+            intraday_enabled=_get_bool("INTRADAY_ENABLED", False),
+            intraday_ticker_limit=_get_int("INTRADAY_TICKER_LIMIT", 100) or 100,
+            intraday_watchlist_top_n=_get_int("INTRADAY_WATCHLIST_TOP_N", 20) or 20,
+            intraday_exit_only=_get_bool("INTRADAY_EXIT_ONLY", False),
+            intraday_min_price_move_pct=_get_float("INTRADAY_MIN_PRICE_MOVE_PCT", 0.02),
+            intraday_stale_threshold_hours=_get_float("INTRADAY_STALE_THRESHOLD_HOURS", 18.0),
             stop_loss_pct=(
                 _get_float("STOP_LOSS_PCT", 0.0) if os.getenv("STOP_LOSS_PCT") not in {None, ""} else None
             ),

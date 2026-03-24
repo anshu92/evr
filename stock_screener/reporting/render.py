@@ -37,6 +37,16 @@ def _fmt_num(x: float) -> str:
         return "N/A"
 
 
+def _html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
 def render_reports(
     reports_dir: Path,
     run_meta: dict[str, Any],
@@ -415,15 +425,6 @@ def render_reports(
     (reports_dir / "daily_report.txt").write_text("\n".join(lines), encoding="utf-8")
 
     # HTML email (simple and robust: no external templating dependency)
-    def _html_escape(s: str) -> str:
-        return (
-            s.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&#39;")
-        )
-
     _base_cols = [
         "ticker", "actual_weight", "target_weight", "weight", "shares",
         "position_value_cad", "score", "last_close_cad", "ret_60d", "vol_60d_ann",
@@ -816,3 +817,210 @@ def render_reports(
         except Exception as e:
             logger.warning("Could not write trade_actions.json: %s", e)
     logger.info("Rendered reports: %s", str(reports_dir))
+
+
+def render_intraday_report(
+    reports_dir: Path,
+    positions: list[dict],
+    exit_actions: list,
+    run_meta: dict,
+    logger,
+    *,
+    entry_actions: list | None = None,
+) -> None:
+    """Render a lightweight intraday monitoring report."""
+    from datetime import datetime, timezone
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    status = run_meta.get("status", "unknown")
+
+    # --- Text report ---
+    lines = [
+        "=" * 60,
+        "INTRADAY PORTFOLIO MONITOR",
+        "=" * 60,
+        f"Generated: {now}",
+        f"Status: {status}",
+        "",
+    ]
+
+    if positions:
+        lines.append("OPEN POSITIONS")
+        lines.append("-" * 60)
+        lines.append(f"{'Ticker':<12} {'Entry':>10} {'Current':>10} {'P&L':>8} {'Days':>5}")
+        for p in positions:
+            ticker = p.get("ticker", "")
+            entry = p.get("entry_price")
+            current = p.get("current_price")
+            pnl = p.get("pnl_pct")
+            days = p.get("days_held", "")
+            entry_str = _fmt_money(entry) if entry else "N/A"
+            current_str = _fmt_money(current) if current else "N/A"
+            pnl_str = _fmt_pct(pnl) if pnl is not None else "N/A"
+            lines.append(f"{ticker:<12} {entry_str:>10} {current_str:>10} {pnl_str:>8} {days:>5}")
+        lines.append("")
+
+    if exit_actions:
+        lines.append("EXIT ACTIONS")
+        lines.append("-" * 60)
+        for a in exit_actions:
+            if isinstance(a, dict):
+                ticker = a.get("ticker", "")
+                reason = a.get("reason", "")
+            else:
+                ticker = getattr(a, "ticker", "")
+                reason = getattr(a, "reason", "")
+            lines.append(f"  SELL {ticker} — {reason}")
+        lines.append("")
+
+    if entry_actions:
+        lines.append("ENTRY ACTIONS")
+        lines.append("-" * 60)
+        for a in entry_actions:
+            if isinstance(a, dict):
+                ticker = a.get("ticker", "")
+                shares = a.get("shares", "")
+                px = a.get("price_cad")
+            else:
+                ticker = getattr(a, "ticker", "")
+                shares = getattr(a, "shares", "")
+                px = getattr(a, "price_cad", None)
+            px_str = _fmt_money(px) if px else "N/A"
+            lines.append(f"  BUY  {ticker} — {shares} shares @ {px_str}")
+        lines.append("")
+
+    if not exit_actions and not entry_actions:
+        lines.append("No actions triggered.")
+        lines.append("")
+
+    (reports_dir / "intraday_report.txt").write_text("\n".join(lines), encoding="utf-8")
+
+    # --- HTML email ---
+    position_rows = ""
+    for p in positions:
+        ticker = p.get("ticker", "")
+        entry = p.get("entry_price")
+        current = p.get("current_price")
+        pnl = p.get("pnl_pct")
+        days = p.get("days_held", "")
+        trailing = p.get("trailing_stop")
+        pnl_val = float(pnl) if pnl is not None and pnl == pnl else None
+        color = "#059669" if pnl_val and pnl_val > 0 else "#dc2626" if pnl_val and pnl_val < 0 else "#666"
+        position_rows += (
+            f"<tr>"
+            f"<td style='padding:6px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
+            f"<td style='padding:6px 8px;'>{_fmt_money(entry) if entry else 'N/A'}</td>"
+            f"<td style='padding:6px 8px;'>{_fmt_money(current) if current else 'N/A'}</td>"
+            f"<td style='padding:6px 8px;color:{color};font-weight:bold;'>{_fmt_pct(pnl) if pnl is not None else 'N/A'}</td>"
+            f"<td style='padding:6px 8px;'>{days}</td>"
+            f"<td style='padding:6px 8px;'>{_fmt_money(trailing) if trailing else 'N/A'}</td>"
+            f"</tr>"
+        )
+
+    exit_html = ""
+    if exit_actions:
+        exit_rows = ""
+        for a in exit_actions:
+            if isinstance(a, dict):
+                ticker = a.get("ticker", "")
+                reason = a.get("reason", "")
+                px = a.get("price_cad")
+            else:
+                ticker = getattr(a, "ticker", "")
+                reason = getattr(a, "reason", "")
+                px = getattr(a, "price_cad", None)
+            exit_rows += (
+                f"<tr>"
+                f"<td style='padding:4px 8px;color:#dc2626;font-weight:bold;'>SELL</td>"
+                f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
+                f"<td style='padding:4px 8px;'>{_fmt_money(px) if px else 'N/A'}</td>"
+                f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td>"
+                f"</tr>"
+            )
+        exit_html = f"""
+        <h3 style="color:#dc2626;margin:16px 0 8px 0;">Exit Actions Triggered</h3>
+        <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead><tr>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Action</th>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Ticker</th>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Price</th>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Reason</th>
+        </tr></thead>
+        <tbody>{exit_rows}</tbody>
+        </table>
+        """
+
+    entry_html = ""
+    if entry_actions:
+        entry_rows = ""
+        for a in entry_actions:
+            if isinstance(a, dict):
+                ticker = a.get("ticker", "")
+                shares = a.get("shares", "")
+                px = a.get("price_cad")
+            else:
+                ticker = getattr(a, "ticker", "")
+                shares = getattr(a, "shares", "")
+                px = getattr(a, "price_cad", None)
+            entry_rows += (
+                f"<tr>"
+                f"<td style='padding:4px 8px;color:#059669;font-weight:bold;'>BUY</td>"
+                f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
+                f"<td style='padding:4px 8px;'>{shares}</td>"
+                f"<td style='padding:4px 8px;'>{_fmt_money(px) if px else 'N/A'}</td>"
+                f"</tr>"
+            )
+        entry_html = f"""
+        <h3 style="color:#059669;margin:16px 0 8px 0;">Entry Actions</h3>
+        <table style="border-collapse:collapse;width:100%;font-size:13px;">
+        <thead><tr>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Action</th>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Ticker</th>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Shares</th>
+            <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Price</th>
+        </tr></thead>
+        <tbody>{entry_rows}</tbody>
+        </table>
+        """
+
+    n_exits = run_meta.get("n_exits", 0)
+    n_entries = run_meta.get("n_entries", 0)
+    max_move = run_meta.get("max_move_pct", 0)
+    entries_enabled = run_meta.get("entries_enabled", False)
+    status_badge = {
+        "executed": "Exit logic evaluated" + (" + entries" if entries_enabled else ""),
+        "below_threshold": "Below move threshold — no action",
+        "no_positions": "No open positions" + (" — checking entries" if entries_enabled else ""),
+        "no_intraday_data": "Market closed — no data",
+    }.get(status, status)
+
+    html = f"""<html>
+<body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;max-width:700px;margin:0 auto;padding:20px;">
+  <h2 style="margin:0 0 8px 0;">Intraday Portfolio Monitor</h2>
+  <p style="margin:0 0 12px 0;color:#6b7280;font-size:13px;">{_html_escape(now)} &mdash; {_html_escape(status_badge)}</p>
+
+  {exit_html}
+
+  {entry_html}
+
+  <h3 style="margin:16px 0 8px 0;">Open Positions</h3>
+  <table style="border-collapse:collapse;width:100%;font-size:13px;">
+  <thead><tr>
+      <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Ticker</th>
+      <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Entry</th>
+      <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Current</th>
+      <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">P&amp;L</th>
+      <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Days</th>
+      <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Trail Stop</th>
+  </tr></thead>
+  <tbody>{position_rows if position_rows else '<tr><td colspan="6" style="padding:8px;color:#9ca3af;">No open positions</td></tr>'}</tbody>
+  </table>
+
+  <p style="margin-top:16px;color:#6b7280;font-size:12px;">
+    Max price move: {max_move * 100:.1f}% &bull; Exits: {n_exits} &bull; Entries: {n_entries} &bull; Next full run: post-close
+  </p>
+</body>
+</html>"""
+
+    (reports_dir / "intraday_email.html").write_text(html, encoding="utf-8")
+    logger.info("Rendered intraday report: %s", str(reports_dir))

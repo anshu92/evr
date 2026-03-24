@@ -2,8 +2,8 @@ name: Verify Daily Session Coverage
 
 on:
   schedule:
-    # Runs after the pre-close daily session should have completed.
-    - cron: '15 22 * * 1-5'
+    # Runs after the post-close daily session should have completed.
+    - cron: '0 23 * * 1-5'
   workflow_dispatch:
     inputs:
       date_utc:
@@ -84,9 +84,12 @@ jobs:
             end.setUTCDate(end.getUTCDate() + 1);
 
             const sessionWindows = [
-              { key: "PRE_MARKET", start: 11 * 60 + 30, end: 13 * 60 + 30 },
-              { key: "MID_DAY", start: 14 * 60 + 30, end: 16 * 60 + 30 },
-              { key: "PRE_CLOSE", start: 19 * 60 + 0, end: 21 * 60 + 0 },
+              { key: "POST_CLOSE", start: 21 * 60 + 0, end: 23 * 60 + 0 },
+              { key: "PRE_MARKET", start: 12 * 60 + 30, end: 14 * 60 + 30 },
+              // Intraday monitoring windows (optional — missing doesn't create issues)
+              { key: "INTRADAY_1", start: 15 * 60 + 0, end: 16 * 60 + 30, optional: true },
+              { key: "INTRADAY_2", start: 17 * 60 + 0, end: 18 * 60 + 30, optional: true },
+              { key: "INTRADAY_3", start: 19 * 60 + 0, end: 20 * 60 + 30, optional: true },
             ];
 
             const counts = Object.fromEntries(sessionWindows.map((s) => [s.key, 0]));
@@ -120,7 +123,7 @@ jobs:
             }
 
             const missing = isWeekday
-              ? sessionWindows.filter((s) => counts[s.key] < 1).map((s) => s.key)
+              ? sessionWindows.filter((s) => counts[s.key] < 1 && !s.optional).map((s) => s.key)
               : [];
 
             const shouldCreateIssue =
@@ -161,9 +164,8 @@ jobs:
 
             core.setOutput("target_date", targetDateStr);
             core.setOutput("is_weekday", isWeekday ? "true" : "false");
+            core.setOutput("post_close_count", String(counts.POST_CLOSE));
             core.setOutput("pre_market_count", String(counts.PRE_MARKET));
-            core.setOutput("mid_day_count", String(counts.MID_DAY));
-            core.setOutput("pre_close_count", String(counts.PRE_CLOSE));
             core.setOutput("missing_sessions", missing.join(","));
             core.setOutput("missing_count", String(missing.length));
             core.setOutput("issue_created", issueCreated ? "true" : "false");
@@ -182,7 +184,7 @@ jobs:
             echo ""
             echo "- Target date (UTC): \`${{ steps.coverage.outputs.target_date }}\`"
             echo "- Weekday validation active: \`${{ steps.coverage.outputs.is_weekday }}\`"
-            echo "- Session success counts (PRE_MARKET / MID_DAY / PRE_CLOSE): \`${{ steps.coverage.outputs.pre_market_count }} / ${{ steps.coverage.outputs.mid_day_count }} / ${{ steps.coverage.outputs.pre_close_count }}\`"
+            echo "- Session success counts (POST_CLOSE / PRE_MARKET): \`${{ steps.coverage.outputs.post_close_count }} / ${{ steps.coverage.outputs.pre_market_count }}\`"
             echo "- Missing sessions: \`${{ steps.coverage.outputs.missing_sessions || 'none' }}\`"
             echo "- Issue created: \`${{ steps.coverage.outputs.issue_created }}\`"
             echo "- Job status: \`${{ job.status }}\`"
