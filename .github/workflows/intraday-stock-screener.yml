@@ -9,15 +9,17 @@ on:
     # for held positions only and evaluate exit logic (stops, trailing stops,
     # peak detection). They do NOT re-run ML predictions or universe screening.
     #
-    #                          EST (winter)      EDT (summer)
-    # ─────────────────────────────────────────────────────────
-    # INTRADAY-1  15:30 UTC    10:30 AM (+1h)   11:30 AM (+2h)
-    # INTRADAY-2  17:30 UTC    12:30 PM (+3h)    1:30 PM (+4h)
-    # INTRADAY-3  19:30 UTC     2:30 PM (+5h)    3:30 PM (+6h)
+    #                          EST (winter)      EDT (summer)       Emails by
+    # ────────────────────────────────────────────────────────────────────────
+    # INTRADAY-1  15:00 UTC    10:00 AM          11:00 AM          ~11:02 AM EDT
+    # INTRADAY-2  17:00 UTC    12:00 PM           1:00 PM          ~ 1:02 PM EDT
+    # INTRADAY-3  19:00 UTC     2:00 PM           3:00 PM          ~ 3:02 PM EDT
+    #
+    # Triggers 30 min early so the ~1-2 min pipeline finishes on time.
 
-    - cron: '30 15 * * 1-5'
-    - cron: '30 17 * * 1-5'
-    - cron: '30 19 * * 1-5'
+    - cron: '0 15 * * 1-5'
+    - cron: '0 17 * * 1-5'
+    - cron: '0 19 * * 1-5'
   workflow_dispatch:
 
 concurrency:

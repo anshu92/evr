@@ -9,22 +9,22 @@ on:
     # Running during market hours adds no information because the daily bar
     # (the model's input) doesn't update until after 4 PM ET close.
     #
-    #                             EST (winter)     EDT (summer)
-    # ──────────────────────────────────────────────────────────
-    # POST-CLOSE  21:30 UTC      4:30 PM (+0.5h)  5:30 PM (+1.5h)
-    # PRE-MARKET  13:00 UTC      8:00 AM (-1.5h)  9:00 AM (-0.5h)
+    #                             EST (winter)     EDT (summer)       Emails by
+    # ──────────────────────────────────────────────────────────────────────────
+    # POST-CLOSE  21:00 UTC      4:00 PM          5:00 PM            ~5:10 PM EDT
+    # PRE-MARKET  12:30 UTC      7:30 AM          8:30 AM            ~8:40 AM EDT
     #
     # POST-CLOSE is the PRIMARY signal run — uses today's finalized daily bar.
     # PRE-MARKET is the EXECUTION reminder — same signal, validates overnight
     # gaps haven't invalidated yesterday's recommendations.
     #
-    # Pipeline takes ~5-10 min, so emails arrive well before the action window.
+    # Triggers 30 min early so the ~5-10 min pipeline finishes on time.
 
-    # POST-CLOSE: 21:30 UTC — primary signal using today's finalized daily bar
-    - cron: '30 21 * * 1-5'
+    # POST-CLOSE: 21:00 UTC — emails arrive by ~5:10 PM EDT / 4:10 PM EST
+    - cron: '0 21 * * 1-5'
 
-    # PRE-MARKET: 13:00 UTC — execution reminder before 9:30 AM open
-    - cron: '0 13 * * 1-5'
+    # PRE-MARKET: 12:30 UTC — emails arrive by ~8:40 AM EDT / 7:40 AM EST
+    - cron: '30 12 * * 1-5'
   workflow_dispatch:
 
 concurrency:

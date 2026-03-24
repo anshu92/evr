@@ -84,12 +84,12 @@ jobs:
             end.setUTCDate(end.getUTCDate() + 1);
 
             const sessionWindows = [
-              { key: "POST_CLOSE", start: 21 * 60 + 0, end: 23 * 60 + 0 },
-              { key: "PRE_MARKET", start: 12 * 60 + 30, end: 14 * 60 + 30 },
+              { key: "POST_CLOSE", start: 20 * 60 + 30, end: 22 * 60 + 30 },
+              { key: "PRE_MARKET", start: 12 * 60 + 0, end: 14 * 60 + 0 },
               // Intraday monitoring windows (optional — missing doesn't create issues)
-              { key: "INTRADAY_1", start: 15 * 60 + 0, end: 16 * 60 + 30, optional: true },
-              { key: "INTRADAY_2", start: 17 * 60 + 0, end: 18 * 60 + 30, optional: true },
-              { key: "INTRADAY_3", start: 19 * 60 + 0, end: 20 * 60 + 30, optional: true },
+              { key: "INTRADAY_1", start: 14 * 60 + 30, end: 16 * 60 + 0, optional: true },
+              { key: "INTRADAY_2", start: 16 * 60 + 30, end: 18 * 60 + 0, optional: true },
+              { key: "INTRADAY_3", start: 18 * 60 + 30, end: 20 * 60 + 0, optional: true },
             ];
 
             const counts = Object.fromEntries(sessionWindows.map((s) => [s.key, 0]));
