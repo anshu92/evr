@@ -3307,7 +3307,10 @@ def run_intraday_monitor(cfg, logger) -> None:
     reports_dir = ensure_dir(cfg.reports_dir)
 
     # --- Staleness guard ---
-    last_meta = read_json(cache_dir / "last_run_meta.json")
+    try:
+        last_meta = read_json(cache_dir / "last_run_meta.json")
+    except (FileNotFoundError, OSError):
+        last_meta = None
     if not last_meta:
         logger.warning("No daily run metadata found; skipping intraday monitor")
         return
@@ -3327,13 +3330,16 @@ def run_intraday_monitor(cfg, logger) -> None:
             logger.warning("Could not parse daily run timestamp: %s", e)
 
     # --- Load intraday cache from daily run ---
-    intraday_cache = read_json(cache_dir / "intraday_cache.json") or {}
+    try:
+        intraday_cache = read_json(cache_dir / "intraday_cache.json") or {}
+    except (FileNotFoundError, OSError):
+        intraday_cache = {}
     watchlist = intraday_cache.get("screened_tickers", [])
     cached_target_weights = intraday_cache.get("target_weights", {})
     allow_entries = not cfg.intraday_exit_only and bool(cached_target_weights)
 
     # --- Load portfolio state ---
-    state = load_portfolio_state(cfg.portfolio_state_path, logger=logger)
+    state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
     open_positions = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
     held_tickers = [p.ticker for p in open_positions]
 
@@ -3418,7 +3424,50 @@ def run_intraday_monitor(cfg, logger) -> None:
     elif isinstance(market_vol_regime_vals, dict) and market_vol_regime_vals:
         market_vol_regime = float(list(market_vol_regime_vals.values())[0])
 
-    pm = PortfolioManager(cfg)
+    pm = PortfolioManager(
+        state_path=str(cfg.portfolio_state_path),
+        max_holding_days=cfg.max_holding_days,
+        max_holding_days_hard=cfg.max_holding_days_hard,
+        extend_hold_min_pred_return=cfg.extend_hold_min_pred_return,
+        extend_hold_min_score=cfg.extend_hold_min_score,
+        max_positions=cfg.dynamic_size_max_positions,
+        stop_loss_pct=cfg.stop_loss_pct,
+        take_profit_pct=cfg.take_profit_pct,
+        trailing_stop_enabled=cfg.trailing_stop_enabled,
+        trailing_stop_activation_pct=cfg.trailing_stop_activation_pct,
+        trailing_stop_distance_pct=cfg.trailing_stop_distance_pct,
+        peak_based_exit=cfg.peak_based_exit,
+        twr_optimization=cfg.twr_optimization,
+        quick_profit_pct=cfg.quick_profit_pct,
+        quick_profit_days=cfg.quick_profit_days,
+        min_daily_return=cfg.min_daily_return,
+        low_daily_return_hold_min_pred_return=cfg.low_daily_return_hold_min_pred_return,
+        momentum_decay_exit=cfg.momentum_decay_exit,
+        signal_decay_exit_enabled=cfg.signal_decay_exit_enabled,
+        signal_decay_threshold=cfg.signal_decay_threshold,
+        dynamic_holding_enabled=cfg.dynamic_holding_enabled,
+        dynamic_holding_vol_scale=cfg.dynamic_holding_vol_scale,
+        vol_adjusted_stop_enabled=cfg.vol_adjusted_stop_enabled,
+        vol_adjusted_stop_base=cfg.vol_adjusted_stop_base,
+        vol_adjusted_stop_min=cfg.vol_adjusted_stop_min,
+        vol_adjusted_stop_max=cfg.vol_adjusted_stop_max,
+        age_urgency_enabled=cfg.age_urgency_enabled,
+        age_urgency_start_day=cfg.age_urgency_start_day,
+        age_urgency_min_return=cfg.age_urgency_min_return,
+        peak_detection_enabled=cfg.peak_detection_enabled,
+        peak_sell_portion_pct=cfg.peak_sell_portion_pct,
+        peak_min_gain_pct=cfg.peak_min_gain_pct,
+        peak_min_holding_days=cfg.peak_min_holding_days,
+        peak_pred_return_threshold=cfg.peak_pred_return_threshold,
+        peak_score_percentile_drop=cfg.peak_score_percentile_drop,
+        peak_rsi_overbought=cfg.peak_rsi_overbought,
+        peak_above_ma_ratio=cfg.peak_above_ma_ratio,
+        min_trade_notional_cad=cfg.min_trade_notional_cad,
+        min_rebalance_weight_delta=cfg.min_rebalance_weight_delta,
+        rotate_on_missing_data=cfg.rotate_on_missing_data,
+        rotation_cooldown_days=cfg.rotation_cooldown_days,
+        logger=logger,
+    )
 
     # --- Run exit logic for held positions ---
     exit_actions = []
@@ -3441,6 +3490,10 @@ def run_intraday_monitor(cfg, logger) -> None:
     # --- Run entry logic (if enabled) ---
     entry_actions = []
     if allow_entries:
+        # Snapshot state before entries so we can roll back on failure
+        _pre_entry_positions = list(state.positions)
+        _pre_entry_cash = state.cash_cad
+
         # Reconstruct a target weights DataFrame from the daily cache
         tw_data = {"weight": cached_target_weights}
         cached_target_pred = intraday_cache.get("target_pred_return", {})
@@ -3485,13 +3538,14 @@ def run_intraday_monitor(cfg, logger) -> None:
             if entry_actions:
                 logger.info("Intraday entries: %d BUY actions",  len(entry_actions))
         except Exception as e:
-            logger.warning("Intraday entry logic failed: %s", e)
+            logger.warning("Intraday entry logic failed: %s; rolling back state", e)
+            state.positions = _pre_entry_positions
+            state.cash_cad = _pre_entry_cash
 
     # --- Persist state ---
-    save_portfolio_state(state, cfg.portfolio_state_path, logger=logger)
+    save_portfolio_state(cfg.portfolio_state_path, state)
 
     # --- Build position data for report ---
-    all_actions = exit_actions + entry_actions
     position_data = []
     for p in [pp for pp in state.positions if getattr(pp, "status", "OPEN") == "OPEN"]:
         px = float(prices_cad.get(p.ticker, float("nan")))
