@@ -3257,9 +3257,9 @@ def run_daily(cfg: Config, logger) -> None:
         _intraday_data_dir = Path(cache_dir) / "intraday"
         _intraday_data_dir.mkdir(parents=True, exist_ok=True)
         if not screened.empty:
-            screened.to_parquet(_intraday_data_dir / "screened.parquet", engine="pyarrow" if "pyarrow" in str(pd.io.parquet.get_engine("auto")) else "auto")
+            screened.to_parquet(_intraday_data_dir / "screened.parquet", engine="auto")
         if target_weights is not None and not target_weights.empty:
-            target_weights.to_parquet(_intraday_data_dir / "target_weights.parquet", engine="pyarrow" if "pyarrow" in str(pd.io.parquet.get_engine("auto")) else "auto")
+            target_weights.to_parquet(_intraday_data_dir / "target_weights.parquet", engine="auto")
 
         _intraday_cache = {
             "run_utc": datetime.now(tz=timezone.utc).isoformat(),
@@ -3310,8 +3310,16 @@ def run_intraday(cfg, logger) -> None:
         last_meta = read_json(cache_dir / "last_run_meta.json")
     except (FileNotFoundError, OSError):
         last_meta = None
+    def _empty_report(status: str, msg: str) -> None:
+        """Render a minimal report so the email step always has a file."""
+        render_intraday_report(
+            reports_dir=Path(reports_dir), positions=[], exit_actions=[], entry_actions=[],
+            run_meta={"status": status, "started_utc": started_utc.isoformat()}, logger=logger,
+        )
+        logger.warning(msg)
+
     if not last_meta:
-        logger.warning("No daily run metadata found; skipping intraday run")
+        _empty_report("no_daily_run", "No daily run metadata found; skipping intraday run")
         return
     last_run_ts = last_meta.get("started_utc") or last_meta.get("run_utc")
     if last_run_ts:
@@ -3319,7 +3327,7 @@ def run_intraday(cfg, logger) -> None:
             last_dt = datetime.fromisoformat(str(last_run_ts).replace("Z", "+00:00"))
             age_hours = (started_utc - last_dt).total_seconds() / 3600.0
             if age_hours > cfg.intraday_stale_threshold_hours:
-                logger.warning("Daily run %.1fh old (threshold %.1fh); skipping", age_hours, cfg.intraday_stale_threshold_hours)
+                _empty_report("stale", f"Daily run {age_hours:.1f}h old (threshold {cfg.intraday_stale_threshold_hours:.1f}h)")
                 return
             logger.info("Daily run age: %.1fh — OK", age_hours)
         except Exception as e:
@@ -3350,7 +3358,7 @@ def run_intraday(cfg, logger) -> None:
         logger.warning("Could not load target weights cache: %s", e)
 
     if screened.empty and target_weights.empty:
-        logger.warning("No cached screened data or target weights; skipping intraday run")
+        _empty_report("no_cache", "No cached screened data or target weights; skipping intraday run")
         return
 
     fx_rate = intraday_cache.get("fx_usdcad", 1.35)
@@ -3369,7 +3377,7 @@ def run_intraday(cfg, logger) -> None:
                 len(held_tickers), len(target_tickers), len(watchlist), len(all_tickers))
 
     if not all_tickers:
-        logger.info("No tickers to scan; skipping")
+        _empty_report("no_tickers", "No tickers to scan; skipping")
         return
 
     # ── Download intraday prices ─────────────────────────────────────
@@ -3391,7 +3399,7 @@ def run_intraday(cfg, logger) -> None:
     # ── Derive current prices in CAD ─────────────────────────────────
     latest_prices = get_latest_prices(intraday_prices)
     if latest_prices.empty:
-        logger.warning("Could not extract latest prices")
+        _empty_report("no_prices", "Could not extract latest prices")
         return
 
     prices_cad = pd.Series(dtype=float)
