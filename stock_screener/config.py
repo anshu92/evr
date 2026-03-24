@@ -169,7 +169,7 @@ class Config:
     intraday_enabled: bool = False  # Enable intraday monitoring pipeline
     intraday_ticker_limit: int = 100  # Max tickers for intraday price download
     intraday_watchlist_top_n: int = 20  # Top-N from last daily screened to monitor
-    intraday_exit_only: bool = False  # When False, also execute new entries from daily target weights
+    intraday_exit_only: bool = False  # Deprecated — intraday always runs full trading pipeline
     intraday_min_price_move_pct: float = 0.02  # Min price move to trigger action (2%)
     intraday_stale_threshold_hours: float = 18.0  # Max daily-run age before skipping
     stop_loss_pct: float | None = None

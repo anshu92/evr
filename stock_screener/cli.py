@@ -71,14 +71,14 @@ def main() -> int:
         return 0
 
     if args.cmd == "intraday":
-        from stock_screener.pipeline.daily import run_intraday_monitor
+        from stock_screener.pipeline.daily import run_intraday
         cfg = Config.from_env()
         started = datetime.now(tz=timezone.utc)
-        logger.info("Starting intraday monitoring at %s", started.isoformat())
-        run_intraday_monitor(cfg=cfg, logger=logger)
+        logger.info("Starting intraday trading pipeline at %s", started.isoformat())
+        run_intraday(cfg=cfg, logger=logger)
         finished = datetime.now(tz=timezone.utc)
         elapsed = (finished - started).total_seconds()
-        logger.info("Finished intraday monitoring in %.1fs", elapsed)
+        logger.info("Finished intraday trading pipeline in %.1fs", elapsed)
         return 0
 
     raise RuntimeError(f"Unknown cmd: {args.cmd}")
