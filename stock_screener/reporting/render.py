@@ -987,12 +987,20 @@ def render_intraday_report(
     n_entries = run_meta.get("n_entries", 0)
     max_move = run_meta.get("max_move_pct", 0)
     entries_enabled = run_meta.get("entries_enabled", False)
+    status_message = run_meta.get("message", "")
     status_badge = {
         "executed": "Exit logic evaluated" + (" + entries" if entries_enabled else ""),
         "below_threshold": "Below move threshold — no action",
         "no_positions": "No open positions" + (" — checking entries" if entries_enabled else ""),
         "no_intraday_data": "Market closed — no data",
+        "no_cache": "Waiting for daily post-close run to populate cache",
+        "no_daily_run": "No daily run found — run daily pipeline first",
+        "stale": "Daily signal too old — waiting for next post-close run",
+        "no_tickers": "No tickers to scan",
+        "no_prices": "Could not fetch prices",
     }.get(status, status)
+    if status_message and status not in ("executed",):
+        status_badge += f" — {_html_escape(str(status_message))}"
 
     html = f"""<html>
 <body style="font-family:Arial,sans-serif;line-height:1.5;color:#111827;max-width:700px;margin:0 auto;padding:20px;">

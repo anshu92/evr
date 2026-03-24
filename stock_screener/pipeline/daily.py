@@ -3311,10 +3311,27 @@ def run_intraday(cfg, logger) -> None:
     except (FileNotFoundError, OSError):
         last_meta = None
     def _empty_report(status: str, msg: str) -> None:
-        """Render a minimal report so the email step always has a file."""
+        """Render a report with current positions so the email is never blank."""
+        _positions = []
+        try:
+            _state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+            for _p in _state.positions:
+                if getattr(_p, "status", "OPEN") != "OPEN":
+                    continue
+                _positions.append({
+                    "ticker": _p.ticker,
+                    "entry_price": _p.entry_price,
+                    "current_price": None,
+                    "pnl_pct": None,
+                    "days_held": (started_utc - _p.entry_date).days if hasattr(_p, "entry_date") else 0,
+                    "trailing_stop": getattr(_p, "highest_price", None),
+                })
+        except Exception:
+            pass
         render_intraday_report(
-            reports_dir=Path(reports_dir), positions=[], exit_actions=[], entry_actions=[],
-            run_meta={"status": status, "started_utc": started_utc.isoformat()}, logger=logger,
+            reports_dir=Path(reports_dir), positions=_positions, exit_actions=[], entry_actions=[],
+            run_meta={"status": status, "message": msg, "started_utc": started_utc.isoformat()},
+            logger=logger,
         )
         logger.warning(msg)
 
