@@ -2068,8 +2068,13 @@ def run_daily(cfg: Config, logger) -> None:
                         "sector": str(_row.get("sector", "Unknown")),
                     })
 
-                _open = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
-                _portfolio_ctx = f"{len(_open)} open positions, ${state.cash_cad:.0f} cash"
+                # Load portfolio state early (cheap JSON read) for LLM context.
+                # The main pipeline loads it again later for trading — that's fine,
+                # load_portfolio_state is idempotent.
+                from stock_screener.portfolio.state import load_portfolio_state as _load_ps
+                _early_state = _load_ps(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+                _open = [p for p in _early_state.positions if getattr(p, "status", "OPEN") == "OPEN"]
+                _portfolio_ctx = f"{len(_open)} open positions, ${_early_state.cash_cad:.0f} cash"
                 if _open:
                     _portfolio_ctx += f", tickers: {', '.join(p.ticker for p in _open[:5])}"
 
