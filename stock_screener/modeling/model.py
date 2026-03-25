@@ -73,14 +73,8 @@ FEATURE_COLUMNS = [
     # Additional technical indicators
     "mfi_14",
     "vwma_20_ratio",
-    # News sentiment
-    "news_sentiment_avg",
-    "news_volume_5d",
-    "news_sentiment_pos_ratio",
-    # Insider transactions
-    "insider_net_buys_90d",
-    "insider_buy_ratio_90d",
-    "insider_activity_recency",
+    # Note: news_sentiment and insider features are NOT model features.
+    # They feed the LLM agent layer only (see stock_screener/agents/trading_agent.py).
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
@@ -193,14 +187,8 @@ TECHNICAL_FEATURES_ONLY = [
     # Additional technical indicators
     "mfi_14",
     "vwma_20_ratio",
-    # News sentiment
-    "news_sentiment_avg",
-    "news_volume_5d",
-    "news_sentiment_pos_ratio",
-    # Insider transactions
-    "insider_net_buys_90d",
-    "insider_buy_ratio_90d",
-    "insider_activity_recency",
+    # Note: news_sentiment and insider features are in FEATURE_COLUMNS only (inference).
+    # They cannot be backfilled historically so are excluded from training.
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
