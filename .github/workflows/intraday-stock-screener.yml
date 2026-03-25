@@ -114,10 +114,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: intraday-monitor-${{ github.run_number }}
+          name: intraday-screener-${{ github.run_number }}
           path: |
-            reports/intraday_report.txt
-            reports/intraday_email.html
+            reports/
             cache/last_intraday_meta.json
           retention-days: 7
 
@@ -131,8 +130,8 @@ jobs:
           secure: true
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "[Intraday] Portfolio Monitor"
+          subject: "[Intraday] Stock Screener + Portfolio (CAD)"
           to: ${{ secrets.EMAIL_TO || secrets.EMAIL_USERNAME }}
           from: Stock Screener Bot <${{ secrets.EMAIL_USERNAME }}>
-          html_body: file://reports/intraday_email.html
-          attachments: reports/intraday_report.txt
+          html_body: file://reports/daily_email.html
+          attachments: reports/daily_report.txt,reports/portfolio_weights.csv,reports/trade_actions.json

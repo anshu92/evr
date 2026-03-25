@@ -3297,7 +3297,7 @@ def run_intraday(cfg, logger) -> None:
     from stock_screener.data.prices import download_intraday_prices, get_latest_prices
     from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
     from stock_screener.portfolio.manager import PortfolioManager
-    from stock_screener.reporting.render import render_intraday_report
+    from stock_screener.reporting.render import render_reports
     from stock_screener.utils import read_json, write_json, ensure_dir
 
     started_utc = datetime.now(tz=timezone.utc)
@@ -3312,26 +3312,35 @@ def run_intraday(cfg, logger) -> None:
         last_meta = None
     def _empty_report(status: str, msg: str) -> None:
         """Render a report with current positions so the email is never blank."""
-        _positions = []
+        _holdings = pd.DataFrame()
         try:
             _state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+            _rows = []
             for _p in _state.positions:
                 if getattr(_p, "status", "OPEN") != "OPEN":
                     continue
-                _positions.append({
+                _rows.append({
                     "ticker": _p.ticker,
-                    "entry_price": _p.entry_price,
-                    "current_price": None,
-                    "pnl_pct": None,
-                    "days_held": (started_utc - _p.entry_date).days if hasattr(_p, "entry_date") else 0,
-                    "trailing_stop": getattr(_p, "highest_price", None),
+                    "weight": 0.0,
+                    "last_close_cad": _p.entry_price,
+                    "ret_60d": float("nan"),
+                    "vol_60d_ann": float("nan"),
+                    "score": float("nan"),
                 })
+            if _rows:
+                _holdings = pd.DataFrame(_rows).set_index("ticker")
         except Exception:
             pass
-        render_intraday_report(
-            reports_dir=Path(reports_dir), positions=_positions, exit_actions=[], entry_actions=[],
-            run_meta={"status": status, "message": msg, "started_utc": started_utc.isoformat()},
+        render_reports(
+            reports_dir=Path(reports_dir),
+            run_meta={"intraday": True, "status": status, "message": msg, "started_utc": started_utc.isoformat()},
+            universe_meta={"us": {}, "tsx": {}, "total_requested": 0},
+            screened=_holdings,
+            weights=_holdings,
+            trade_actions=[],
             logger=logger,
+            portfolio_pnl_history=getattr(_state, "pnl_history", None) if "_state" in dir() else None,
+            fx_usdcad_rate=intraday_cache.get("fx_usdcad") if intraday_cache else None,
         )
         logger.warning(msg)
 
@@ -3403,14 +3412,7 @@ def run_intraday(cfg, logger) -> None:
         threads=True, batch_size=50, logger=logger,
     )
     if intraday_prices.empty:
-        logger.info("No intraday data (market may be closed); skipping")
-        render_intraday_report(
-            reports_dir=Path(reports_dir),
-            positions=[{"ticker": p.ticker, "status": "no_data"} for p in open_positions],
-            exit_actions=[], entry_actions=[],
-            run_meta={"status": "no_intraday_data", "started_utc": started_utc.isoformat()},
-            logger=logger,
-        )
+        _empty_report("no_intraday_data", "No intraday data (market may be closed)")
         return
 
     # ── Derive current prices in CAD ─────────────────────────────────
@@ -3539,35 +3541,65 @@ def run_intraday(cfg, logger) -> None:
     # ── 3. Persist state ─────────────────────────────────────────────
     save_portfolio_state(cfg.portfolio_state_path, state)
 
-    # ── 4. Report ────────────────────────────────────────────────────
-    position_data = []
-    for p in [pp for pp in state.positions if getattr(pp, "status", "OPEN") == "OPEN"]:
+    # ── 4. Report — use same render_reports() as daily pipeline ─────
+    open_after = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
+    shares_by_ticker = {str(p.ticker).upper(): float(p.shares) for p in open_after}
+    market_value_by_ticker: dict[str, float] = {}
+    open_mkt_value_total = 0.0
+    for p in open_after:
         px = float(prices_cad.get(p.ticker, float("nan")))
-        pnl_pct = (px / p.entry_price - 1.0) if p.entry_price > 0 and pd.notna(px) else float("nan")
-        position_data.append({
-            "ticker": p.ticker,
-            "entry_price": p.entry_price,
-            "current_price": px,
-            "pnl_pct": pnl_pct,
-            "days_held": (started_utc - p.entry_date).days if hasattr(p, "entry_date") else 0,
-            "trailing_stop": getattr(p, "highest_price", None),
-        })
+        if pd.isna(px) or px <= 0:
+            continue
+        mv = float(px) * float(p.shares)
+        market_value_by_ticker[str(p.ticker).upper()] = market_value_by_ticker.get(str(p.ticker).upper(), 0.0) + mv
+        open_mkt_value_total += mv
+    equity_cad_live = float(state.cash_cad) + open_mkt_value_total
 
-    render_intraday_report(
+    # Build holdings DataFrame matching what the daily pipeline passes to render_reports
+    holdings_weights = screened.copy() if not screened.empty else pd.DataFrame()
+    # Keep only tickers that are currently held
+    held_set = {str(p.ticker) for p in open_after}
+    if not holdings_weights.empty:
+        holdings_weights = holdings_weights[holdings_weights.index.isin(held_set)].copy()
+    # Add any held tickers missing from screened
+    for t in held_set:
+        if t not in holdings_weights.index:
+            holdings_weights.loc[t] = float("nan")
+
+    if "weight" in holdings_weights.columns:
+        holdings_weights["target_weight"] = holdings_weights["weight"]
+    else:
+        holdings_weights["target_weight"] = pd.NA
+    holdings_weights["shares"] = [shares_by_ticker.get(str(t).upper(), pd.NA) for t in holdings_weights.index.astype(str)]
+    holdings_weights["position_value_cad"] = [market_value_by_ticker.get(str(t).upper(), pd.NA) for t in holdings_weights.index.astype(str)]
+    if equity_cad_live > 0:
+        holdings_weights["actual_weight"] = pd.to_numeric(holdings_weights["position_value_cad"], errors="coerce") / equity_cad_live
+    else:
+        holdings_weights["actual_weight"] = pd.NA
+    holdings_weights["weight"] = holdings_weights["actual_weight"].where(
+        pd.notna(holdings_weights["actual_weight"]),
+        holdings_weights.get("target_weight", pd.NA),
+    )
+
+    all_trade_actions = exit_actions + rotation_actions + entry_actions + hold_actions
+    run_meta_intraday = {
+        "intraday": True,
+        "started_utc": started_utc.isoformat(),
+        "label_horizon_days": cfg.label_horizon_days,
+    }
+
+    render_reports(
         reports_dir=Path(reports_dir),
-        positions=position_data,
-        exit_actions=exit_actions + rotation_actions,
-        entry_actions=entry_actions,
-        run_meta={
-            "status": "executed",
-            "started_utc": started_utc.isoformat(),
-            "n_exits": len(exit_actions),
-            "n_rotations": len(rotation_actions),
-            "n_entries": len(entry_actions),
-            "n_holds": len(hold_actions),
-            "n_positions": len(position_data),
-        },
+        run_meta=run_meta_intraday,
+        universe_meta={"us": {}, "tsx": {}, "total_requested": len(all_tickers)},
+        screened=screened,
+        weights=holdings_weights,
+        trade_actions=all_trade_actions,
         logger=logger,
+        target_weights=target_weights if not target_weights.empty else None,
+        portfolio_pnl_history=state.pnl_history if hasattr(state, "pnl_history") else None,
+        fx_usdcad_rate=fx_rate,
+        total_processed=len(all_tickers),
     )
 
     # ── 5. Metadata ──────────────────────────────────────────────────
