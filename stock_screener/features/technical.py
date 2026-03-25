@@ -289,6 +289,36 @@ def compute_features(
             if avg_60 > 0:
                 liquidity_trend_60d = avg_20 / avg_60
 
+        # Money Flow Index (volume-weighted RSI, captures institutional flow)
+        mfi_14 = float("nan")
+        try:
+            high_p = prices[(t, "High")].astype(float).dropna()
+            low_p = prices[(t, "Low")].astype(float).dropna()
+            if len(high_p) >= 15 and len(low_p) >= 15 and len(close) >= 15 and len(vol) >= 15:
+                tp = (high_p.iloc[-15:] + low_p.iloc[-15:] + close.iloc[-15:]) / 3.0
+                raw_mf = tp * vol.reindex(tp.index).fillna(0)
+                tp_diff = tp.diff()
+                pos_mf = raw_mf.where(tp_diff > 0, 0.0).rolling(14).sum()
+                neg_mf = raw_mf.where(tp_diff < 0, 0.0).rolling(14).sum()
+                mfr = pos_mf / neg_mf.replace(0.0, np.nan)
+                mfi_val = 100.0 - (100.0 / (1.0 + mfr))
+                if not mfi_val.empty and pd.notna(mfi_val.iloc[-1]):
+                    mfi_14 = float(mfi_val.iloc[-1])
+        except Exception:
+            pass
+
+        # Volume-Weighted Moving Average ratio (volume-confirmed trend)
+        vwma_20_ratio = float("nan")
+        if len(close) >= 20 and len(vol) >= 20:
+            try:
+                c20 = close.iloc[-20:]
+                v20 = vol.reindex(c20.index).fillna(0)
+                vwma = (c20 * v20).sum() / v20.sum() if v20.sum() > 0 else float("nan")
+                if pd.notna(vwma) and vwma > 0:
+                    vwma_20_ratio = float(close.iloc[-1] / vwma - 1.0)
+            except Exception:
+                pass
+
         fx_ret_5d = float(fx.pct_change(5).iloc[-1]) if not is_tsx and len(fx) >= 6 else 0.0
         fx_ret_20d = float(fx.pct_change(20).iloc[-1]) if not is_tsx and len(fx) >= 21 else 0.0
 
@@ -411,6 +441,9 @@ def compute_features(
                 "amihud_illiquidity_20d": amihud_illiquidity_20d,
                 "spread_estimate_cs": spread_estimate_cs,
                 "liquidity_trend_60d": liquidity_trend_60d,
+                # Additional technical indicators
+                "mfi_14": mfi_14,
+                "vwma_20_ratio": vwma_20_ratio,
                 # Relative momentum (computed cross-sectionally after all tickers)
                 "relative_momentum_20d": float("nan"),  # Placeholder - filled after DataFrame is built
                 "relative_momentum_60d": float("nan"),  # Placeholder - filled after DataFrame is built

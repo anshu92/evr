@@ -70,6 +70,17 @@ FEATURE_COLUMNS = [
     # Sector breadth
     "sector_breadth_20d",
     "sector_momentum_dispersion",
+    # Additional technical indicators
+    "mfi_14",
+    "vwma_20_ratio",
+    # News sentiment
+    "news_sentiment_avg",
+    "news_volume_5d",
+    "news_sentiment_pos_ratio",
+    # Insider transactions
+    "insider_net_buys_90d",
+    "insider_buy_ratio_90d",
+    "insider_activity_recency",
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",
@@ -179,6 +190,17 @@ TECHNICAL_FEATURES_ONLY = [
     # Sector breadth
     "sector_breadth_20d",
     "sector_momentum_dispersion",
+    # Additional technical indicators
+    "mfi_14",
+    "vwma_20_ratio",
+    # News sentiment
+    "news_sentiment_avg",
+    "news_volume_5d",
+    "news_sentiment_pos_ratio",
+    # Insider transactions
+    "insider_net_buys_90d",
+    "insider_buy_ratio_90d",
+    "insider_activity_recency",
     # Relative momentum (vs market)
     "relative_momentum_20d",
     "relative_momentum_60d",

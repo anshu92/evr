@@ -244,6 +244,9 @@ jobs:
           RET_PER_DAY_MEAN_SHIFT_ALERT_PCT: "0.50"
           RET_PER_DAY_P90_SHIFT_ALERT_PCT: "0.50"
           RET_PER_DAY_STD_SHIFT_ALERT_PCT: "0.75"
+          # LLM trading agent (multi-agent analysis on final picks via Groq free tier)
+          LLM_AGENT_ENABLED: ${{ vars.LLM_AGENT_ENABLED || '0' }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           # Use SOTA ML by default. If ML is unavailable, default is HOLD_ONLY
           # unless ALLOW_BASELINE_TRADING is explicitly enabled.
           USE_ML: "1"

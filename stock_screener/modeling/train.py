@@ -329,6 +329,25 @@ def _compute_ticker_features(
     dvol_60 = dollar_vol.rolling(60).mean()
     liquidity_trend_60d_s = dvol_20 / dvol_60.replace(0.0, np.nan)
 
+    # --- Money Flow Index (MFI) ---
+    mfi_14_s = pd.Series(np.nan, index=idx, dtype=float)
+    if high_price is not None and low_price is not None and not high_price.empty and not low_price.empty:
+        tp = (high_price.reindex(idx) + low_price.reindex(idx) + close) / 3.0
+        raw_mf = tp * vol
+        tp_diff = tp.diff()
+        pos_mf = raw_mf.where(tp_diff > 0, 0.0).rolling(14, min_periods=14).sum()
+        neg_mf = raw_mf.where(tp_diff < 0, 0.0).rolling(14, min_periods=14).sum()
+        mfr = pos_mf / neg_mf.replace(0.0, np.nan)
+        mfi_14_s = 100.0 - (100.0 / (1.0 + mfr))
+
+    # --- Volume-Weighted Moving Average ratio ---
+    vwma_20_s = pd.Series(np.nan, index=idx, dtype=float)
+    cv = close * vol
+    cv_sum = cv.rolling(20).sum()
+    vol_sum = vol.rolling(20).sum()
+    vwma = cv_sum / vol_sum.replace(0.0, np.nan)
+    vwma_20_s = close / vwma.replace(0.0, np.nan) - 1.0
+
     return pd.DataFrame(
         {
             "date": idx,
@@ -381,6 +400,9 @@ def _compute_ticker_features(
             "amihud_illiquidity_20d": amihud_illiquidity_20d_s.values,
             "spread_estimate_cs": spread_estimate_cs_s.values,
             "liquidity_trend_60d": liquidity_trend_60d_s.values,
+            # Additional technical indicators
+            "mfi_14": mfi_14_s.values,
+            "vwma_20_ratio": vwma_20_s.values,
             "fx_ret_5d": fx_ret_5d_series.values if hasattr(fx_ret_5d_series, "values") else fx_ret_5d_series,
             "fx_ret_20d": fx_ret_20d_series.values if hasattr(fx_ret_20d_series, "values") else fx_ret_20d_series,
             "n_days": n_days.values,

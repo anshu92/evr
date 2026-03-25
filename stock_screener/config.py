@@ -165,6 +165,11 @@ class Config:
     rotation_cooldown_days: int = 2  # Min trading days after entry before rotation sells (risk exits still apply)
     portfolio_state_path: str = "screener_portfolio_state.json"
 
+    # LLM trading agent (multi-agent analysis on final picks)
+    llm_agent_enabled: bool = False  # Enable LLM agent layer after screening
+    llm_agent_ml_weight: float = 0.7  # Weight for ML score in blended signal
+    llm_agent_llm_weight: float = 0.3  # Weight for LLM score in blended signal
+
     # Intraday monitoring (lightweight exit-only runs during market hours)
     intraday_enabled: bool = False  # Enable intraday monitoring pipeline
     intraday_ticker_limit: int = 100  # Max tickers for intraday price download
@@ -457,6 +462,9 @@ class Config:
             rotate_on_missing_data=_get_bool("ROTATE_ON_MISSING_DATA", False),
             rotation_cooldown_days=max(0, _get_int("ROTATION_COOLDOWN_DAYS", 2) or 2),
             portfolio_state_path=_get_str("PORTFOLIO_STATE_PATH", "screener_portfolio_state.json"),
+            llm_agent_enabled=_get_bool("LLM_AGENT_ENABLED", False),
+            llm_agent_ml_weight=_get_float("LLM_AGENT_ML_WEIGHT", 0.7),
+            llm_agent_llm_weight=_get_float("LLM_AGENT_LLM_WEIGHT", 0.3),
             intraday_enabled=_get_bool("INTRADAY_ENABLED", False),
             intraday_ticker_limit=_get_int("INTRADAY_TICKER_LIMIT", 100) or 100,
             intraday_watchlist_top_n=_get_int("INTRADAY_WATCHLIST_TOP_N", 20) or 20,

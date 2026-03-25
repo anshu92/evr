@@ -140,6 +140,29 @@ def render_reports(
         lines.append(f"Regressor: {_fmt_ic_summary(reg_summary)}")
         lines.append("")
 
+    # LLM Agent Analysis (text report)
+    _llm_text = run_meta.get("llm_agent") if isinstance(run_meta, dict) else None
+    if isinstance(_llm_text, dict) and _llm_text.get("decisions"):
+        lines.append("LLM AGENT ANALYSIS")
+        lines.append("-" * 78)
+        for _t, _info in _llm_text["decisions"].items():
+            if not isinstance(_info, dict):
+                continue
+            lines.append(f"{_t}: {_info.get('rating', 'N/A')} (score={_info.get('score', 0):+.1f})")
+            _reason = _info.get("reasoning", "")
+            if _reason:
+                lines.append(f"  Verdict: {_reason}")
+            _bull = _info.get("bull_thesis", "")
+            if _bull:
+                lines.append(f"  Bull: {_bull[:200]}")
+            _bear = _info.get("bear_thesis", "")
+            if _bear:
+                lines.append(f"  Bear: {_bear[:200]}")
+            _risk = _info.get("risk_assessment", "")
+            if _risk:
+                lines.append(f"  Risk: {_risk[:200]}")
+            lines.append("")
+
     projection_audit = run_meta.get("optimizer_projection_audit", {}) if isinstance(run_meta, dict) else {}
     if isinstance(projection_audit, dict) and projection_audit:
         lines.append("OPTIMIZER PROJECTION AUDIT")
@@ -627,6 +650,54 @@ def render_reports(
     else:
         actions_html = _html_escape("No actions (portfolio already aligned).")
 
+    # LLM Agent Analysis block
+    llm_block = ""
+    llm_agent_data = run_meta.get("llm_agent") if isinstance(run_meta, dict) else None
+    if isinstance(llm_agent_data, dict) and llm_agent_data.get("decisions"):
+        llm_rows_html = ""
+        for ticker, info in llm_agent_data["decisions"].items():
+            if not isinstance(info, dict):
+                continue
+            rating = info.get("rating", "N/A")
+            score = info.get("score", 0)
+            reasoning = info.get("reasoning", "")
+            bull = info.get("bull_thesis", "")
+            bear = info.get("bear_thesis", "")
+            risk = info.get("risk_assessment", "")
+            rating_colors = {"BUY": "#059669", "OVERWEIGHT": "#10b981", "HOLD": "#6b7280", "UNDERWEIGHT": "#f59e0b", "SELL": "#dc2626"}
+            rc = rating_colors.get(rating, "#6b7280")
+            llm_rows_html += f"""
+            <tr style="border-bottom:1px solid #e5e7eb;">
+              <td style="padding:8px;font-weight:bold;vertical-align:top;">{_html_escape(str(ticker))}</td>
+              <td style="padding:8px;vertical-align:top;">
+                <span style="color:{rc};font-weight:bold;">{_html_escape(rating)}</span>
+                <span style="color:#9ca3af;"> ({score:+.1f})</span>
+              </td>
+              <td style="padding:8px;vertical-align:top;font-size:12px;">
+                <div style="margin-bottom:4px;"><strong>Verdict:</strong> {_html_escape(reasoning)}</div>
+                <details style="margin-bottom:2px;"><summary style="cursor:pointer;color:#059669;font-size:11px;">Bull thesis</summary><div style="padding:4px 0;color:#374151;font-size:11px;">{_html_escape(bull)}</div></details>
+                <details style="margin-bottom:2px;"><summary style="cursor:pointer;color:#dc2626;font-size:11px;">Bear thesis</summary><div style="padding:4px 0;color:#374151;font-size:11px;">{_html_escape(bear)}</div></details>
+                <details><summary style="cursor:pointer;color:#2563eb;font-size:11px;">Risk assessment</summary><div style="padding:4px 0;color:#374151;font-size:11px;">{_html_escape(risk)}</div></details>
+              </td>
+            </tr>"""
+        if llm_rows_html:
+            n_analyzed = llm_agent_data.get("n_analyzed", 0)
+            llm_block = f"""
+  <h3 style="margin: 0 0 10px 0;">LLM Agent Analysis ({n_analyzed} tickers)</h3>
+  <div style="background:#f0fdf4;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
+    <table style="border-collapse:collapse;width:100%;font-size:13px;">
+      <thead>
+        <tr>
+          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;width:80px;">Ticker</th>
+          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;width:100px;">Rating</th>
+          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Analysis</th>
+        </tr>
+      </thead>
+      <tbody>{llm_rows_html}</tbody>
+    </table>
+  </div>
+"""
+
     pnl_block = ""
     if portfolio_pnl_history:
         latest = portfolio_pnl_history[-1]
@@ -764,6 +835,8 @@ def render_reports(
   </div>
 
   {model_block}
+
+  {llm_block}
 
   {pnl_block}
 

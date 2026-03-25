@@ -19,3 +19,7 @@ rich>=13.0.0,<15.0.0
 lxml>=4.9.0,<7.0.0
 html5lib>=1.1,<2.0.0
 joblib>=1.3.0,<2.0.0
+# News sentiment scoring (lightweight, no GPU, ~50KB)
+vaderSentiment>=3.3.0,<4.0.0
+# LLM agent layer (Groq free tier, OpenAI-compatible SDK, ~1MB)
+groq>=0.9.0,<1.0.0
