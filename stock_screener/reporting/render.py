@@ -142,6 +142,11 @@ def render_reports(
 
     # LLM Agent Analysis (text report)
     _llm_text = run_meta.get("llm_agent") if isinstance(run_meta, dict) else None
+    if isinstance(_llm_text, dict) and not _llm_text.get("decisions") and _llm_text.get("status") != "disabled":
+        _s = _llm_text.get("status", "unknown")
+        _r = _llm_text.get("reason", "")
+        lines.append(f"LLM AGENT: {_s.upper()}{(' — ' + _r) if _r else ''}")
+        lines.append("")
     if isinstance(_llm_text, dict) and _llm_text.get("decisions"):
         lines.append("LLM AGENT ANALYSIS")
         lines.append("-" * 78)
@@ -653,6 +658,17 @@ def render_reports(
     # LLM Agent Analysis block
     llm_block = ""
     llm_agent_data = run_meta.get("llm_agent") if isinstance(run_meta, dict) else None
+    if isinstance(llm_agent_data, dict) and not llm_agent_data.get("decisions"):
+        # Show status when LLM ran but produced no analysis
+        _llm_status = llm_agent_data.get("status", "unknown")
+        _llm_reason = llm_agent_data.get("reason", "")
+        if _llm_status != "disabled":
+            _status_label = {"skipped": "Skipped", "no_results": "No Results", "error": "Error"}.get(_llm_status, _llm_status)
+            llm_block = f"""
+  <div style="background:#fef3c7;border-radius:8px;padding:10px 14px;margin:0 0 18px 0;font-size:13px;">
+    <strong>LLM Agent:</strong> {_html_escape(_status_label)}{(' — ' + _html_escape(_llm_reason)) if _llm_reason else ''}
+  </div>
+"""
     if isinstance(llm_agent_data, dict) and llm_agent_data.get("decisions"):
         llm_rows_html = ""
         for ticker, info in llm_agent_data["decisions"].items():

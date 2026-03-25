@@ -57,12 +57,14 @@ def fetch_insider_features(
             col_map = {}
             for c in df.columns:
                 cl = str(c).lower().replace(" ", "_")
-                if "date" in cl or "start" in cl:
+                if cl in ("start_date", "date"):
                     col_map[c] = "date"
-                elif "shares" in cl:
+                elif cl == "shares":
                     col_map[c] = "shares"
-                elif "transaction" in cl or "text" in cl:
+                elif cl == "transaction":
                     col_map[c] = "transaction"
+                elif cl == "text":
+                    col_map[c] = "text"
             df = df.rename(columns=col_map)
 
             # Parse dates and filter to lookback window
@@ -77,14 +79,17 @@ def fetch_insider_features(
                     _save_cache(t, row, cache_dir)
                 continue
 
-            # Classify transactions as buy or sell
-            if "transaction" in df.columns:
-                txn_lower = df["transaction"].astype(str).str.lower()
-                is_buy = txn_lower.str.contains("purchase|buy|acquisition", na=False)
-                is_sell = txn_lower.str.contains("sale|sell|disposition", na=False)
-            else:
-                is_buy = pd.Series(False, index=df.index)
-                is_sell = pd.Series(False, index=df.index)
+            # Classify transactions as buy or sell.
+            # yfinance puts details in both 'transaction' and 'text' columns
+            # (one or both may be populated depending on version).
+            txn_text = pd.Series("", index=df.index)
+            for _col in ("transaction", "text"):
+                if _col in df.columns:
+                    _vals = df[_col].astype(str).str.lower().fillna("")
+                    txn_text = txn_text.where(txn_text != "", _vals)
+                    txn_text = txn_text.fillna("") + " " + _vals
+            is_buy = txn_text.str.contains("purchase|buy|acquisition", na=False)
+            is_sell = txn_text.str.contains("sale|sell|disposition", na=False)
 
             # Compute features
             shares_col = "shares" if "shares" in df.columns else None

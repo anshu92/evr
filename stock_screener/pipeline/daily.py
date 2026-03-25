@@ -2039,56 +2039,78 @@ def run_daily(cfg: Config, logger) -> None:
     if cfg.llm_agent_enabled and not screened.empty:
         try:
             from stock_screener.agents.trading_agent import analyze_candidates, blend_llm_scores
+            from stock_screener.agents.config import get_agent_config as _get_agent_config
 
-            _agent_candidates = []
-            for _t in screened.index[:cfg.dynamic_size_max_positions]:
-                _row = screened.loc[_t]
-                _agent_candidates.append({
-                    "ticker": str(_t),
-                    **{c: float(_row.get(c, float("nan"))) for c in [
-                        "pred_return", "pred_confidence", "pred_peak_days", "score",
-                        "last_close_cad", "ret_60d", "ret_5d", "vol_60d_ann", "rsi_14",
-                        "beta", "market_vol_regime", "market_trend_20d", "market_breadth",
-                        "news_sentiment_avg", "news_volume_5d",
-                        "insider_net_buys_90d", "insider_buy_ratio_90d",
-                    ]},
-                    "sector": str(_row.get("sector", "Unknown")),
-                })
-
-            _open = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
-            _portfolio_ctx = f"{len(_open)} open positions, ${state.cash_cad:.0f} cash"
-            if _open:
-                _portfolio_ctx += f", tickers: {', '.join(p.ticker for p in _open[:5])}"
-
-            _decisions = analyze_candidates(
-                _agent_candidates, portfolio_context=_portfolio_ctx, log=logger,
+            _agent_cfg = _get_agent_config()
+            _has_key = bool(_agent_cfg.get("api_key"))
+            logger.info(
+                "LLM agent: provider=%s, model=%s, api_key=%s, candidates=%d",
+                _agent_cfg.get("provider"), _agent_cfg.get("model"),
+                "set" if _has_key else "MISSING", min(len(screened), cfg.dynamic_size_max_positions),
             )
 
-            if _decisions:
-                screened = blend_llm_scores(
-                    screened, _decisions, score_col="score",
-                    ml_weight=cfg.llm_agent_ml_weight, llm_weight=cfg.llm_agent_llm_weight,
-                    log=logger,
+            if not _has_key:
+                run_meta["llm_agent"] = {"status": "skipped", "reason": "no API key configured"}
+                logger.warning("LLM agent: GROQ_API_KEY not set; skipping")
+            else:
+                _agent_candidates = []
+                for _t in screened.index[:cfg.dynamic_size_max_positions]:
+                    _row = screened.loc[_t]
+                    _agent_candidates.append({
+                        "ticker": str(_t),
+                        **{c: float(_row.get(c, float("nan"))) for c in [
+                            "pred_return", "pred_confidence", "pred_peak_days", "score",
+                            "last_close_cad", "ret_60d", "ret_5d", "vol_60d_ann", "rsi_14",
+                            "beta", "market_vol_regime", "market_trend_20d", "market_breadth",
+                            "news_sentiment_avg", "news_volume_5d",
+                            "insider_net_buys_90d", "insider_buy_ratio_90d",
+                        ]},
+                        "sector": str(_row.get("sector", "Unknown")),
+                    })
+
+                _open = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
+                _portfolio_ctx = f"{len(_open)} open positions, ${state.cash_cad:.0f} cash"
+                if _open:
+                    _portfolio_ctx += f", tickers: {', '.join(p.ticker for p in _open[:5])}"
+
+                _decisions = analyze_candidates(
+                    _agent_candidates, portfolio_context=_portfolio_ctx, log=logger,
                 )
-                screened = screened.sort_values("score", ascending=False)
-                run_meta["llm_agent"] = {
-                    "n_analyzed": len(_decisions),
-                    "decisions": {
-                        t: {
-                            "rating": d.rating,
-                            "score": d.score,
-                            "reasoning": d.reasoning,
-                            "bull_thesis": d.bull_thesis,
-                            "bear_thesis": d.bear_thesis,
-                            "risk_assessment": d.risk_assessment,
-                        }
-                        for t, d in _decisions.items()
-                    },
-                }
-                logger.info("LLM agent: blended scores for %d tickers", len(_decisions))
+
+                if _decisions:
+                    screened = blend_llm_scores(
+                        screened, _decisions, score_col="score",
+                        ml_weight=cfg.llm_agent_ml_weight, llm_weight=cfg.llm_agent_llm_weight,
+                        log=logger,
+                    )
+                    screened = screened.sort_values("score", ascending=False)
+                    run_meta["llm_agent"] = {
+                        "status": "success",
+                        "n_analyzed": len(_decisions),
+                        "decisions": {
+                            t: {
+                                "rating": d.rating,
+                                "score": d.score,
+                                "reasoning": d.reasoning,
+                                "bull_thesis": d.bull_thesis,
+                                "bear_thesis": d.bear_thesis,
+                                "risk_assessment": d.risk_assessment,
+                            }
+                            for t, d in _decisions.items()
+                        },
+                    }
+                    logger.info("LLM agent: blended scores for %d tickers", len(_decisions))
+                else:
+                    run_meta["llm_agent"] = {"status": "no_results", "reason": "API returned no decisions (check logs for warnings)"}
+                    logger.warning("LLM agent: analyze_candidates returned empty")
         except Exception as e:
+            run_meta["llm_agent"] = {"status": "error", "reason": str(e)}
             logger.warning("LLM agent layer failed (continuing without): %s", e)
         _check_runtime_budget(started_utc, cfg, logger, "llm_agent")
+    elif cfg.llm_agent_enabled and screened.empty:
+        run_meta["llm_agent"] = {"status": "skipped", "reason": "no screened tickers"}
+    elif not cfg.llm_agent_enabled:
+        run_meta["llm_agent"] = {"status": "disabled"}
 
     alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
 
