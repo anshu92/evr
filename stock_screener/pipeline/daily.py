@@ -3305,16 +3305,23 @@ def run_intraday(cfg, logger) -> None:
     reports_dir = ensure_dir(cfg.reports_dir)
     intraday_data_dir = Path(cache_dir) / "intraday"
 
-    # ── Staleness guard ──────────────────────────────────────────────
+    # ── Load caches first (needed by _empty_report) ────────────────
     try:
         last_meta = read_json(cache_dir / "last_run_meta.json")
     except (FileNotFoundError, OSError):
         last_meta = None
+    try:
+        intraday_cache = read_json(cache_dir / "intraday_cache.json") or {}
+    except (FileNotFoundError, OSError):
+        intraday_cache = {}
+
     def _empty_report(status: str, msg: str) -> None:
         """Render a report with current positions so the email is never blank."""
         _holdings = pd.DataFrame()
+        _pnl_history = None
         try:
             _state = load_portfolio_state(cfg.portfolio_state_path, initial_cash_cad=cfg.portfolio_budget_cad)
+            _pnl_history = getattr(_state, "pnl_history", None)
             _rows = []
             for _p in _state.positions:
                 if getattr(_p, "status", "OPEN") != "OPEN":
@@ -3339,11 +3346,12 @@ def run_intraday(cfg, logger) -> None:
             weights=_holdings,
             trade_actions=[],
             logger=logger,
-            portfolio_pnl_history=getattr(_state, "pnl_history", None) if "_state" in dir() else None,
-            fx_usdcad_rate=intraday_cache.get("fx_usdcad") if intraday_cache else None,
+            portfolio_pnl_history=_pnl_history,
+            fx_usdcad_rate=intraday_cache.get("fx_usdcad"),
         )
         logger.warning(msg)
 
+    # ── Staleness guard ──────────────────────────────────────────────
     if not last_meta:
         _empty_report("no_daily_run", "No daily run metadata found; skipping intraday run")
         return
@@ -3358,12 +3366,6 @@ def run_intraday(cfg, logger) -> None:
             logger.info("Daily run age: %.1fh — OK", age_hours)
         except Exception as e:
             logger.warning("Could not parse daily run timestamp: %s", e)
-
-    # ── Load daily cache ─────────────────────────────────────────────
-    try:
-        intraday_cache = read_json(cache_dir / "intraday_cache.json") or {}
-    except (FileNotFoundError, OSError):
-        intraday_cache = {}
 
     # Load full screened features and target weights from parquet
     screened = pd.DataFrame()
@@ -3570,8 +3572,12 @@ def run_intraday(cfg, logger) -> None:
         holdings_weights["target_weight"] = holdings_weights["weight"]
     else:
         holdings_weights["target_weight"] = pd.NA
-    holdings_weights["shares"] = [shares_by_ticker.get(str(t).upper(), pd.NA) for t in holdings_weights.index.astype(str)]
-    holdings_weights["position_value_cad"] = [market_value_by_ticker.get(str(t).upper(), pd.NA) for t in holdings_weights.index.astype(str)]
+    holdings_weights["shares"] = holdings_weights.index.astype(str).map(
+        lambda t: shares_by_ticker.get(str(t).upper(), pd.NA)
+    )
+    holdings_weights["position_value_cad"] = holdings_weights.index.astype(str).map(
+        lambda t: market_value_by_ticker.get(str(t).upper(), pd.NA)
+    )
     if equity_cad_live > 0:
         holdings_weights["actual_weight"] = pd.to_numeric(holdings_weights["position_value_cad"], errors="coerce") / equity_cad_live
     else:
@@ -3609,7 +3615,7 @@ def run_intraday(cfg, logger) -> None:
     write_json(cache_dir / "last_intraday_meta.json", {
         "started_utc": started_utc.isoformat(),
         "elapsed_seconds": elapsed,
-        "n_positions": len(position_data),
+        "n_positions": len(open_after),
         "n_exits": len(exit_actions),
         "n_rotations": len(rotation_actions),
         "n_entries": len(entry_actions),
@@ -3619,7 +3625,7 @@ def run_intraday(cfg, logger) -> None:
     })
     logger.info("Intraday complete: %d exits, %d rotations, %d entries, %d holds, %d open (%.1fs)",
                 len(exit_actions), len(rotation_actions), len(entry_actions),
-                len(hold_actions), len(position_data), elapsed)
+                len(hold_actions), len(open_after), elapsed)
 
 
 # Backward compatibility alias

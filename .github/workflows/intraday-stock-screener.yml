@@ -120,7 +120,17 @@ jobs:
             cache/last_intraday_meta.json
           retention-days: 7
 
-      - name: Send monitoring email
+      - name: Build email attachment list
+        if: always()
+        id: attachments
+        run: |
+          files=""
+          for f in reports/daily_report.txt reports/portfolio_weights.csv reports/trade_actions.json; do
+            [ -f "$f" ] && files="${files:+$files,}$f"
+          done
+          echo "list=${files:-reports/daily_report.txt}" >> $GITHUB_OUTPUT
+
+      - name: Send intraday email
         if: always()
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
@@ -134,4 +144,4 @@ jobs:
           to: ${{ secrets.EMAIL_TO || secrets.EMAIL_USERNAME }}
           from: Stock Screener Bot <${{ secrets.EMAIL_USERNAME }}>
           html_body: file://reports/daily_email.html
-          attachments: reports/daily_report.txt,reports/portfolio_weights.csv,reports/trade_actions.json
+          attachments: ${{ steps.attachments.outputs.list }}
