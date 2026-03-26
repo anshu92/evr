@@ -2053,19 +2053,39 @@ def run_daily(cfg: Config, logger) -> None:
                 run_meta["llm_agent"] = {"status": "skipped", "reason": "no API key configured"}
                 logger.warning("LLM agent: GROQ_API_KEY not set; skipping")
             else:
+                # Fetch actual news headlines for LLM context
+                from stock_screener.data.news import fetch_ticker_news
+                _llm_tickers = list(screened.index[:cfg.dynamic_size_max_positions])
+                _news_by_ticker: dict[str, list[dict]] = {}
+                for _nt in _llm_tickers:
+                    try:
+                        _news_by_ticker[str(_nt)] = fetch_ticker_news(str(_nt), logger=logger)[:5]
+                    except Exception:
+                        _news_by_ticker[str(_nt)] = []
+
                 _agent_candidates = []
-                for _t in screened.index[:cfg.dynamic_size_max_positions]:
+                for _t in _llm_tickers:
                     _row = screened.loc[_t]
                     _agent_candidates.append({
                         "ticker": str(_t),
                         **{c: float(_row.get(c, float("nan"))) for c in [
                             "pred_return", "pred_confidence", "pred_peak_days", "score",
-                            "last_close_cad", "ret_60d", "ret_5d", "vol_60d_ann", "rsi_14",
-                            "beta", "market_vol_regime", "market_trend_20d", "market_breadth",
+                            "last_close_cad", "ret_60d", "ret_5d", "ret_10d", "ret_20d", "ret_120d",
+                            "vol_20d_ann", "vol_60d_ann", "rsi_14",
+                            "beta", "log_market_cap",
+                            "ma20_ratio", "ma50_ratio", "ma200_ratio",
+                            "drawdown_60d", "dist_52w_high", "dist_52w_low",
+                            "market_vol_regime", "market_trend_20d", "market_breadth",
                             "news_sentiment_avg", "news_volume_5d",
-                            "insider_net_buys_90d", "insider_buy_ratio_90d",
+                            "insider_net_buys_90d", "insider_buy_ratio_90d", "insider_activity_recency",
+                            "trailing_pe", "forward_pe", "price_to_book",
+                            "profit_margins", "return_on_equity", "debt_to_equity",
+                            "revenue_growth", "earnings_growth",
+                            "dividend_yield", "recommendation_mean", "num_analyst_opinions",
                         ]},
                         "sector": str(_row.get("sector", "Unknown")),
+                        "industry": str(_row.get("industry", "Unknown")),
+                        "news_headlines": _news_by_ticker.get(str(_t), []),
                     })
 
                 # Load portfolio state early (cheap JSON read) for LLM context.

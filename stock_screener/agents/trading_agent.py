@@ -41,28 +41,48 @@ class AgentDecision:
 _ANALYST_PROMPT = """You are a senior equity analyst. Analyze this stock for a SHORT-TERM trade (1-5 day holding period).
 
 Ticker: {ticker}
-ML Predicted Return (5d): {pred_return:.2%}
-ML Confidence: {confidence:.1%}
-Predicted Peak Day: {peak_days:.1f}
+Sector: {sector} | Industry: {industry}
 
-Key Metrics:
+ML Model Signal:
+- Predicted Return (5d): {pred_return:.2%}
+- Confidence: {confidence:.1%}
+- Predicted Peak Day: {peak_days:.1f}
+
+Price & Momentum:
 - Price: ${price:.2f} CAD
-- 60d Return: {ret_60d:.2%}
-- 5d Return: {ret_5d:.2%}
-- Volatility (60d ann): {vol:.2%}
+- 5d Return: {ret_5d:.2%} | 10d: {ret_10d:.2%} | 20d: {ret_20d:.2%} | 60d: {ret_60d:.2%} | 120d: {ret_120d:.2%}
 - RSI(14): {rsi:.1f}
-- Beta: {beta:.2f}
-- Sector: {sector}
+- vs 20d MA: {ma20_ratio:.2%} | vs 50d MA: {ma50_ratio:.2%} | vs 200d MA: {ma200_ratio:.2%}
+- Drawdown from 60d high: {drawdown_60d:.2%}
+- Distance from 52w high: {dist_52w_high:.2%} | 52w low: {dist_52w_low:.2%}
 
-News Sentiment: {news_sentiment}
+Risk:
+- Volatility (20d ann): {vol_20d:.2%} | (60d ann): {vol_60d:.2%}
+- Beta: {beta:.2f}
+
+Fundamentals:
+- Market Cap: {market_cap}
+- Trailing P/E: {trailing_pe} | Forward P/E: {forward_pe}
+- Price/Book: {price_to_book}
+- Profit Margin: {profit_margins} | ROE: {roe}
+- Debt/Equity: {debt_to_equity}
+- Revenue Growth: {revenue_growth} | Earnings Growth: {earnings_growth}
+- Dividend Yield: {dividend_yield}
+- Analyst Consensus: {analyst_consensus} ({num_analysts} analysts)
+
 Insider Activity: {insider_activity}
+
+Recent News Headlines:
+{news_headlines}
+
+News Sentiment (VADER): {news_sentiment}
 
 Market Conditions:
 - Vol Regime: {vol_regime:.2f} (1.0=normal, >1.2=high stress)
 - Market Trend (20d): {market_trend:.2%}
 - Market Breadth: {breadth:.1%}
 
-Provide a concise 2-3 sentence analysis covering the key opportunity and risk. Be specific about the short-term catalyst or headwind."""
+Provide a concise 2-3 sentence analysis covering the key opportunity and risk. Be specific about the short-term catalyst or headwind based on the news and data above."""
 
 _BULL_PROMPT = """You are a BULL researcher arguing FOR buying {ticker}.
 
@@ -167,14 +187,71 @@ def _format_news_sentiment(features: dict) -> str:
     return f"{label} ({avg:.2f}), {int(vol)} articles in 5d"
 
 
+def _format_news_headlines(features: dict) -> str:
+    """Format actual news headlines for the LLM prompt."""
+    headlines = features.get("news_headlines", [])
+    if not headlines:
+        return "No recent news available"
+    lines = []
+    for i, article in enumerate(headlines[:5], 1):
+        title = article.get("title", "").strip()
+        publisher = article.get("publisher", "")
+        date = article.get("publish_date", "")
+        if not title:
+            continue
+        date_str = f" ({date[:10]})" if date else ""
+        pub_str = f" — {publisher}" if publisher else ""
+        lines.append(f"  {i}. {title}{pub_str}{date_str}")
+    return "\n".join(lines) if lines else "No recent news available"
+
+
 def _format_insider_activity(features: dict) -> str:
     net = features.get("insider_net_buys_90d")
     ratio = features.get("insider_buy_ratio_90d")
+    recency = features.get("insider_activity_recency")
     if net is None or (net != net):
         return "No insider data"
     label = "Net buying" if net > 0 else "Net selling" if net < 0 else "Neutral"
     ratio_str = f", buy ratio {ratio:.0%}" if ratio is not None and ratio == ratio else ""
-    return f"{label} ({net:+,.0f} shares 90d){ratio_str}"
+    recency_str = f", {int(recency)}d ago" if recency is not None and recency == recency else ""
+    return f"{label} ({net:+,.0f} shares 90d{ratio_str}{recency_str})"
+
+
+def _fmt_val(v, fmt: str = ".2f", suffix: str = "") -> str:
+    """Format a numeric value, returning 'N/A' for NaN/None."""
+    if v is None:
+        return "N/A"
+    try:
+        f = float(v)
+        if f != f:  # NaN
+            return "N/A"
+        return f"{f:{fmt}}{suffix}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _format_market_cap(features: dict) -> str:
+    log_cap = features.get("log_market_cap")
+    if log_cap is None or (log_cap != log_cap):
+        return "N/A"
+    cap = 10 ** float(log_cap)
+    if cap >= 1e12:
+        return f"${cap/1e12:.1f}T"
+    if cap >= 1e9:
+        return f"${cap/1e9:.1f}B"
+    if cap >= 1e6:
+        return f"${cap/1e6:.0f}M"
+    return f"${cap:,.0f}"
+
+
+def _format_analyst_consensus(features: dict) -> str:
+    rec = features.get("recommendation_mean")
+    if rec is None or (rec != rec):
+        return "N/A"
+    rec = float(rec)
+    # yfinance: 1=Strong Buy, 2=Buy, 3=Hold, 4=Sell, 5=Strong Sell
+    label = "Strong Buy" if rec <= 1.5 else "Buy" if rec <= 2.5 else "Hold" if rec <= 3.5 else "Sell" if rec <= 4.5 else "Strong Sell"
+    return f"{label} ({rec:.1f})"
 
 
 def analyze_ticker(
@@ -196,12 +273,36 @@ def analyze_ticker(
         confidence=features.get("pred_confidence", 0.5),
         peak_days=features.get("pred_peak_days", 3),
         price=features.get("last_close_cad", 0),
-        ret_60d=features.get("ret_60d", 0),
         ret_5d=features.get("ret_5d", 0),
-        vol=features.get("vol_60d_ann", 0.2),
+        ret_10d=features.get("ret_10d", 0),
+        ret_20d=features.get("ret_20d", 0),
+        ret_60d=features.get("ret_60d", 0),
+        ret_120d=features.get("ret_120d", 0),
+        vol_20d=features.get("vol_20d_ann", 0.2),
+        vol_60d=features.get("vol_60d_ann", 0.2),
         rsi=features.get("rsi_14", 50),
         beta=features.get("beta", 1.0),
+        ma20_ratio=features.get("ma20_ratio", 0),
+        ma50_ratio=features.get("ma50_ratio", 0),
+        ma200_ratio=features.get("ma200_ratio", 0),
+        drawdown_60d=features.get("drawdown_60d", 0),
+        dist_52w_high=features.get("dist_52w_high", 0),
+        dist_52w_low=features.get("dist_52w_low", 0),
         sector=features.get("sector", "Unknown"),
+        industry=features.get("industry", "Unknown"),
+        market_cap=_format_market_cap(features),
+        trailing_pe=_fmt_val(features.get("trailing_pe")),
+        forward_pe=_fmt_val(features.get("forward_pe")),
+        price_to_book=_fmt_val(features.get("price_to_book")),
+        profit_margins=_fmt_val(features.get("profit_margins"), ".1%"),
+        roe=_fmt_val(features.get("return_on_equity"), ".1%"),
+        debt_to_equity=_fmt_val(features.get("debt_to_equity")),
+        revenue_growth=_fmt_val(features.get("revenue_growth"), ".1%"),
+        earnings_growth=_fmt_val(features.get("earnings_growth"), ".1%"),
+        dividend_yield=_fmt_val(features.get("dividend_yield"), ".2%"),
+        analyst_consensus=_format_analyst_consensus(features),
+        num_analysts=_fmt_val(features.get("num_analyst_opinions"), ".0f"),
+        news_headlines=_format_news_headlines(features),
         news_sentiment=_format_news_sentiment(features),
         insider_activity=_format_insider_activity(features),
         vol_regime=features.get("market_vol_regime", 1.0),
