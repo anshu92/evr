@@ -829,6 +829,69 @@ def render_reports(
   </table>
 """
 
+    # ── Risk dashboard + settlement warnings ───────────────────────
+    risk_block = ""
+    _risk_alerts: list[str] = []
+    _risk_items: list[str] = []
+
+    # Data freshness
+    _is_intraday = run_meta.get("intraday", False) if isinstance(run_meta, dict) else False
+    if _is_intraday:
+        _risk_items.append("<strong>Data:</strong> Intraday 1h bars (may be 15-20 min delayed via yfinance)")
+    else:
+        _risk_items.append("<strong>Data:</strong> Daily closing bars (finalized)")
+
+    # Settlement warning on BUY actions
+    _n_buys = sum(1 for a in (trade_actions or []) if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) == "BUY")
+    _n_sells = sum(1 for a in (trade_actions or []) if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) in ("SELL", "SELL_PARTIAL"))
+    if _n_buys > 0 and _n_sells > 0:
+        _risk_alerts.append("T+2 Settlement: Sell proceeds may not settle for 2 business days. Ensure cash is available before placing buy orders.")
+    if _n_buys > 0:
+        _risk_items.append(f"<strong>Orders:</strong> {_n_buys} BUY, {_n_sells} SELL recommended")
+
+    # Drawdown check from P&L history
+    if portfolio_pnl_history and len(portfolio_pnl_history) >= 2:
+        _equities = [float(h.get("equity_cad", 0)) for h in portfolio_pnl_history if h.get("equity_cad")]
+        if _equities:
+            _peak = max(_equities)
+            _current = _equities[-1]
+            _dd = (_current / _peak - 1.0) if _peak > 0 else 0
+            _risk_items.append(f"<strong>Drawdown:</strong> {_dd * 100:.1f}% from peak (${_peak:,.0f} &rarr; ${_current:,.0f})")
+            if _dd < -0.05:
+                _risk_alerts.append(f"Drawdown alert: Portfolio is {_dd*100:.1f}% below peak equity. Consider reducing position sizes.")
+            if _dd < -0.10:
+                _risk_alerts.append("SEVERE DRAWDOWN: Portfolio is >10% below peak. Review all positions and consider halting new entries.")
+
+    # Kill switch status
+    _halt = False
+    try:
+        import os as _os
+        _halt = _os.getenv("TRADING_HALT", "").strip().lower() in ("1", "true", "yes")
+    except Exception:
+        pass
+    if _halt:
+        _risk_alerts.append("TRADING HALTED: TRADING_HALT is active. No new trades will be executed.")
+
+    # LLM agent status
+    _llm_status = (run_meta.get("llm_agent", {}) or {}).get("status", "disabled") if isinstance(run_meta, dict) else "disabled"
+    _risk_items.append(f"<strong>LLM Agent:</strong> {_llm_status}")
+
+    # Build risk block HTML
+    _alerts_html = ""
+    if _risk_alerts:
+        _alerts_html = "".join(
+            f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:0 0 8px 0;font-size:13px;color:#991b1b;">{_html_escape(a)}</div>'
+            for a in _risk_alerts
+        )
+    _items_html = "<br/>".join(_risk_items) if _risk_items else ""
+    if _alerts_html or _items_html:
+        risk_block = f"""
+  <div style="margin:0 0 18px 0;">
+    {_alerts_html}
+    <div style="background:#f8fafc;border-radius:8px;padding:10px 14px;font-size:13px;">{_items_html}</div>
+  </div>
+"""
+
     total_scanned = total_processed if total_processed is not None else len(screened)
     portfolio_label = f"{len(weights):,} tickers (current holdings)" if not weights.empty else "No current holdings"
     html = f"""<html>
@@ -842,6 +905,8 @@ def render_reports(
   <div style="background:#fef3c7;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
     {actions_html}
   </div>
+
+  {risk_block}
 
   <div style="background:#f3f4f6;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
     <div><strong>Universe:</strong> US + TSX</div>

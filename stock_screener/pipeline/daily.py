@@ -1535,6 +1535,50 @@ def _trade_actions_to_event_payloads(
     return payloads
 
 
+def _append_pnl_snapshot(state, *, prices_cad=None, now=None) -> None:
+    """Append a P&L snapshot to state.pnl_history.
+
+    Called before each state save so P&L accumulates over time.
+    """
+    if now is None:
+        now = datetime.now(tz=timezone.utc)
+    open_positions = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"]
+    n_open = len(open_positions)
+    n_closed = len([p for p in state.positions if getattr(p, "status", "") != "OPEN"])
+
+    open_mkt_value = 0.0
+    realized_pl = 0.0
+    unrealized_pl = 0.0
+    for p in open_positions:
+        # Use prices_cad if available, otherwise estimate from entry price
+        if prices_cad is not None and hasattr(prices_cad, "get"):
+            px = float(prices_cad.get(p.ticker, p.entry_price))
+        else:
+            px = p.entry_price
+        mv = px * float(p.shares)
+        open_mkt_value += mv
+        unrealized_pl += (px - p.entry_price) * float(p.shares)
+
+    equity = float(state.cash_cad) + open_mkt_value
+    net_pl = equity - 500.0  # vs initial budget (config default)
+
+    entry = {
+        "asof_utc": now.isoformat(),
+        "equity_cad": equity,
+        "cash_cad": float(state.cash_cad),
+        "open_market_value_cad": open_mkt_value,
+        "realized_pl_cad": realized_pl,
+        "unrealized_pl_cad": unrealized_pl,
+        "net_pl_cad": net_pl,
+        "n_open": n_open,
+        "n_closed": n_closed,
+    }
+    state.pnl_history.append(entry)
+    # Keep at most 365 entries
+    if len(state.pnl_history) > 365:
+        state.pnl_history = state.pnl_history[-365:]
+
+
 def _persist_state_transition_or_fail(
     *,
     state_path: Path,
@@ -1548,14 +1592,31 @@ def _persist_state_transition_or_fail(
     events = _trade_actions_to_event_payloads(actions, source=source, ts_utc=now)
     if events:
         append_portfolio_events(event_log_path, events)
+    # Append P&L snapshot before saving (so history accumulates)
+    _append_pnl_snapshot(state, prices_cad=None, now=now)
     save_portfolio_state(state_path, state)
     return len(events)
+
+
+def _check_kill_switch(logger) -> bool:
+    """Check if trading is halted via TRADING_HALT env var or marker file."""
+    import os
+    if os.getenv("TRADING_HALT", "").strip().lower() in ("1", "true", "yes"):
+        logger.warning("KILL SWITCH: TRADING_HALT=1 — pipeline halted")
+        return True
+    halt_file = Path("HALT_TRADING")
+    if halt_file.exists():
+        logger.warning("KILL SWITCH: HALT_TRADING file exists — pipeline halted")
+        return True
+    return False
 
 
 def run_daily(cfg: Config, logger) -> None:
     """Run the daily screener + weights + reporting pipeline."""
 
     started_utc = datetime.now(tz=timezone.utc)
+    if _check_kill_switch(logger):
+        return
     state_path = _resolve_portfolio_state_path(cfg.portfolio_state_path)
     event_log_path = resolve_portfolio_event_log_path(state_path)
     cache_dir = ensure_dir(cfg.cache_dir)
@@ -3432,6 +3493,9 @@ def run_intraday(cfg, logger) -> None:
 
     Designed to complete in <3 minutes.
     """
+    if _check_kill_switch(logger):
+        return
+
     from pathlib import Path
     from stock_screener.data.prices import download_intraday_prices, get_latest_prices
     from stock_screener.portfolio.state import load_portfolio_state, save_portfolio_state
@@ -3806,6 +3870,7 @@ def run_intraday(cfg, logger) -> None:
         logger.info("No target weights cached; skipping entries/rotation")
 
     # ── 3. Persist state ─────────────────────────────────────────────
+    _append_pnl_snapshot(state, prices_cad=prices_cad, now=started_utc)
     save_portfolio_state(cfg.portfolio_state_path, state)
 
     # ── 4. Report — use same render_reports() as daily pipeline ─────

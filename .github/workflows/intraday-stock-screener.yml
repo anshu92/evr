@@ -23,8 +23,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: intraday-stock-screener
-  cancel-in-progress: true  # OK to skip stale intraday runs
+  group: stock-screener-pipeline  # shared with daily to prevent state race conditions
+  cancel-in-progress: true  # OK to skip stale intraday runs if daily is running
 
 permissions:
   contents: read

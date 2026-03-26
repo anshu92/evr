@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: daily-stock-screener
+  group: stock-screener-pipeline  # shared with intraday to prevent state race conditions
   cancel-in-progress: false
 
 permissions:
