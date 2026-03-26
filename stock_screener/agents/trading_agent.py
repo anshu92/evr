@@ -77,6 +77,7 @@ Recent News Headlines:
 
 News Sentiment (VADER): {news_sentiment}
 
+{intraday_section}
 Market Conditions:
 - Vol Regime: {vol_regime:.2f} (1.0=normal, >1.2=high stress)
 - Market Trend (20d): {market_trend:.2%}
@@ -244,6 +245,26 @@ def _format_market_cap(features: dict) -> str:
     return f"${cap:,.0f}"
 
 
+def _format_intraday_section(features: dict) -> str:
+    """Format intraday price action if available."""
+    change = features.get("intraday_change")
+    if change is None or (change != change):
+        return ""
+    last = features.get("intraday_last")
+    high = features.get("intraday_high")
+    low = features.get("intraday_low")
+    open_px = features.get("intraday_open_today")
+    bars = features.get("bars_today", 0)
+    lines = ["Intraday Price Action (live):"]
+    if open_px and last:
+        lines.append(f"- Today's range: {_fmt_val(open_px)} open → {_fmt_val(last)} last ({change:+.2%})")
+    if high and low:
+        lines.append(f"- Intraday high/low: {_fmt_val(high)} / {_fmt_val(low)}")
+    if bars:
+        lines.append(f"- Bars observed: {int(bars)}h")
+    return "\n".join(lines)
+
+
 def _format_analyst_consensus(features: dict) -> str:
     rec = features.get("recommendation_mean")
     if rec is None or (rec != rec):
@@ -304,6 +325,7 @@ def analyze_ticker(
         num_analysts=_fmt_val(features.get("num_analyst_opinions"), ".0f"),
         news_headlines=_format_news_headlines(features),
         news_sentiment=_format_news_sentiment(features),
+        intraday_section=_format_intraday_section(features),
         insider_activity=_format_insider_activity(features),
         vol_regime=features.get("market_vol_regime", 1.0),
         market_trend=features.get("market_trend_20d", 0),

@@ -3574,6 +3574,132 @@ def run_intraday(cfg, logger) -> None:
             if str(t) in prices_cad.index:
                 screened.loc[t, "last_close_cad"] = prices_cad[str(t)]
 
+    # ── Intraday LLM agent analysis (fail-soft) ─────────────────────
+    run_meta_intraday = {
+        "intraday": True,
+        "started_utc": started_utc.isoformat(),
+        "label_horizon_days": getattr(cfg, "label_horizon_days", 5),
+    }
+    if cfg.llm_agent_enabled and not screened.empty:
+        try:
+            from stock_screener.agents.trading_agent import analyze_candidates, blend_llm_scores
+            from stock_screener.agents.config import get_agent_config as _get_agent_config
+            from stock_screener.data.news import fetch_ticker_news
+
+            _agent_cfg = _get_agent_config()
+            _has_key = bool(_agent_cfg.get("api_key"))
+            _llm_tickers = list(screened.index[:cfg.dynamic_size_max_positions])
+            logger.info("Intraday LLM agent: provider=%s, key=%s, tickers=%d",
+                        _agent_cfg.get("provider"), "set" if _has_key else "MISSING", len(_llm_tickers))
+
+            if not _has_key:
+                run_meta_intraday["llm_agent"] = {"status": "skipped", "reason": "no API key"}
+            else:
+                # Compute intraday price action from 1h bars for each ticker
+                _intraday_context: dict[str, dict] = {}
+                for _t in _llm_tickers:
+                    _ctx: dict = {}
+                    try:
+                        if (str(_t), "Close") in intraday_prices.columns:
+                            _bars = intraday_prices[(str(_t), "Close")].dropna()
+                            if len(_bars) >= 2:
+                                _ctx["intraday_last"] = float(_bars.iloc[-1])
+                                _ctx["intraday_open_today"] = float(_bars.iloc[-min(7, len(_bars))])  # ~today's open
+                                _ctx["intraday_high"] = float(_bars.iloc[-min(7, len(_bars)):].max())
+                                _ctx["intraday_low"] = float(_bars.iloc[-min(7, len(_bars)):].min())
+                                _ctx["intraday_change"] = float(_bars.iloc[-1] / _bars.iloc[-2] - 1.0)
+                                _ctx["bars_today"] = min(7, len(_bars))
+                    except Exception:
+                        pass
+                    _intraday_context[str(_t)] = _ctx
+
+                # Fetch fresh news
+                _news_by_ticker: dict[str, list] = {}
+                for _nt in _llm_tickers:
+                    try:
+                        _news_by_ticker[str(_nt)] = fetch_ticker_news(str(_nt), logger=logger)[:5]
+                    except Exception:
+                        _news_by_ticker[str(_nt)] = []
+
+                # Build candidate list with live data
+                _agent_candidates = []
+                for _t in _llm_tickers:
+                    _row = screened.loc[_t]
+                    _ic = _intraday_context.get(str(_t), {})
+                    _candidate = {
+                        "ticker": str(_t),
+                        **{c: float(_row.get(c, float("nan"))) for c in [
+                            "pred_return", "pred_confidence", "pred_peak_days", "score",
+                            "last_close_cad", "ret_60d", "ret_5d", "ret_10d", "ret_20d", "ret_120d",
+                            "vol_20d_ann", "vol_60d_ann", "rsi_14",
+                            "beta", "log_market_cap",
+                            "ma20_ratio", "ma50_ratio", "ma200_ratio",
+                            "drawdown_60d", "dist_52w_high", "dist_52w_low",
+                            "market_vol_regime", "market_trend_20d", "market_breadth",
+                            "news_sentiment_avg", "news_volume_5d",
+                            "insider_net_buys_90d", "insider_buy_ratio_90d", "insider_activity_recency",
+                            "trailing_pe", "forward_pe", "price_to_book",
+                            "profit_margins", "return_on_equity", "debt_to_equity",
+                            "revenue_growth", "earnings_growth",
+                            "dividend_yield", "recommendation_mean", "num_analyst_opinions",
+                        ]},
+                        "sector": str(_row.get("sector", "Unknown")),
+                        "industry": str(_row.get("industry", "Unknown")),
+                        "news_headlines": _news_by_ticker.get(str(_t), []),
+                    }
+                    # Override last_close_cad with live intraday price
+                    if str(_t) in prices_cad.index:
+                        _candidate["last_close_cad"] = float(prices_cad[str(_t)])
+                    # Add intraday context
+                    _candidate.update(_ic)
+                    _agent_candidates.append(_candidate)
+
+                # Portfolio context
+                _portfolio_ctx = f"{len(open_positions)} open positions, ${state.cash_cad:.0f} cash"
+                if open_positions:
+                    _held_pnl = []
+                    for _p in open_positions[:5]:
+                        _px = float(prices_cad.get(_p.ticker, float("nan")))
+                        if pd.notna(_px) and _p.entry_price > 0:
+                            _pnl = (_px / _p.entry_price - 1.0) * 100
+                            _held_pnl.append(f"{_p.ticker} {_pnl:+.1f}%")
+                        else:
+                            _held_pnl.append(_p.ticker)
+                    _portfolio_ctx += f", holdings: {', '.join(_held_pnl)}"
+
+                _decisions = analyze_candidates(
+                    _agent_candidates, portfolio_context=_portfolio_ctx, log=logger,
+                )
+
+                if _decisions:
+                    screened = blend_llm_scores(
+                        screened, _decisions, score_col="score",
+                        ml_weight=cfg.llm_agent_ml_weight, llm_weight=cfg.llm_agent_llm_weight,
+                        log=logger,
+                    )
+                    screened = screened.sort_values("score", ascending=False)
+                    run_meta_intraday["llm_agent"] = {
+                        "status": "success",
+                        "n_analyzed": len(_decisions),
+                        "decisions": {
+                            t: {
+                                "rating": d.rating,
+                                "score": d.score,
+                                "reasoning": d.reasoning,
+                                "bull_thesis": d.bull_thesis,
+                                "bear_thesis": d.bear_thesis,
+                                "risk_assessment": d.risk_assessment,
+                            }
+                            for t, d in _decisions.items()
+                        },
+                    }
+                    logger.info("Intraday LLM: blended scores for %d tickers", len(_decisions))
+                else:
+                    run_meta_intraday["llm_agent"] = {"status": "no_results", "reason": "API returned empty"}
+        except Exception as e:
+            run_meta_intraday["llm_agent"] = {"status": "error", "reason": str(e)}
+            logger.warning("Intraday LLM agent failed: %s", e)
+
     # ── Build PortfolioManager ───────────────────────────────────────
     effective_portfolio_size = intraday_cache.get("portfolio_size", cfg.dynamic_size_max_positions)
     pm = PortfolioManager(
@@ -3727,11 +3853,6 @@ def run_intraday(cfg, logger) -> None:
     )
 
     all_trade_actions = exit_actions + rotation_actions + entry_actions + hold_actions
-    run_meta_intraday = {
-        "intraday": True,
-        "started_utc": started_utc.isoformat(),
-        "label_horizon_days": cfg.label_horizon_days,
-    }
 
     render_reports(
         reports_dir=Path(reports_dir),
