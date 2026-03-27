@@ -132,6 +132,11 @@ class AgentDecision:
     debate_history: list[tuple[str, str]] = field(default_factory=list)
     risk_debate: dict[str, str] | None = None
     analyst_reports: dict[str, str] | None = None
+    # LLM-primary mode fields (populated when primary_mode=True)
+    position_size: str = "MEDIUM"  # SMALL | MEDIUM | FULL | NONE
+    target_weight: float | None = None  # 0.0-0.20, LLM-suggested weight
+    suggested_stop_loss: float | None = None  # e.g., 0.08
+    expected_hold_days: int | None = None  # 1-5
 
 
 @dataclass
@@ -229,6 +234,53 @@ RATING: [BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL]
 SCORE: [number from -1.0 to 1.0]
 REASON: [one sentence]"""
 
+# -- LLM-primary mode prompts (binding decisions) -------------------------
+
+_PM_PROMPT_PRIMARY = """You are a portfolio manager making a BINDING decision on {ticker}. Your output directly determines trading.
+
+Analyst report: {analyst_report}
+Bull case: {bull_case}
+Bear case: {bear_case}
+Risk assessment: {risk_assessment}
+
+ML model predicts {pred_return:.2%} return over 5 days with {confidence:.1%} confidence.
+Current portfolio: {portfolio_context}
+
+Respond with EXACTLY this format (no extra text):
+RATING: [BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL]
+SCORE: [number from -1.0 to 1.0]
+POSITION_SIZE: [SMALL|MEDIUM|FULL|NONE]
+TARGET_WEIGHT: [decimal 0.0 to 0.20, your suggested portfolio weight]
+STOP_LOSS: [decimal, e.g. 0.08 for 8% stop]
+HOLD_DAYS: [integer 1-5, expected holding period]
+REASON: [one sentence]"""
+
+_PORTFOLIO_PROMPT_PRIMARY = """You are a portfolio strategist with BINDING authority over the final trading portfolio.
+
+CANDIDATES (ranked by score):
+{candidate_table}
+
+CURRENT PORTFOLIO:
+{portfolio_context}
+
+MARKET CONDITIONS:
+- Vol Regime: {vol_regime:.2f} (1.0=normal, >1.2=high stress)
+- Market Trend (20d): {market_trend:.2%}
+- Market Breadth: {breadth:.1%}
+
+CONSTRAINTS: Max {max_positions} positions, 1-5 day hold, ${budget:.0f} CAD
+HARD LIMITS (cannot override): Max 20% per position, 8% stop-loss, 10% portfolio drawdown
+
+Your output DIRECTLY determines portfolio weights. Be precise.
+
+Respond with EXACTLY this format:
+CONCENTRATION_RISK: [NONE|LOW|HIGH] - [explanation]
+CORRELATION_FLAG: [specific correlated pairs or NONE]
+REGIME_CHECK: [OK|CAUTION|REDUCE_EXPOSURE] - [explanation]
+TICKER_WEIGHTS: [comma-separated ticker:weight pairs, e.g. AAPL:0.15,MSFT:0.12]
+EXCLUDED: [comma-separated tickers to exclude, or NONE]
+OVERALL: [one sentence portfolio assessment]"""
+
 
 def _create_client(config: dict):
     """Create a Groq/OpenAI-compatible client."""
@@ -294,6 +346,63 @@ def _parse_pm_response(response: str) -> tuple[str, float, str]:
         score = {"BUY": 0.8, "OVERWEIGHT": 0.4, "UNDERWEIGHT": -0.4, "SELL": -0.8}.get(rating, 0.0)
 
     return rating, score, reason
+
+
+def _parse_pm_response_primary(response: str) -> tuple[str, float, str, str, float | None, float | None, int | None]:
+    """Parse the enhanced PM response for LLM-primary mode."""
+    rating, score, reason = _parse_pm_response(response)
+    position_size = "MEDIUM"
+    target_weight = None
+    stop_loss = None
+    hold_days = None
+    for line in response.split("\n"):
+        line = line.strip()
+        if line.upper().startswith("POSITION_SIZE:"):
+            raw = line.split(":", 1)[1].strip().upper()
+            if raw in ("SMALL", "MEDIUM", "FULL", "NONE"):
+                position_size = raw
+        elif line.upper().startswith("TARGET_WEIGHT:"):
+            try:
+                target_weight = max(0.0, min(0.20, float(line.split(":", 1)[1].strip())))
+            except ValueError:
+                pass
+        elif line.upper().startswith("STOP_LOSS:"):
+            try:
+                stop_loss = max(0.01, min(0.30, float(line.split(":", 1)[1].strip())))
+            except ValueError:
+                pass
+        elif line.upper().startswith("HOLD_DAYS:"):
+            try:
+                hold_days = max(1, min(10, int(line.split(":", 1)[1].strip())))
+            except ValueError:
+                pass
+    return rating, score, reason, position_size, target_weight, stop_loss, hold_days
+
+
+def _parse_portfolio_response_primary(response: str) -> dict[str, Any]:
+    """Parse the enhanced portfolio response for LLM-primary mode."""
+    result = _parse_portfolio_response(response)
+    for line in response.split("\n"):
+        line = line.strip()
+        if line.upper().startswith("TICKER_WEIGHTS:"):
+            raw = line.split(":", 1)[1].strip()
+            weights: dict[str, float] = {}
+            for pair in raw.split(","):
+                pair = pair.strip()
+                if ":" in pair:
+                    t, w = pair.split(":", 1)
+                    try:
+                        weights[t.strip().upper()] = max(0.0, min(0.20, float(w.strip())))
+                    except ValueError:
+                        pass
+            result["ticker_weights"] = weights
+        elif line.upper().startswith("EXCLUDED:"):
+            raw = line.split(":", 1)[1].strip()
+            if raw.upper() != "NONE":
+                result["excluded"] = [t.strip().upper() for t in raw.split(",") if t.strip()]
+            else:
+                result["excluded"] = []
+    return result
 
 
 def _format_news_sentiment(features: dict) -> str:
@@ -847,6 +956,7 @@ def analyze_ticker(
     features: dict[str, Any],
     portfolio_context: str = "No current positions",
     config: dict | None = None,
+    primary_mode: bool = False,
 ) -> AgentDecision | None:
     """Run the full multi-agent analysis pipeline for a single ticker."""
     cfg = config or get_agent_config()
@@ -927,18 +1037,38 @@ def analyze_ticker(
         )
 
     # 4. Portfolio manager final decision
-    pm_response = _call_llm(
-        client, cfg, "You are a portfolio manager making trading decisions.",
-        _PM_PROMPT.format(
-            ticker=ticker, analyst_report=analyst_report,
-            bull_case=bull_case, bear_case=bear_case,
-            risk_assessment=risk_assessment,
-            pred_return=features.get("pred_return", 0),
-            confidence=features.get("pred_confidence", 0.5),
-        ),
-    )
+    position_size = "MEDIUM"
+    target_weight = None
+    suggested_stop_loss = None
+    expected_hold_days = None
 
-    rating, score, reason = _parse_pm_response(pm_response)
+    if primary_mode:
+        pm_response = _call_llm(
+            client, cfg, "You are a portfolio manager making binding trading decisions.",
+            _PM_PROMPT_PRIMARY.format(
+                ticker=ticker, analyst_report=analyst_report,
+                bull_case=bull_case, bear_case=bear_case,
+                risk_assessment=risk_assessment,
+                pred_return=features.get("pred_return", 0),
+                confidence=features.get("pred_confidence", 0.5),
+                portfolio_context=portfolio_context,
+            ),
+        )
+        rating, score, reason, position_size, target_weight, suggested_stop_loss, expected_hold_days = (
+            _parse_pm_response_primary(pm_response)
+        )
+    else:
+        pm_response = _call_llm(
+            client, cfg, "You are a portfolio manager making trading decisions.",
+            _PM_PROMPT.format(
+                ticker=ticker, analyst_report=analyst_report,
+                bull_case=bull_case, bear_case=bear_case,
+                risk_assessment=risk_assessment,
+                pred_return=features.get("pred_return", 0),
+                confidence=features.get("pred_confidence", 0.5),
+            ),
+        )
+        rating, score, reason = _parse_pm_response(pm_response)
 
     return AgentDecision(
         ticker=ticker, rating=rating, score=score, reasoning=reason,
@@ -947,6 +1077,10 @@ def analyze_ticker(
         debate_history=debate_history,
         risk_debate=risk_debate,
         analyst_reports=analyst_reports,
+        position_size=position_size,
+        target_weight=target_weight,
+        suggested_stop_loss=suggested_stop_loss,
+        expected_hold_days=expected_hold_days,
     )
 
 
@@ -955,6 +1089,7 @@ def analyze_candidates(
     portfolio_context: str = "No current positions",
     config: dict | None = None,
     log: logging.Logger | None = None,
+    primary_mode: bool = False,
 ) -> dict[str, AgentDecision]:
     """Analyze multiple candidates sequentially.
 
@@ -977,7 +1112,7 @@ def analyze_candidates(
         if not ticker:
             continue
         try:
-            decision = analyze_ticker(ticker, c, portfolio_context=portfolio_context, config=cfg)
+            decision = analyze_ticker(ticker, c, portfolio_context=portfolio_context, config=cfg, primary_mode=primary_mode)
             if decision:
                 results[ticker] = decision
                 _log.info(
@@ -1066,6 +1201,7 @@ def analyze_portfolio(
     budget_cad: float = 500.0,
     config: dict | None = None,
     log: logging.Logger | None = None,
+    primary_mode: bool = False,
 ) -> dict[str, Any] | None:
     """Run portfolio-level LLM reasoning (Phase 4). Single call, not per-ticker."""
     _log = log or logger
@@ -1089,9 +1225,11 @@ def analyze_portfolio(
     if not table_lines:
         return None
 
+    prompt_template = _PORTFOLIO_PROMPT_PRIMARY if primary_mode else _PORTFOLIO_PROMPT
     response = _call_llm(
-        client, cfg, "You are a portfolio strategist.",
-        _PORTFOLIO_PROMPT.format(
+        client, cfg,
+        "You are a portfolio strategist with binding authority." if primary_mode else "You are a portfolio strategist.",
+        prompt_template.format(
             candidate_table="\n".join(table_lines),
             portfolio_context=portfolio_context,
             vol_regime=market_conditions.get("vol_regime", 1.0),
@@ -1106,7 +1244,7 @@ def analyze_portfolio(
     if not response:
         return None
 
-    result = _parse_portfolio_response(response)
+    result = _parse_portfolio_response_primary(response) if primary_mode else _parse_portfolio_response(response)
     result["raw_response"] = response
     _log.info("Portfolio reasoning: %s", result.get("overall", "(no overall)"))
     return result
@@ -1229,3 +1367,181 @@ def review_exits(
             _log.warning("Exit review failed for %s: %s", ticker, e)
 
     return results
+
+
+# ── LLM-Primary Decision Functions ────────────────────────────────────────
+
+def select_tickers_llm_primary(
+    screened: pd.DataFrame,
+    decisions: dict[str, AgentDecision],
+    max_positions: int,
+    log: logging.Logger | None = None,
+) -> list[str]:
+    """Select tickers based on LLM ratings (LLM-primary mode).
+
+    BUY/OVERWEIGHT → include (sorted by LLM score).
+    HOLD → fill remaining slots (ML score as tiebreaker).
+    UNDERWEIGHT/SELL → exclude.
+    """
+    _log = log or logger
+    buy_tickers: list[tuple[str, float]] = []
+    hold_tickers: list[str] = []
+    excluded: list[str] = []
+
+    for t, d in decisions.items():
+        if d.rating in ("BUY", "OVERWEIGHT"):
+            buy_tickers.append((t, d.score))
+        elif d.rating == "HOLD":
+            hold_tickers.append(t)
+        else:
+            excluded.append(t)
+
+    buy_tickers.sort(key=lambda x: x[1], reverse=True)
+    selected = [t for t, _ in buy_tickers]
+
+    # Fill remaining slots with HOLD tickers using ML score as tiebreaker
+    if len(selected) < max_positions and hold_tickers:
+        hold_scored: list[tuple[str, float]] = []
+        for t in hold_tickers:
+            ml = float(screened.loc[t, "score"]) if t in screened.index and "score" in screened.columns else 0.0
+            hold_scored.append((t, ml))
+        hold_scored.sort(key=lambda x: x[1], reverse=True)
+        for t, _ in hold_scored:
+            if len(selected) >= max_positions:
+                break
+            selected.append(t)
+
+    final = selected[:max_positions]
+    _log.info(
+        "LLM-primary ticker selection: %d BUY/OW, %d HOLD fill, %d excluded → %d selected",
+        len(buy_tickers), len(final) - min(len(buy_tickers), max_positions),
+        len(excluded), len(final),
+    )
+    return final
+
+
+def compute_llm_primary_weights(
+    selected_tickers: list[str],
+    decisions: dict[str, AgentDecision],
+    screened: pd.DataFrame,
+    *,
+    small_range: tuple[float, float] = (0.05, 0.10),
+    medium_range: tuple[float, float] = (0.10, 0.15),
+    full_range: tuple[float, float] = (0.15, 0.20),
+    max_position_pct: float = 0.20,
+    min_position_pct: float = 0.02,
+    log: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Compute portfolio weights from LLM position sizing decisions."""
+    _log = log or logger
+    size_ranges = {
+        "SMALL": small_range,
+        "MEDIUM": medium_range,
+        "FULL": full_range,
+        "NONE": (0.0, 0.0),
+    }
+
+    raw_weights: dict[str, float] = {}
+    for t in selected_tickers:
+        d = decisions.get(t)
+        if d is None:
+            raw_weights[t] = sum(medium_range) / 2
+            continue
+
+        # Use explicit target_weight if provided
+        if d.target_weight is not None and d.target_weight > 0:
+            raw_weights[t] = min(d.target_weight, max_position_pct)
+            continue
+
+        # Map position_size to range, interpolate using LLM score
+        lo, hi = size_ranges.get(d.position_size, medium_range)
+        if lo == 0.0 and hi == 0.0:
+            continue
+        alpha = (d.score + 1.0) / 2.0  # [-1,1] → [0,1]
+        raw_weights[t] = lo + alpha * (hi - lo)
+
+    total = sum(raw_weights.values())
+    if total <= 0:
+        _log.warning("LLM weights sum to zero; falling back to equal weights")
+        n = len(selected_tickers)
+        if n > 0:
+            raw_weights = {t: 1.0 / n for t in selected_tickers}
+            total = 1.0
+        else:
+            return pd.DataFrame({"weight": pd.Series(dtype=float)})
+
+    weights = {t: w / total for t, w in raw_weights.items()}
+
+    # Apply hard caps
+    for t in weights:
+        weights[t] = max(min_position_pct, min(max_position_pct, weights[t]))
+
+    # Re-normalize after caps
+    total = sum(weights.values())
+    if total > 0:
+        weights = {t: w / total for t, w in weights.items()}
+
+    result = screened.loc[screened.index.isin(selected_tickers)].copy()
+    result["weight"] = pd.Series(weights)
+    result = result.dropna(subset=["weight"])
+    result = result.sort_values("weight", ascending=False)
+
+    _log.info("LLM-primary weights: %s", {t: f"{w:.1%}" for t, w in weights.items()})
+    return result
+
+
+def apply_portfolio_reasoning_enforced(
+    target_weights: pd.DataFrame,
+    portfolio_reasoning: dict[str, Any],
+    screened: pd.DataFrame,
+    *,
+    sector_cap: float = 0.30,
+    regime_reduce_scalar: float = 0.50,
+    max_position_pct: float = 0.20,
+    log: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Apply portfolio-level LLM reasoning as BINDING adjustments."""
+    _log = log or logger
+    tw = target_weights.copy()
+
+    # 1. Apply explicit ticker weights from LLM
+    ticker_weights = portfolio_reasoning.get("ticker_weights", {})
+    if isinstance(ticker_weights, dict) and ticker_weights:
+        for t, w in ticker_weights.items():
+            if t in tw.index:
+                tw.loc[t, "weight"] = min(float(w), max_position_pct)
+        _log.info("Enforced LLM ticker weights: %s", ticker_weights)
+
+    # 2. Exclude tickers flagged by LLM
+    excluded = portfolio_reasoning.get("excluded", [])
+    if isinstance(excluded, list) and excluded:
+        before = len(tw)
+        tw = tw[~tw.index.str.upper().isin([e.upper() for e in excluded])]
+        _log.info("Excluded %d tickers per LLM: %s", before - len(tw), excluded)
+
+    # 3. Concentration risk: cap sector weights
+    conc = str(portfolio_reasoning.get("concentration_risk", "")).upper()
+    if "HIGH" in conc and "sector" in screened.columns and not tw.empty:
+        sector_groups: dict[str, list[str]] = {}
+        for t in tw.index:
+            s = str(screened.loc[t, "sector"]) if t in screened.index else "Unknown"
+            sector_groups.setdefault(s, []).append(t)
+        for sector, tickers in sector_groups.items():
+            sector_total = float(tw.loc[tw.index.isin(tickers), "weight"].sum())
+            if sector_total > sector_cap:
+                scale = sector_cap / sector_total
+                tw.loc[tw.index.isin(tickers), "weight"] *= scale
+                _log.info("Sector cap enforced: %s %.1f%% → %.1f%%", sector, sector_total * 100, sector_cap * 100)
+
+    # 4. Regime check: reduce exposure
+    regime = str(portfolio_reasoning.get("regime_check", "")).upper()
+    if "REDUCE_EXPOSURE" in regime:
+        tw["weight"] *= regime_reduce_scalar
+        _log.info("Regime reduce enforced: all weights scaled by %.0f%%", regime_reduce_scalar * 100)
+
+    # 5. Re-normalize
+    wsum = float(tw["weight"].sum()) if not tw.empty else 0.0
+    if wsum > 0:
+        tw["weight"] /= wsum
+
+    return tw

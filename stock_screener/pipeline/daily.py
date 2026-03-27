@@ -618,8 +618,10 @@ def run_daily(cfg: Config, logger) -> None:
                     _early_state.positions, _early_state.cash_cad,
                 )
 
+                _llm_pm = bool(getattr(cfg, "llm_decision_primary", False))
                 _decisions = analyze_candidates(
                     _agent_candidates, portfolio_context=_portfolio_ctx, log=logger,
+                    primary_mode=_llm_pm,
                 )
 
                 if _decisions:
@@ -644,6 +646,10 @@ def run_daily(cfg: Config, logger) -> None:
                                 "debate_history": getattr(d, "debate_history", []),
                                 "risk_debate": getattr(d, "risk_debate", None),
                                 "analyst_reports": getattr(d, "analyst_reports", None),
+                                "position_size": getattr(d, "position_size", "MEDIUM"),
+                                "target_weight": getattr(d, "target_weight", None),
+                                "suggested_stop_loss": getattr(d, "suggested_stop_loss", None),
+                                "expected_hold_days": getattr(d, "expected_hold_days", None),
                             }
                             for t, d in _decisions.items()
                         },
@@ -656,20 +662,109 @@ def run_daily(cfg: Config, logger) -> None:
             run_meta["llm_agent"] = {"status": "error", "reason": str(e)}
             logger.warning("LLM agent layer failed (continuing without): %s", e)
         _check_runtime_budget(started_utc, cfg, logger, "llm_agent")
+
+        # ── Phase 4: Portfolio-level LLM reasoning (fail-soft) ────────
+        if cfg.agent_portfolio_reasoning and _decisions and not screened.empty:
+            try:
+                from stock_screener.agents.trading_agent import analyze_portfolio
+                _market_cond = {
+                    "vol_regime": float(screened["market_vol_regime"].iloc[0]) if "market_vol_regime" in screened.columns and len(screened) > 0 else 1.0,
+                    "market_trend": float(screened["market_trend_20d"].iloc[0]) if "market_trend_20d" in screened.columns and len(screened) > 0 else 0.0,
+                    "breadth": float(screened["market_breadth"].iloc[0]) if "market_breadth" in screened.columns and len(screened) > 0 else 0.5,
+                }
+                _portfolio_llm = analyze_portfolio(
+                    _agent_candidates, _decisions, _portfolio_ctx,
+                    market_conditions=_market_cond,
+                    max_positions=cfg.dynamic_size_max_positions,
+                    budget_cad=cfg.portfolio_budget_cad,
+                    log=logger,
+                    primary_mode=_llm_pm,
+                )
+                if _portfolio_llm:
+                    if isinstance(run_meta.get("llm_agent"), dict):
+                        run_meta["llm_agent"]["portfolio_reasoning"] = _portfolio_llm
+                    # Apply score adjustments if LLM suggests weight changes
+                    adj_raw = _portfolio_llm.get("adjustments", "")
+                    if adj_raw and adj_raw.upper() != "NONE" and "score" in screened.columns:
+                        logger.info("Portfolio LLM adjustments: %s", adj_raw)
+                    logger.info("Portfolio reasoning complete: %s", _portfolio_llm.get("overall", ""))
+            except Exception as e:
+                logger.warning("Portfolio LLM reasoning failed (continuing): %s", e)
+
     elif cfg.llm_agent_enabled and screened.empty:
         run_meta["llm_agent"] = {"status": "skipped", "reason": "no screened tickers"}
     elif not cfg.llm_agent_enabled:
         run_meta["llm_agent"] = {"status": "disabled"}
 
-    alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
+    # ── LLM-primary decision mode: LLM drives ticker selection + weighting ──
+    _llm_primary_mode = bool(getattr(cfg, "llm_decision_primary", False))
+    _llm_primary_success = False
 
-    if screened.empty:
+    if _llm_primary_mode and cfg.llm_agent_enabled and not screened.empty:
+        _llm_agent_status = run_meta.get("llm_agent", {}).get("status") if isinstance(run_meta.get("llm_agent"), dict) else None
+        if _llm_agent_status == "success" and _decisions:
+            try:
+                from stock_screener.agents.trading_agent import (
+                    select_tickers_llm_primary as _select_llm,
+                    compute_llm_primary_weights as _compute_llm_w,
+                    apply_portfolio_reasoning_enforced as _enforce_pr,
+                )
+                _llm_selected = _select_llm(screened, _decisions, max_positions=cfg.dynamic_size_max_positions, log=logger)
+                if _llm_selected:
+                    target_weights = _compute_llm_w(
+                        _llm_selected, _decisions, screened,
+                        small_range=(cfg.llm_weight_small_min, cfg.llm_weight_small_max),
+                        medium_range=(cfg.llm_weight_medium_min, cfg.llm_weight_medium_max),
+                        full_range=(cfg.llm_weight_full_min, cfg.llm_weight_full_max),
+                        max_position_pct=float(getattr(cfg, "max_position_pct", 0.20)),
+                        min_position_pct=float(getattr(cfg, "min_position_pct", 0.02)),
+                        log=logger,
+                    )
+                    # Enforce portfolio reasoning if available
+                    _pr = run_meta.get("llm_agent", {}).get("portfolio_reasoning")
+                    if cfg.llm_portfolio_enforce and isinstance(_pr, dict):
+                        target_weights = _enforce_pr(
+                            target_weights, _pr, screened,
+                            sector_cap=cfg.llm_sector_cap,
+                            regime_reduce_scalar=cfg.llm_regime_reduce_scalar,
+                            max_position_pct=float(getattr(cfg, "max_position_pct", 0.20)),
+                            log=logger,
+                        )
+                    effective_portfolio_size = len(target_weights)
+                    _llm_primary_success = True
+                    run_meta["llm_primary"] = {
+                        "mode": "active",
+                        "selected_tickers": _llm_selected,
+                        "n_selected": len(_llm_selected),
+                    }
+                    logger.info("LLM-primary mode ACTIVE: %d tickers selected, weights assigned by LLM", len(_llm_selected))
+                else:
+                    logger.warning("LLM-primary: no BUY/OVERWEIGHT tickers; falling back to ML pipeline")
+            except Exception as e:
+                logger.warning("LLM-primary decision failed (%s); falling back to ML pipeline", e)
+                run_meta["llm_primary"] = {"mode": "fallback", "reason": str(e)}
+        else:
+            logger.warning("LLM-primary: LLM analysis not successful (status=%s); falling back to ML", _llm_agent_status)
+            run_meta["llm_primary"] = {"mode": "fallback", "reason": f"LLM status: {_llm_agent_status}"}
+    elif _llm_primary_mode:
+        run_meta["llm_primary"] = {"mode": "fallback", "reason": "LLM not enabled or screened empty"}
+
+    # ── ML-primary fallback (runs when LLM-primary is off or failed) ──────
+    # When LLM-primary succeeded, skip the entire ML weight computation block.
+    # The quantitative guardrails (regime, vol targeting, drawdown) still run
+    # on LLM-assigned target_weights downstream.
+    if _llm_primary_success:
+        alpha_col = "score"
+        # target_weights and effective_portfolio_size already set by LLM-primary
+    elif screened.empty:
+        alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
         logger.warning("No screened tickers remain after entry filters; skipping new-entry weight construction.")
         effective_portfolio_size = 0
         target_weights = screened.copy()
         if "weight" not in target_weights.columns:
             target_weights["weight"] = pd.Series(dtype=float)
     else:
+        alpha_col = "pred_return" if "pred_return" in screened.columns else "score"
         # Compute fully dynamic portfolio size based on model metrics and predicted returns
         # No base size - portfolio can range from 1 to max based on opportunity quality
         if getattr(cfg, "dynamic_portfolio_sizing", True):
@@ -1330,14 +1425,76 @@ def run_daily(cfg: Config, logger) -> None:
     if "market_vol_regime" in features.columns:
         market_vol_regime = float(features["market_vol_regime"].iloc[0]) if len(features) > 0 else None
     
+    # ── LLM-primary exit review (runs BEFORE mechanical exits) ─────────
+    _llm_daily_exit_actions: list = []
+    if _llm_primary_mode and cfg.agent_exit_review_enabled and cfg.llm_agent_enabled:
+        try:
+            from stock_screener.agents.trading_agent import review_exits as _review_daily_exits
+            _open_for_exit = [p for p in state.positions if getattr(p, "status", "OPEN") == "OPEN" and p.ticker]
+            if _open_for_exit:
+                _exit_news_d: dict[str, list] = {}
+                try:
+                    from stock_screener.data.news import fetch_ticker_news as _fn_d
+                    for _p in _open_for_exit[:6]:
+                        try:
+                            _exit_news_d[_p.ticker] = _fn_d(str(_p.ticker), logger=logger)[:3]
+                        except Exception:
+                            _exit_news_d[_p.ticker] = []
+                except Exception:
+                    pass
+                _exit_mkt_d = {
+                    "vol_regime": float(market_vol_regime) if market_vol_regime is not None else 1.0,
+                    "market_trend": float(features["market_trend_20d"].iloc[0]) if "market_trend_20d" in features.columns and len(features) > 0 else 0.0,
+                }
+                _reviews_d = _review_daily_exits(
+                    _open_for_exit, prices_cad,
+                    features=features if not features.empty else None,
+                    news_by_ticker=_exit_news_d,
+                    market_conditions=_exit_mkt_d,
+                    max_hold_days=cfg.max_holding_days,
+                    log=logger,
+                )
+                for _t, _rv in _reviews_d.items():
+                    if _rv.action != "EXIT":
+                        continue
+                    _veto = False
+                    if _rv.urgency == "MEDIUM" and pred_return is not None:
+                        _pr_val = float(pred_return.get(_t, float("nan"))) if hasattr(pred_return, "get") else 0.0
+                        if not pd.isna(_pr_val) and _pr_val > cfg.llm_exit_ml_veto_threshold:
+                            _veto = True
+                            logger.info("LLM EXIT vetoed by ML: %s pred_return=%.2f%% > %.2f%%", _t, _pr_val * 100, cfg.llm_exit_ml_veto_threshold * 100)
+                    if _rv.urgency == "LOW":
+                        _veto = True  # LOW urgency exits are advisory only
+                    if not _veto:
+                        _pos = next((p for p in _open_for_exit if p.ticker == _t), None)
+                        if _pos and _t in prices_cad.index:
+                            _px = float(prices_cad[_t])
+                            if _px > 0:
+                                _llm_daily_exit_actions.append(TradeAction(
+                                    ticker=_t, action="SELL",
+                                    reason=f"LLM_EXIT_{_rv.urgency}:{_rv.reason[:50]}",
+                                    shares=float(_pos.shares), price_cad=_px,
+                                ))
+                if _llm_daily_exit_actions:
+                    logger.info("LLM-primary daily exit review: %d exit(s)", len(_llm_daily_exit_actions))
+        except Exception as e:
+            logger.warning("LLM daily exit review failed (continuing with mechanical): %s", e)
+
+    # Mechanical exits (circuit breakers — always run)
     exit_actions = pm.apply_exits(
-        state, 
-        prices_cad=prices_cad, 
-        pred_return=pred_return, 
-        score=score, 
+        state,
+        prices_cad=prices_cad,
+        pred_return=pred_return,
+        score=score,
         features=features,
         market_vol_regime=market_vol_regime,
     )
+    # Merge LLM exits (avoid duplicates)
+    if _llm_daily_exit_actions:
+        _mech_tickers = {str(a.ticker).upper() for a in exit_actions if a.action in ("SELL", "SELL_PARTIAL")}
+        for _a in _llm_daily_exit_actions:
+            if str(_a.ticker).upper() not in _mech_tickers:
+                exit_actions.append(_a)
     exited_sell_tickers = {
         str(a.ticker).upper()
         for a in exit_actions
@@ -2256,6 +2413,63 @@ def run_intraday(cfg, logger) -> None:
         market_vol_regime=float(market_vol_regime) if market_vol_regime is not None else None,
     )
     logger.info("Exits: %d actions from %d positions", len(exit_actions), len(held_tickers))
+
+    # ── Phase 5: LLM exit review for positions mechanical rules say HOLD ──
+    if cfg.agent_exit_review_enabled and cfg.llm_agent_enabled:
+        try:
+            from stock_screener.agents.trading_agent import review_exits as _review_exits
+            _exited_by_mechanical = {
+                str(getattr(a, "ticker", "") or "").upper()
+                for a in exit_actions
+                if getattr(a, "action", "") in ("SELL", "SELL_PARTIAL")
+            }
+            _held_after_exits = [
+                p for p in state.positions
+                if getattr(p, "status", "OPEN") == "OPEN"
+                and str(getattr(p, "ticker", "")).upper() not in _exited_by_mechanical
+            ]
+            if _held_after_exits:
+                _exit_news: dict[str, list] = {}
+                try:
+                    from stock_screener.data.news import fetch_ticker_news as _fetch_news
+                    for _p in _held_after_exits[:6]:
+                        try:
+                            _exit_news[_p.ticker] = _fetch_news(str(_p.ticker), logger=logger)[:3]
+                        except Exception:
+                            _exit_news[_p.ticker] = []
+                except Exception:
+                    pass
+
+                _exit_market = {
+                    "vol_regime": float(market_vol_regime) if market_vol_regime is not None else 1.0,
+                    "market_trend": float(screened["market_trend_20d"].iloc[0]) if "market_trend_20d" in screened.columns and len(screened) > 0 else 0.0,
+                }
+                _exit_reviews = _review_exits(
+                    _held_after_exits, prices_cad,
+                    features=screened if not screened.empty else None,
+                    news_by_ticker=_exit_news,
+                    market_conditions=_exit_market,
+                    max_hold_days=cfg.max_holding_days,
+                    log=logger,
+                )
+                _llm_exits_added = 0
+                for _ticker, _review in _exit_reviews.items():
+                    if _review.action == "EXIT" and _review.urgency in ("MEDIUM", "HIGH"):
+                        _pos = next((p for p in _held_after_exits if p.ticker == _ticker), None)
+                        if _pos and _ticker in prices_cad:
+                            _px = float(prices_cad[_ticker])
+                            if _px > 0:
+                                exit_actions.append(TradeAction(
+                                    ticker=_ticker, action="SELL",
+                                    reason=f"LLM_EXIT:{_review.reason[:50]}",
+                                    shares=float(_pos.shares), price_cad=_px,
+                                    days_held=None, pred_return=None,
+                                ))
+                                _llm_exits_added += 1
+                if _llm_exits_added > 0:
+                    logger.info("LLM exit review: added %d exit(s)", _llm_exits_added)
+        except Exception as e:
+            logger.warning("LLM exit review failed (continuing): %s", e)
 
     # Update trailing stops with intraday peaks
     for p in [pp for pp in state.positions if getattr(pp, "status", "OPEN") == "OPEN"]:

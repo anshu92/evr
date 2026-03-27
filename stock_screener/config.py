@@ -174,6 +174,19 @@ class Config:
     agent_portfolio_reasoning: bool = True  # Cross-ticker portfolio-level LLM reasoning
     agent_exit_review_enabled: bool = True  # LLM exit review during intraday
 
+    # LLM-primary decision mode (TradingAgents-inspired: LLM drives decisions, ML as fallback)
+    llm_decision_primary: bool = True  # Master switch: LLM becomes primary decision engine
+    llm_weight_small_min: float = 0.05  # SMALL position: 5-10%
+    llm_weight_small_max: float = 0.10
+    llm_weight_medium_min: float = 0.10  # MEDIUM position: 10-15%
+    llm_weight_medium_max: float = 0.15
+    llm_weight_full_min: float = 0.15  # FULL position: 15-20%
+    llm_weight_full_max: float = 0.20
+    llm_exit_ml_veto_threshold: float = 0.03  # ML can veto MEDIUM-urgency LLM exit if pred_return > this
+    llm_portfolio_enforce: bool = True  # Enforce (not just log) portfolio reasoning adjustments
+    llm_sector_cap: float = 0.30  # Max sector weight when LLM flags concentration_risk=HIGH
+    llm_regime_reduce_scalar: float = 0.50  # Weight scalar when LLM flags regime_check=REDUCE_EXPOSURE
+
     # Intraday monitoring (lightweight exit-only runs during market hours)
     intraday_enabled: bool = False  # Enable intraday monitoring pipeline
     intraday_ticker_limit: int = 100  # Max tickers for intraday price download
