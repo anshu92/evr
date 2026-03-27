@@ -547,113 +547,174 @@ def render_reports(
 
     fx_rate = _to_float(fx_usdcad_rate)
     if trade_actions:
-        # Separate SELL and BUY/HOLD actions for different table formats
+        # Separate actions by type for card rendering
         sell_actions = [a for a in trade_actions if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) in ("SELL", "SELL_PARTIAL")]
-        buy_hold_actions = [a for a in trade_actions if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) not in ("SELL", "SELL_PARTIAL")]
-        
-        actions_html_parts = []
-        
-        # SELL actions table (with entry price and realized gain)
-        if sell_actions:
-            sell_rows: list[str] = []
-            for a in sell_actions:
-                ticker = _action_value(a, "ticker", "")
-                action = _action_value(a, "action", "")
-                reason = _action_value(a, "reason", "")
-                shares = _action_value(a, "shares", "")
-                px = _action_value(a, "price_cad", None)
-                days = _action_value(a, "days_held", None)
-                entry_px = _action_value(a, "entry_price", None)
-                realized_gain = _action_value(a, "realized_gain_pct", None)
-                
-                px_f = _to_float(px)
-                entry_px_f = _to_float(entry_px)
-                px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
-                px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
-                entry_px_str = _fmt_money(entry_px_f) if entry_px_f is not None else "N/A"
-                entry_px_usd_str = _fmt_money(entry_px_f / fx_rate) if entry_px_f is not None and fx_rate and fx_rate > 0 else "N/A"
-                realized_str = _fmt_pct(realized_gain) if realized_gain is not None else "N/A"
-                gain_color = "#059669" if realized_gain and realized_gain > 0 else "#dc2626" if realized_gain and realized_gain < 0 else "#666"
-                days_label = days if days is not None else "N/A"
-                
-                sell_rows.append(
-                    f"<tr><td style='padding:4px 8px;color:#dc2626;font-weight:bold;'>{_html_escape(action)}</td>"
-                    f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
-                    f"<td style='padding:4px 8px;'>{shares}</td>"
-                    f"<td style='padding:4px 8px;'>{entry_px_str}/{entry_px_usd_str}</td>"
-                    f"<td style='padding:4px 8px;'>{px_cad_str}/{px_usd_str}</td>"
-                    f"<td style='padding:4px 8px;color:{gain_color};font-weight:bold;'>{realized_str}</td>"
-                    f"<td style='padding:4px 8px;'>{days_label}</td>"
-                    f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
-                )
-            actions_html_parts.append(f"""<h4 style="color:#dc2626;margin:10px 0 5px 0;">SELL Actions</h4>
-            <table style="border-collapse:collapse;width:100%;font-size:13px;">
-            <thead><tr>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Action</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Ticker</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Shares</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Entry (CAD/USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Sell @ (CAD/USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Gain/Loss</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Days Held</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #dc2626;">Reason</th>
-            </tr></thead>
-            <tbody>{"".join(sell_rows)}</tbody>
-            </table>""")
-        
-        # BUY/HOLD actions table (with pred return and target sell price)
-        if buy_hold_actions:
-            buy_rows: list[str] = []
-            for a in buy_hold_actions:
-                ticker = _action_value(a, "ticker", "")
-                action = _action_value(a, "action", "")
-                reason = _action_value(a, "reason", "")
-                shares = _action_value(a, "shares", "")
-                px = _action_value(a, "price_cad", None)
-                pred_ret = _action_value(a, "pred_return", None)
-                sell_date = _action_value(a, "expected_sell_date", "")
-                
-                pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
-                px_f = _to_float(px)
-                px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
-                px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
-                # Calculate target sell price based on predicted return
-                sell_px_cad = float(px_f) * (1 + float(pred_ret)) if px_f is not None and pred_ret is not None else None
-                sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
-                sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
-                action_color = "#059669" if action == "BUY" else "#2563eb"
-                
-                buy_rows.append(
-                    f"<tr><td style='padding:4px 8px;color:{action_color};font-weight:bold;'>{_html_escape(action)}</td>"
-                    f"<td style='padding:4px 8px;font-weight:bold;'>{_html_escape(str(ticker))}</td>"
-                    f"<td style='padding:4px 8px;'>{shares}</td>"
-                    f"<td style='padding:4px 8px;'>{px_cad_str}/{px_usd_str}</td>"
-                    f"<td style='padding:4px 8px;'>{pred_ret_str}</td>"
-                    f"<td style='padding:4px 8px;color:#059669;font-weight:bold;'>{sell_px_cad_str}/{sell_px_usd_str}</td>"
-                    f"<td style='padding:4px 8px;'>{sell_date or 'N/A'}</td>"
-                    f"<td style='padding:4px 8px;'>{_html_escape(str(reason))}</td></tr>"
-                )
-            actions_html_parts.append(f"""<h4 style="color:#059669;margin:10px 0 5px 0;">BUY/HOLD Actions</h4>
-            <table style="border-collapse:collapse;width:100%;font-size:13px;">
-            <thead><tr>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Action</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Ticker</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Shares</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Price (CAD/USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">{_html_escape(_pred_ret_label)}</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Sell @ (CAD/USD)</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Sell Date</th>
-                <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #059669;">Reason</th>
-            </tr></thead>
-            <tbody>{"".join(buy_rows)}</tbody>
-            </table>""")
-        
-        if actions_html_parts:
-            actions_html = "".join(actions_html_parts)
+        buy_actions = [a for a in trade_actions if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) == "BUY"]
+        hold_actions = [a for a in trade_actions if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) not in ("SELL", "SELL_PARTIAL", "BUY")]
+
+        action_cards: list[str] = []
+
+        # --- SELL action cards (red left-border) ---
+        for a in sell_actions:
+            ticker = _action_value(a, "ticker", "")
+            action = _action_value(a, "action", "")
+            reason = _action_value(a, "reason", "")
+            shares = _action_value(a, "shares", "")
+            px = _action_value(a, "price_cad", None)
+            days = _action_value(a, "days_held", None)
+            entry_px = _action_value(a, "entry_price", None)
+            realized_gain = _action_value(a, "realized_gain_pct", None)
+
+            px_f = _to_float(px)
+            entry_px_f = _to_float(entry_px)
+            px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
+            px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
+            entry_px_str = _fmt_money(entry_px_f) if entry_px_f is not None else "N/A"
+            entry_px_usd_str = _fmt_money(entry_px_f / fx_rate) if entry_px_f is not None and fx_rate and fx_rate > 0 else "N/A"
+            realized_str = _fmt_pct(realized_gain) if realized_gain is not None else "N/A"
+            gain_color = "#059669" if realized_gain and realized_gain > 0 else "#dc2626" if realized_gain and realized_gain < 0 else "#6b7280"
+            gain_arrow = "&#9650;" if realized_gain and realized_gain > 0 else "&#9660;" if realized_gain and realized_gain < 0 else ""
+            days_label = str(days) if days is not None else "N/A"
+
+            action_cards.append(
+                f'<div style="background:#ffffff;border-radius:12px;border-left:5px solid #dc2626;'
+                f'padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">'
+                # Row 1: badge + ticker + gain
+                f'<table style="width:100%;border-collapse:collapse;"><tr>'
+                f'<td style="vertical-align:middle;width:1%;white-space:nowrap;padding:0 10px 0 0;">'
+                f'<span style="background:#dc2626;color:#ffffff;font-size:11px;font-weight:700;'
+                f'padding:3px 10px;border-radius:6px;letter-spacing:0.5px;">{_html_escape(action)}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;">'
+                f'<span style="font-size:20px;font-weight:800;color:#111827;letter-spacing:-0.5px;">{_html_escape(str(ticker))}</span></td>'
+                f'<td style="vertical-align:middle;text-align:right;padding:0;">'
+                f'<span style="font-size:18px;font-weight:700;color:{gain_color};">{gain_arrow} {realized_str}</span></td>'
+                f'</tr></table>'
+                # Row 2: details
+                f'<table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:12px;color:#6b7280;"><tr>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Entry</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">${entry_px_str}</span>'
+                f'<span style="color:#9ca3af;font-size:11px;"> / ${entry_px_usd_str}</span></td>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Exit</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">${px_cad_str}</span>'
+                f'<span style="color:#9ca3af;font-size:11px;"> / ${px_usd_str}</span></td>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Shares</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">{shares}</span></td>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Held</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">{days_label}d</span></td>'
+                f'</tr></table>'
+                # Row 3: reason
+                f'<div style="margin-top:10px;padding:8px 10px;background:#fef2f2;border-radius:8px;'
+                f'font-size:12px;color:#991b1b;line-height:1.4;">{_html_escape(str(reason))}</div>'
+                f'</div>'
+            )
+
+        # --- BUY action cards (green left-border) ---
+        for a in buy_actions:
+            ticker = _action_value(a, "ticker", "")
+            action = _action_value(a, "action", "")
+            reason = _action_value(a, "reason", "")
+            shares = _action_value(a, "shares", "")
+            px = _action_value(a, "price_cad", None)
+            pred_ret = _action_value(a, "pred_return", None)
+            sell_date = _action_value(a, "expected_sell_date", "")
+
+            pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+            px_f = _to_float(px)
+            px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
+            px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
+            sell_px_cad = float(px_f) * (1 + float(pred_ret)) if px_f is not None and pred_ret is not None else None
+            sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
+            sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
+            ret_color = "#059669" if pred_ret and pred_ret > 0 else "#dc2626" if pred_ret and pred_ret < 0 else "#6b7280"
+
+            action_cards.append(
+                f'<div style="background:#ffffff;border-radius:12px;border-left:5px solid #059669;'
+                f'padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">'
+                # Row 1: badge + ticker + predicted return
+                f'<table style="width:100%;border-collapse:collapse;"><tr>'
+                f'<td style="vertical-align:middle;width:1%;white-space:nowrap;padding:0 10px 0 0;">'
+                f'<span style="background:#059669;color:#ffffff;font-size:11px;font-weight:700;'
+                f'padding:3px 10px;border-radius:6px;letter-spacing:0.5px;">{_html_escape(action)}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;">'
+                f'<span style="font-size:20px;font-weight:800;color:#111827;letter-spacing:-0.5px;">{_html_escape(str(ticker))}</span></td>'
+                f'<td style="vertical-align:middle;text-align:right;padding:0;">'
+                f'<span style="font-size:13px;font-weight:600;color:{ret_color};">{_html_escape(_pred_ret_label)}: {pred_ret_str}</span></td>'
+                f'</tr></table>'
+                # Row 2: details
+                f'<table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:12px;color:#6b7280;"><tr>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Buy @</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">${px_cad_str}</span>'
+                f'<span style="color:#9ca3af;font-size:11px;"> / ${px_usd_str}</span></td>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Target Sell @</span><br/>'
+                f'<span style="color:#059669;font-weight:700;">${sell_px_cad_str}</span>'
+                f'<span style="color:#9ca3af;font-size:11px;"> / ${sell_px_usd_str}</span></td>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Shares</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">{shares}</span></td>'
+                f'<td style="padding:2px 0;"><span style="color:#9ca3af;">Sell Date</span><br/>'
+                f'<span style="color:#111827;font-weight:600;">{_html_escape(str(sell_date)) if sell_date else "N/A"}</span></td>'
+                f'</tr></table>'
+                # Row 3: reason
+                f'<div style="margin-top:10px;padding:8px 10px;background:#ecfdf5;border-radius:8px;'
+                f'font-size:12px;color:#065f46;line-height:1.4;">{_html_escape(str(reason))}</div>'
+                f'</div>'
+            )
+
+        # --- HOLD action cards (blue left-border, compact) ---
+        for a in hold_actions:
+            ticker = _action_value(a, "ticker", "")
+            action = _action_value(a, "action", "")
+            reason = _action_value(a, "reason", "")
+            shares = _action_value(a, "shares", "")
+            px = _action_value(a, "price_cad", None)
+            pred_ret = _action_value(a, "pred_return", None)
+            sell_date = _action_value(a, "expected_sell_date", "")
+
+            pred_ret_str = _fmt_pct(pred_ret) if pred_ret is not None else "N/A"
+            px_f = _to_float(px)
+            px_cad_str = _fmt_money(px_f) if px_f is not None else "N/A"
+            px_usd_str = _fmt_money(px_f / fx_rate) if px_f is not None and fx_rate and fx_rate > 0 else "N/A"
+            sell_px_cad = float(px_f) * (1 + float(pred_ret)) if px_f is not None and pred_ret is not None else None
+            sell_px_cad_str = _fmt_money(sell_px_cad) if sell_px_cad is not None else "N/A"
+            sell_px_usd_str = _fmt_money(sell_px_cad / fx_rate) if sell_px_cad and fx_rate and fx_rate > 0 else "N/A"
+
+            action_cards.append(
+                f'<div style="background:#ffffff;border-radius:10px;border-left:4px solid #2563eb;'
+                f'padding:10px 14px;margin-bottom:8px;box-shadow:0 1px 2px rgba(0,0,0,0.05);">'
+                f'<table style="width:100%;border-collapse:collapse;font-size:12px;"><tr>'
+                f'<td style="vertical-align:middle;width:1%;white-space:nowrap;padding:0 8px 0 0;">'
+                f'<span style="background:#2563eb;color:#ffffff;font-size:10px;font-weight:700;'
+                f'padding:2px 8px;border-radius:5px;">{_html_escape(action)}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;">'
+                f'<span style="font-size:15px;font-weight:700;color:#111827;">{_html_escape(str(ticker))}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;color:#6b7280;">'
+                f'{shares} shares @ ${px_cad_str}'
+                f'<span style="color:#9ca3af;font-size:11px;"> / ${px_usd_str}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;color:#6b7280;white-space:nowrap;">'
+                f'{_html_escape(_pred_ret_label)}: <span style="font-weight:600;">{pred_ret_str}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;color:#6b7280;white-space:nowrap;">'
+                f'Target: <span style="font-weight:600;">${sell_px_cad_str}</span>'
+                f'<span style="color:#9ca3af;font-size:11px;"> / ${sell_px_usd_str}</span></td>'
+                f'<td style="vertical-align:middle;padding:0;color:#6b7280;white-space:nowrap;">'
+                f'Sell: {_html_escape(str(sell_date)) if sell_date else "N/A"}</td>'
+                f'</tr></table>'
+                f'<div style="margin-top:6px;font-size:11px;color:#6b7280;line-height:1.3;">{_html_escape(str(reason))}</div>'
+                f'</div>'
+            )
+
+        if action_cards:
+            actions_html = "\n".join(action_cards)
         else:
-            actions_html = _html_escape("No actions (portfolio already aligned).")
+            actions_html = (
+                '<div style="background:#ffffff;border-radius:12px;padding:20px;text-align:center;'
+                'color:#9ca3af;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">'
+                'No actions &mdash; portfolio already aligned.</div>'
+            )
     else:
-        actions_html = _html_escape("No actions (portfolio already aligned).")
+        actions_html = (
+            '<div style="background:#ffffff;border-radius:12px;padding:20px;text-align:center;'
+            'color:#9ca3af;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,0.08);">'
+            'No actions &mdash; portfolio already aligned.</div>'
+        )
 
     # LLM Agent Analysis block
     llm_block = ""
@@ -862,11 +923,15 @@ def render_reports(
 """
 
     pnl_block = ""
+    # Variables used by executive summary cards later
+    _pnl_equity = None
+    _pnl_day_change = None
+    _pnl_all_time_return = None
     if portfolio_pnl_history:
         latest = portfolio_pnl_history[-1]
         prev = portfolio_pnl_history[-2] if len(portfolio_pnl_history) >= 2 else None
         first = portfolio_pnl_history[0]
-        
+
         latest_asof = latest.get("asof_utc")
         prev_asof = prev.get("asof_utc") if prev else None
         equity = _to_float(latest.get("equity_cad"))
@@ -877,7 +942,7 @@ def render_reports(
         realized_pl = _to_float(latest.get("realized_pl_cad"))
         unrealized_pl = _to_float(latest.get("unrealized_pl_cad"))
         net_pl = _to_float(latest.get("net_pl_cad"))
-        
+
         # Calculate returns
         all_time_return = None
         day_to_day_return = None
@@ -887,6 +952,11 @@ def render_reports(
 
         if equity is not None and prev_equity is not None and prev_equity > 0:
             day_to_day_return = (equity - prev_equity) / prev_equity
+
+        # Expose for executive summary cards
+        _pnl_equity = equity
+        _pnl_day_change = day_to_day_return
+        _pnl_all_time_return = all_time_return
 
         # Compute time period labels for returns
         all_time_label_html = "All-Time Return"
@@ -908,30 +978,46 @@ def render_reports(
                 pass
 
         fx_rate = _to_float(fx_usdcad_rate)
-        equity_parts: list[str] = []
-        if latest_asof:
-            equity_parts.append(f"<strong>Snapshot:</strong> {_html_escape(str(latest_asof))}")
-        if prev_asof:
-            equity_parts.append(f"<strong>Previous Snapshot:</strong> {_html_escape(str(prev_asof))}")
-        equity_parts.append(f"<strong>Current Equity:</strong> {_fmt_money(equity) if equity is not None else 'N/A'}")
-        if fx_rate is not None and fx_rate > 0 and equity is not None:
-            equity_parts.append(f"<strong>Current Equity USD:</strong> {_fmt_money(equity / fx_rate)}")
-        equity_parts.append(f"<strong>Cash:</strong> {_fmt_money(cash) if cash is not None else 'N/A'}")
-        equity_parts.append(f"<strong>Invested Market Value:</strong> {_fmt_money(open_market_value) if open_market_value is not None else 'N/A'}")
-        equity_parts.append(f"<strong>Realized P&L:</strong> {_fmt_money(realized_pl) if realized_pl is not None else 'N/A'}")
-        equity_parts.append(f"<strong>Unrealized P&L:</strong> {_fmt_money(unrealized_pl) if unrealized_pl is not None else 'N/A'}")
-        equity_parts.append(f"<strong>Net P&L:</strong> {_fmt_money(net_pl) if net_pl is not None else 'N/A'}")
 
-        return_parts: list[str] = []
-        return_parts.append(f"<strong>{all_time_label_html}:</strong> {_fmt_pct(all_time_return) if all_time_return is not None else 'N/A'}")
-        return_parts.append(f"<strong>{day_to_day_label_html}:</strong> {_fmt_pct(day_to_day_return) if day_to_day_return is not None else 'N/A'}")
-        
-        summary = "<br/>".join(equity_parts + return_parts)
+        # Build P&L detail rows for the card layout
+        def _pnl_row(label: str, val_str: str, color: str = "#111827") -> str:
+            return (
+                f'<tr><td style="padding:5px 8px;font-size:12px;color:#6b7280;border-bottom:1px solid #f3f4f6;">{label}</td>'
+                f'<td style="padding:5px 8px;font-size:13px;font-weight:600;color:{color};text-align:right;'
+                f'border-bottom:1px solid #f3f4f6;">{val_str}</td></tr>'
+            )
+
+        pnl_rows: list[str] = []
+        if latest_asof:
+            pnl_rows.append(_pnl_row("Snapshot", _html_escape(str(latest_asof))))
+        if prev_asof:
+            pnl_rows.append(_pnl_row("Previous Snapshot", _html_escape(str(prev_asof))))
+        pnl_rows.append(_pnl_row("Current Equity (CAD)", f"${_fmt_money(equity)}" if equity is not None else "N/A"))
+        if fx_rate is not None and fx_rate > 0 and equity is not None:
+            pnl_rows.append(_pnl_row("Current Equity (USD)", f"${_fmt_money(equity / fx_rate)}"))
+        pnl_rows.append(_pnl_row("Cash", f"${_fmt_money(cash)}" if cash is not None else "N/A"))
+        pnl_rows.append(_pnl_row("Invested Market Value", f"${_fmt_money(open_market_value)}" if open_market_value is not None else "N/A"))
+        _rpl_color = "#059669" if realized_pl and realized_pl > 0 else "#dc2626" if realized_pl and realized_pl < 0 else "#111827"
+        pnl_rows.append(_pnl_row("Realized P&amp;L", f"${_fmt_money(realized_pl)}" if realized_pl is not None else "N/A", _rpl_color))
+        _upl_color = "#059669" if unrealized_pl and unrealized_pl > 0 else "#dc2626" if unrealized_pl and unrealized_pl < 0 else "#111827"
+        pnl_rows.append(_pnl_row("Unrealized P&amp;L", f"${_fmt_money(unrealized_pl)}" if unrealized_pl is not None else "N/A", _upl_color))
+        _npl_color = "#059669" if net_pl and net_pl > 0 else "#dc2626" if net_pl and net_pl < 0 else "#111827"
+        pnl_rows.append(_pnl_row("Net P&amp;L", f"${_fmt_money(net_pl)}" if net_pl is not None else "N/A", _npl_color))
+
+        # Returns section
+        _atr_color = "#059669" if all_time_return and all_time_return > 0 else "#dc2626" if all_time_return and all_time_return < 0 else "#111827"
+        _dtr_color = "#059669" if day_to_day_return and day_to_day_return > 0 else "#dc2626" if day_to_day_return and day_to_day_return < 0 else "#111827"
+        pnl_rows.append(_pnl_row(all_time_label_html, _fmt_pct(all_time_return) if all_time_return is not None else "N/A", _atr_color))
+        pnl_rows.append(_pnl_row(day_to_day_label_html, _fmt_pct(day_to_day_return) if day_to_day_return is not None else "N/A", _dtr_color))
+
+        pnl_table_rows = "\n".join(pnl_rows)
 
         pnl_block = f"""
-  <h3 style="margin: 0 0 10px 0;">Portfolio Returns</h3>
-  <div style="background:#ecfeff;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
-    <div>{summary}</div>
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Portfolio Returns</div>
+    <table style="width:100%;border-collapse:collapse;">
+      {pnl_table_rows}
+    </table>
   </div>
 """
 
@@ -979,35 +1065,42 @@ def render_reports(
     # ── Risk dashboard + settlement warnings ───────────────────────
     risk_block = ""
     _risk_alerts: list[str] = []
-    _risk_items: list[str] = []
+    _risk_segments: list[str] = []  # horizontal bar segments
 
     # Data freshness
     _is_intraday = run_meta.get("intraday", False) if isinstance(run_meta, dict) else False
-    if _is_intraday:
-        _risk_items.append("<strong>Data:</strong> Intraday 1h bars (may be 15-20 min delayed via yfinance)")
-    else:
-        _risk_items.append("<strong>Data:</strong> Daily closing bars (finalized)")
+    _data_freshness_label = "Intraday 1h bars" if _is_intraday else "Daily close"
+    _data_freshness_color = "#f59e0b" if _is_intraday else "#059669"
 
     # Settlement warning on BUY actions
     _n_buys = sum(1 for a in (trade_actions or []) if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) == "BUY")
     _n_sells = sum(1 for a in (trade_actions or []) if (getattr(a, "action", None) or (a.get("action") if isinstance(a, dict) else "")) in ("SELL", "SELL_PARTIAL"))
     if _n_buys > 0 and _n_sells > 0:
         _risk_alerts.append("T+2 Settlement: Sell proceeds may not settle for 2 business days. Ensure cash is available before placing buy orders.")
-    if _n_buys > 0:
-        _risk_items.append(f"<strong>Orders:</strong> {_n_buys} BUY, {_n_sells} SELL recommended")
 
     # Drawdown check from P&L history
+    _dd_pct = 0.0
+    _dd_color = "#059669"
+    _dd_label = "0.0%"
+    _dd_bar_width = 0
     if portfolio_pnl_history and len(portfolio_pnl_history) >= 2:
         _equities = [float(h.get("equity_cad", 0)) for h in portfolio_pnl_history if h.get("equity_cad")]
         if _equities:
             _peak = max(_equities)
             _current = _equities[-1]
             _dd = (_current / _peak - 1.0) if _peak > 0 else 0
-            _risk_items.append(f"<strong>Drawdown:</strong> {_dd * 100:.1f}% from peak (${_peak:,.0f} &rarr; ${_current:,.0f})")
-            if _dd < -0.05:
-                _risk_alerts.append(f"Drawdown alert: Portfolio is {_dd*100:.1f}% below peak equity. Consider reducing position sizes.")
+            _dd_pct = _dd
+            _dd_label = f"{_dd * 100:.1f}%"
+            # Map drawdown to bar width (0% = 0 width, -20% = 100% width)
+            _dd_bar_width = min(100, max(0, int(abs(_dd) * 500)))
             if _dd < -0.10:
-                _risk_alerts.append("SEVERE DRAWDOWN: Portfolio is >10% below peak. Review all positions and consider halting new entries.")
+                _dd_color = "#dc2626"
+                _risk_alerts.append(f"SEVERE DRAWDOWN: Portfolio is {_dd*100:.1f}% below peak (${_peak:,.0f} &rarr; ${_current:,.0f}). Review all positions.")
+            elif _dd < -0.05:
+                _dd_color = "#f59e0b"
+                _risk_alerts.append(f"Drawdown alert: Portfolio is {_dd*100:.1f}% below peak equity. Consider reducing position sizes.")
+            else:
+                _dd_color = "#059669"
 
     # Kill switch status
     _halt = False
@@ -1018,71 +1111,240 @@ def render_reports(
         pass
     if _halt:
         _risk_alerts.append("TRADING HALTED: TRADING_HALT is active. No new trades will be executed.")
+    _kill_color = "#dc2626" if _halt else "#059669"
+    _kill_label = "HALTED" if _halt else "Active"
 
     # LLM agent status
     _llm_status = (run_meta.get("llm_agent", {}) or {}).get("status", "disabled") if isinstance(run_meta, dict) else "disabled"
-    _risk_items.append(f"<strong>LLM Agent:</strong> {_llm_status}")
 
-    # Build risk block HTML
+    # Settlement warning indicator
+    _settle_color = "#f59e0b" if (_n_buys > 0 and _n_sells > 0) else "#059669"
+    _settle_label = "T+2 Warning" if (_n_buys > 0 and _n_sells > 0) else "Clear"
+
+    # Build alerts strip (above the bar)
     _alerts_html = ""
     if _risk_alerts:
         _alerts_html = "".join(
-            f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;margin:0 0 8px 0;font-size:13px;color:#991b1b;">{_html_escape(a)}</div>'
+            f'<div style="background:#fef2f2;border-left:4px solid #dc2626;padding:8px 12px;'
+            f'margin-bottom:8px;border-radius:0 8px 8px 0;font-size:12px;color:#991b1b;">'
+            f'{_html_escape(a)}</div>'
             for a in _risk_alerts
         )
-    _items_html = "<br/>".join(_risk_items) if _risk_items else ""
-    if _alerts_html or _items_html:
-        risk_block = f"""
-  <div style="margin:0 0 18px 0;">
+
+    # Build the horizontal risk dashboard bar
+    risk_block = f"""
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Risk Dashboard</div>
     {_alerts_html}
-    <div style="background:#f8fafc;border-radius:8px;padding:10px 14px;font-size:13px;">{_items_html}</div>
+    <table style="width:100%;border-collapse:collapse;"><tr>
+      <!-- Drawdown gauge -->
+      <td style="vertical-align:top;padding:0 12px 0 0;width:35%;">
+        <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Drawdown from Peak</div>
+        <div style="font-size:16px;font-weight:700;color:{_dd_color};margin-bottom:6px;">{_dd_label}</div>
+        <div style="background:#f3f4f6;border-radius:4px;height:8px;overflow:hidden;">
+          <div style="background:{_dd_color};width:{_dd_bar_width}%;height:8px;border-radius:4px;"></div>
+        </div>
+      </td>
+      <!-- Data freshness -->
+      <td style="vertical-align:top;padding:0 12px;width:20%;">
+        <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Data Freshness</div>
+        <div style="display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;
+          background:{_data_freshness_color}20;color:{_data_freshness_color};">{_data_freshness_label}</div>
+      </td>
+      <!-- Kill switch -->
+      <td style="vertical-align:top;padding:0 12px;width:20%;">
+        <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Kill Switch</div>
+        <div style="display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;
+          background:{_kill_color}20;color:{_kill_color};">{_kill_label}</div>
+      </td>
+      <!-- Settlement -->
+      <td style="vertical-align:top;padding:0 0 0 12px;width:25%;">
+        <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Settlement</div>
+        <div style="display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;
+          background:{_settle_color}20;color:{_settle_color};">{_settle_label}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px;">{_n_buys} BUY / {_n_sells} SELL</div>
+      </td>
+    </tr></table>
   </div>
 """
 
     total_scanned = total_processed if total_processed is not None else len(screened)
     portfolio_label = f"{len(weights):,} tickers (current holdings)" if not weights.empty else "No current holdings"
-    html = f"""<html>
-<body style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827; max-width: 900px; margin: 0 auto; padding: 20px;">
-  <h2 style="margin: 0 0 10px 0;">Daily Screener + Risk Parity Portfolio (CAD)</h2>
-  <p style="margin: 0 0 16px 0; color: #374151;">
-    Generated: <strong>{_html_escape(now)}</strong>
-  </p>
+    _n_actions = len(trade_actions) if trade_actions else 0
 
-  <h3 style="margin: 0 0 10px 0;">Recommended Actions (sell at predicted peak)</h3>
-  <div style="background:#fef3c7;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
+    # ── Executive Summary Cards data ──
+    # Equity card
+    _eq_display = f"${_fmt_money(_pnl_equity)}" if _pnl_equity is not None else "N/A"
+    _eq_change_arrow = ""
+    _eq_change_color = "#6b7280"
+    _eq_change_str = ""
+    if _pnl_day_change is not None:
+        _eq_change_arrow = "&#9650;" if _pnl_day_change >= 0 else "&#9660;"
+        _eq_change_color = "#059669" if _pnl_day_change >= 0 else "#dc2626"
+        _eq_change_str = f"{_pnl_day_change * 100:+.2f}% today"
+    _eq_alltime_str = _fmt_pct(_pnl_all_time_return) if _pnl_all_time_return is not None else "N/A"
+
+    # Positions card
+    _n_positions = len(weights) if not weights.empty else 0
+
+    # Risk status card (traffic light)
+    if _halt:
+        _risk_light_color = "#dc2626"
+        _risk_light_label = "HALTED"
+        _risk_light_bg = "#fef2f2"
+    elif _dd_pct < -0.10:
+        _risk_light_color = "#dc2626"
+        _risk_light_label = "High Risk"
+        _risk_light_bg = "#fef2f2"
+    elif _dd_pct < -0.05:
+        _risk_light_color = "#f59e0b"
+        _risk_light_label = "Elevated"
+        _risk_light_bg = "#fffbeb"
+    else:
+        _risk_light_color = "#059669"
+        _risk_light_label = "Normal"
+        _risk_light_bg = "#ecfdf5"
+
+    # LLM-primary badge
+    _llm_primary = run_meta.get("llm_primary", False) if isinstance(run_meta, dict) else False
+    _llm_badge = (
+        '<span style="background:#8b5cf6;color:#ffffff;font-size:10px;font-weight:700;'
+        'padding:3px 10px;border-radius:6px;margin-left:12px;letter-spacing:0.5px;">LLM-Primary</span>'
+    ) if _llm_primary else ""
+
+    html = f"""<html>
+<body style="font-family:system-ui,-apple-system,Arial,sans-serif;line-height:1.5;color:#111827;
+  max-width:900px;margin:0 auto;padding:0;background:#f0f2f5;">
+
+  <!-- ===== 1. DASHBOARD HEADER ===== -->
+  <div style="background:#111827;padding:18px 24px;border-radius:0 0 14px 14px;">
+    <table style="width:100%;border-collapse:collapse;"><tr>
+      <td style="vertical-align:middle;padding:0;">
+        <span style="font-size:18px;font-weight:800;color:#ffffff;letter-spacing:-0.3px;">Trading Intelligence Report</span>
+        {_llm_badge}
+      </td>
+      <td style="vertical-align:middle;text-align:right;padding:0;">
+        <span style="font-size:12px;color:#9ca3af;">{_html_escape(now)}</span>
+      </td>
+    </tr></table>
+  </div>
+
+  <div style="padding:16px 16px 0 16px;">
+
+  <!-- ===== 2. EXECUTIVE SUMMARY CARDS (3 across) ===== -->
+  <table style="width:100%;border-collapse:separate;border-spacing:12px 0;margin:0 0 16px 0;"><tr>
+    <!-- Equity Card -->
+    <td style="width:33%;vertical-align:top;background:#ffffff;border-radius:12px;padding:16px;
+      box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+      <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Equity (CAD)</div>
+      <div style="font-size:22px;font-weight:800;color:#111827;margin-bottom:4px;">{_eq_display}</div>
+      <div style="font-size:13px;color:{_eq_change_color};font-weight:600;">{_eq_change_arrow} {_eq_change_str}</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:4px;">All-time: {_eq_alltime_str}</div>
+    </td>
+    <!-- Positions Card -->
+    <td style="width:33%;vertical-align:top;background:#ffffff;border-radius:12px;padding:16px;
+      box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+      <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Positions</div>
+      <div style="font-size:22px;font-weight:800;color:#111827;margin-bottom:4px;">{_n_positions}</div>
+      <div style="font-size:13px;color:#6b7280;">open positions</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:4px;">{_n_actions} action{"s" if _n_actions != 1 else ""} today</div>
+    </td>
+    <!-- Risk Status Card -->
+    <td style="width:33%;vertical-align:top;background:{_risk_light_bg};border-radius:12px;padding:16px;
+      box-shadow:0 1px 3px rgba(0,0,0,0.08);border:2px solid {_risk_light_color}30;">
+      <div style="font-size:11px;color:#9ca3af;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Risk Status</div>
+      <table style="border-collapse:collapse;"><tr>
+        <td style="vertical-align:middle;padding:0 8px 0 0;">
+          <div style="width:16px;height:16px;border-radius:50%;background:{_risk_light_color};"></div>
+        </td>
+        <td style="vertical-align:middle;padding:0;">
+          <div style="font-size:18px;font-weight:800;color:{_risk_light_color};">{_risk_light_label}</div>
+        </td>
+      </tr></table>
+      <div style="font-size:11px;color:#6b7280;margin-top:6px;">DD: {_dd_label} from peak</div>
+    </td>
+  </tr></table>
+
+  <!-- ===== 3. ACTION CARDS ===== -->
+  <div style="margin:0 0 16px 0;">
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Recommended Actions</div>
     {actions_html}
   </div>
 
+  <!-- ===== 4. RISK DASHBOARD ===== -->
   {risk_block}
 
-  <div style="background:#f3f4f6;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
-    <div><strong>Universe:</strong> US + TSX</div>
-    <div><strong>Number of tickers scanned:</strong> {total_scanned:,}</div>
-    <div><strong>Top screened:</strong> {len(screened):,} tickers</div>
-    <div><strong>Portfolio:</strong> {portfolio_label}</div>
-  </div>
-
-  {model_block}
-
+  <!-- ===== 5. LLM AGENT BLOCK (kept as-is) ===== -->
   {llm_block}
 
-  {pnl_block}
+  <!-- ===== 6. PORTFOLIO DETAILS ===== -->
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;">
+        P&amp;L Breakdown
+      </summary>
+      <div style="margin-top:10px;">
+        {pnl_block}
+      </div>
+    </details>
+  </div>
 
   {target_weights_html_block}
 
-  <h3 style="margin: 0 0 10px 0;">Current Portfolio Holdings</h3>
-  <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
-    <thead>
-      <tr>{headers_html}</tr>
-    </thead>
-    <tbody>
-      {rows_html}
-    </tbody>
-  </table>
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;">
+        Current Portfolio Holdings ({portfolio_label})
+      </summary>
+      <div style="margin-top:12px;overflow-x:auto;">
+        <table style="border-collapse:collapse;width:100%;font-size:12px;">
+          <thead>
+            <tr style="background:#f9fafb;">{headers_html}</tr>
+          </thead>
+          <tbody>
+            {rows_html}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </div>
 
-  <p style="margin-top: 16px; color: #374151; font-size: 13px;">
-    Attachments: <strong>daily_report.txt</strong> (full details), <strong>portfolio_weights.csv</strong> (weights + metrics).
-  </p>
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;">
+        Universe &amp; Screening Stats
+      </summary>
+      <div style="margin-top:10px;">
+        <table style="border-collapse:collapse;width:100%;font-size:12px;">
+          <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Universe</td>
+              <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">US + TSX</td></tr>
+          <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Tickers Scanned</td>
+              <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">{total_scanned:,}</td></tr>
+          <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Top Screened</td>
+              <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">{len(screened):,} tickers</td></tr>
+          <tr><td style="padding:5px 8px;color:#6b7280;">Portfolio</td>
+              <td style="padding:5px 8px;font-weight:600;">{portfolio_label}</td></tr>
+        </table>
+      </div>
+    </details>
+  </div>
+
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;">
+        Model Validation
+      </summary>
+      <div style="margin-top:10px;">
+        {model_block if model_block else '<div style="font-size:12px;color:#9ca3af;">No model validation data available.</div>'}
+      </div>
+    </details>
+  </div>
+
+  <div style="text-align:center;padding:16px 0 8px 0;font-size:11px;color:#9ca3af;">
+    Attachments: daily_report.txt (full details) &bull; portfolio_weights.csv (weights + metrics)
+  </div>
+
+  </div><!-- /padding wrapper -->
 </body>
 </html>"""
 
