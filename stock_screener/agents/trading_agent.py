@@ -13,9 +13,101 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import pandas as pd
+
 from stock_screener.agents.config import get_agent_config
 
 logger = logging.getLogger(__name__)
+
+# Columns extracted from screened DataFrame for LLM candidate context.
+# Shared between daily and intraday pipelines.
+_CANDIDATE_COLUMNS: list[str] = [
+    "pred_return", "pred_confidence", "pred_peak_days", "score",
+    "last_close_cad", "ret_60d", "ret_5d", "ret_10d", "ret_20d", "ret_120d",
+    "vol_20d_ann", "vol_60d_ann", "rsi_14",
+    "beta", "log_market_cap",
+    "ma20_ratio", "ma50_ratio", "ma200_ratio",
+    "drawdown_60d", "dist_52w_high", "dist_52w_low",
+    "market_vol_regime", "market_trend_20d", "market_breadth",
+    "news_sentiment_avg", "news_volume_5d",
+    "insider_net_buys_90d", "insider_buy_ratio_90d", "insider_activity_recency",
+    "trailing_pe", "forward_pe", "price_to_book",
+    "profit_margins", "return_on_equity", "debt_to_equity",
+    "revenue_growth", "earnings_growth",
+    "dividend_yield", "recommendation_mean", "num_analyst_opinions",
+]
+
+
+def build_agent_candidates(
+    screened: pd.DataFrame,
+    *,
+    max_tickers: int,
+    news_by_ticker: dict[str, list] | None = None,
+    intraday_context: dict[str, dict] | None = None,
+    prices_cad: pd.Series | None = None,
+) -> list[dict[str, Any]]:
+    """Build the candidate list that feeds into ``analyze_candidates``.
+
+    Consolidates the identical candidate-building logic that was duplicated
+    in both ``run_daily`` and ``run_intraday``.
+    """
+    if news_by_ticker is None:
+        news_by_ticker = {}
+    if intraday_context is None:
+        intraday_context = {}
+
+    tickers = list(screened.index[:max_tickers])
+    candidates: list[dict[str, Any]] = []
+    for t in tickers:
+        row = screened.loc[t]
+        candidate: dict[str, Any] = {
+            "ticker": str(t),
+            **{c: float(row.get(c, float("nan"))) for c in _CANDIDATE_COLUMNS},
+            "sector": str(row.get("sector", "Unknown")),
+            "industry": str(row.get("industry", "Unknown")),
+            "news_headlines": news_by_ticker.get(str(t), []),
+        }
+        # Override last_close_cad with live price if available
+        if prices_cad is not None and str(t) in prices_cad.index:
+            candidate["last_close_cad"] = float(prices_cad[str(t)])
+        # Merge intraday context (open/high/low/change/bars)
+        ic = intraday_context.get(str(t))
+        if ic:
+            candidate.update(ic)
+        candidates.append(candidate)
+    return candidates
+
+
+def build_portfolio_context(
+    positions: list,
+    cash_cad: float,
+    prices_cad: pd.Series | None = None,
+) -> str:
+    """Build a human-readable portfolio context string for the LLM prompt.
+
+    Consolidates the portfolio context building that was duplicated in both
+    ``run_daily`` and ``run_intraday``.
+    """
+    open_positions = [p for p in positions if getattr(p, "status", "OPEN") == "OPEN"]
+    ctx = f"{len(open_positions)} open positions, ${cash_cad:.0f} cash"
+    if not open_positions:
+        return ctx
+
+    if prices_cad is not None:
+        # Intraday path: show P&L per holding
+        held_pnl: list[str] = []
+        for p in open_positions[:5]:
+            px = float(prices_cad.get(p.ticker, float("nan")))
+            if pd.notna(px) and getattr(p, "entry_price", 0) > 0:
+                pnl = (px / p.entry_price - 1.0) * 100
+                held_pnl.append(f"{p.ticker} {pnl:+.1f}%")
+            else:
+                held_pnl.append(p.ticker)
+        ctx += f", holdings: {', '.join(held_pnl)}"
+    else:
+        # Daily path: just ticker names
+        ctx += f", tickers: {', '.join(p.ticker for p in open_positions[:5])}"
+    return ctx
 
 try:
     from groq import Groq

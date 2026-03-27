@@ -9,7 +9,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from stock_screener.portfolio.manager import _add_trading_days, _market_for_ticker, _trading_days_between
+from stock_screener.calendar import (
+    add_trading_days as _add_trading_days,
+    market_for_ticker as _market_for_ticker,
+    trading_days_between as _trading_days_between,
+)
 
 
 def _utcnow() -> datetime:
