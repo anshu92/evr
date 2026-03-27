@@ -39,7 +39,7 @@ _PROVIDERS = {
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.0-flash",
+        "model": "gemini-2.5-flash",
     },
     "openrouter": {
         "api_key_env": "OPENROUTER_API_KEY",
