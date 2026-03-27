@@ -640,6 +640,10 @@ def run_daily(cfg: Config, logger) -> None:
                                 "bull_thesis": d.bull_thesis,
                                 "bear_thesis": d.bear_thesis,
                                 "risk_assessment": d.risk_assessment,
+                                "debate_rounds": getattr(d, "debate_rounds", 1),
+                                "debate_history": getattr(d, "debate_history", []),
+                                "risk_debate": getattr(d, "risk_debate", None),
+                                "analyst_reports": getattr(d, "analyst_reports", None),
                             }
                             for t, d in _decisions.items()
                         },
@@ -2178,6 +2182,10 @@ def run_intraday(cfg, logger) -> None:
                                 "bull_thesis": d.bull_thesis,
                                 "bear_thesis": d.bear_thesis,
                                 "risk_assessment": d.risk_assessment,
+                                "debate_rounds": getattr(d, "debate_rounds", 1),
+                                "debate_history": getattr(d, "debate_history", []),
+                                "risk_debate": getattr(d, "risk_debate", None),
+                                "analyst_reports": getattr(d, "analyst_reports", None),
                             }
                             for t, d in _decisions.items()
                         },

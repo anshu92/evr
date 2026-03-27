@@ -659,7 +659,6 @@ def render_reports(
     llm_block = ""
     llm_agent_data = run_meta.get("llm_agent") if isinstance(run_meta, dict) else None
     if isinstance(llm_agent_data, dict) and not llm_agent_data.get("decisions"):
-        # Show status when LLM ran but produced no analysis
         _llm_status = llm_agent_data.get("status", "unknown")
         _llm_reason = llm_agent_data.get("reason", "")
         if _llm_status != "disabled":
@@ -670,7 +669,7 @@ def render_reports(
   </div>
 """
     if isinstance(llm_agent_data, dict) and llm_agent_data.get("decisions"):
-        llm_rows_html = ""
+        ticker_cards_html = ""
         for ticker, info in llm_agent_data["decisions"].items():
             if not isinstance(info, dict):
                 continue
@@ -680,37 +679,185 @@ def render_reports(
             bull = info.get("bull_thesis", "")
             bear = info.get("bear_thesis", "")
             risk = info.get("risk_assessment", "")
+            risk_debate = info.get("risk_debate")
+            analyst_reports = info.get("analyst_reports")
+            debate_history = info.get("debate_history", [])
+            debate_rounds = info.get("debate_rounds", 1)
             rating_colors = {"BUY": "#059669", "OVERWEIGHT": "#10b981", "HOLD": "#6b7280", "UNDERWEIGHT": "#f59e0b", "SELL": "#dc2626"}
+            rating_bg = {"BUY": "#ecfdf5", "OVERWEIGHT": "#ecfdf5", "HOLD": "#f3f4f6", "UNDERWEIGHT": "#fffbeb", "SELL": "#fef2f2"}
             rc = rating_colors.get(rating, "#6b7280")
-            llm_rows_html += f"""
-            <tr style="border-bottom:1px solid #e5e7eb;">
-              <td style="padding:8px;font-weight:bold;vertical-align:top;">{_html_escape(str(ticker))}</td>
-              <td style="padding:8px;vertical-align:top;">
-                <span style="color:{rc};font-weight:bold;">{_html_escape(rating)}</span>
-                <span style="color:#9ca3af;"> ({score:+.1f})</span>
-              </td>
-              <td style="padding:8px;vertical-align:top;font-size:12px;">
-                <div style="margin-bottom:4px;"><strong>Verdict:</strong> {_html_escape(reasoning)}</div>
-                <details style="margin-bottom:2px;"><summary style="cursor:pointer;color:#059669;font-size:11px;">Bull thesis</summary><div style="padding:4px 0;color:#374151;font-size:11px;">{_html_escape(bull)}</div></details>
-                <details style="margin-bottom:2px;"><summary style="cursor:pointer;color:#dc2626;font-size:11px;">Bear thesis</summary><div style="padding:4px 0;color:#374151;font-size:11px;">{_html_escape(bear)}</div></details>
-                <details><summary style="cursor:pointer;color:#2563eb;font-size:11px;">Risk assessment</summary><div style="padding:4px 0;color:#374151;font-size:11px;">{_html_escape(risk)}</div></details>
-              </td>
-            </tr>"""
-        if llm_rows_html:
+            rb = rating_bg.get(rating, "#f3f4f6")
+
+            # ── Analyst Team cards (Phase 3) ──
+            analyst_section = ""
+            if isinstance(analyst_reports, dict) and any(analyst_reports.values()):
+                analyst_cards = ""
+                analyst_defs = [
+                    ("technical", "Technical", "#f59e0b", "&#128200;"),
+                    ("fundamental", "Fundamental", "#f59e0b", "&#128176;"),
+                    ("sentiment", "Sentiment", "#f59e0b", "&#128240;"),
+                ]
+                for key, label, accent, icon in analyst_defs:
+                    report = analyst_reports.get(key, "")
+                    if not report:
+                        continue
+                    analyst_cards += f"""
+              <div style="flex:1;min-width:200px;background:#1e1e2e;border-radius:10px;padding:12px;border-top:3px solid {accent};">
+                <div style="font-size:11px;color:{accent};font-weight:bold;margin-bottom:6px;">{icon} {label}</div>
+                <div style="color:#e0e0e0;font-size:11px;line-height:1.5;">{_html_escape(report)}</div>
+              </div>"""
+                if analyst_cards:
+                    analyst_section = f"""
+            <details style="margin-bottom:10px;">
+              <summary style="cursor:pointer;font-weight:bold;font-size:12px;color:#f59e0b;margin-bottom:6px;">&#128269; Analyst Team Reports</summary>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">{analyst_cards}
+              </div>
+            </details>"""
+
+            # ── Bull vs Bear Debate cards (Phase 1) ──
+            debate_section = ""
+            if bull or bear:
+                debate_rounds_html = ""
+                if isinstance(debate_history, list) and len(debate_history) > 2:
+                    for i, (side, text) in enumerate(debate_history):
+                        round_num = (i // 2) + 1
+                        side_color = "#059669" if side == "BULL" else "#dc2626"
+                        side_icon = "&#128200;" if side == "BULL" else "&#128201;"
+                        debate_rounds_html += f"""
+                  <div style="padding:6px 10px;font-size:11px;border-left:3px solid {side_color};margin-bottom:4px;background:{'#ecfdf5' if side == 'BULL' else '#fef2f2'};">
+                    <strong style="color:{side_color};">{side_icon} R{round_num} {side}:</strong> {_html_escape(text)}
+                  </div>"""
+                    debate_rounds_html = f"""
+                <details style="margin-top:6px;">
+                  <summary style="cursor:pointer;font-size:10px;color:#6b7280;">Full debate ({len(debate_history)} exchanges)</summary>
+                  <div style="margin-top:4px;">{debate_rounds_html}</div>
+                </details>"""
+
+                debate_section = f"""
+            <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
+              <div style="flex:1;min-width:220px;background:#ecfdf5;border-radius:10px;padding:12px;border-left:4px solid #059669;">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+                  <span style="background:#059669;color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold;">&#128200; Bullish</span>
+                </div>
+                <div style="font-size:11px;color:#374151;font-weight:bold;margin-bottom:4px;">Investment Opportunity</div>
+                <div style="font-size:11px;color:#374151;line-height:1.5;">{_html_escape(bull)}</div>
+              </div>
+              <div style="flex:0 0 40px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#9ca3af;flex-direction:column;">
+                <div>&#8594;</div><div style="font-size:10px;">Debate</div><div>&#8592;</div>
+              </div>
+              <div style="flex:1;min-width:220px;background:#fef2f2;border-radius:10px;padding:12px;border-left:4px solid #dc2626;">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+                  <span style="background:#dc2626;color:white;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold;">&#128201; Bearish</span>
+                </div>
+                <div style="font-size:11px;color:#374151;font-weight:bold;margin-bottom:4px;">Investment Risks</div>
+                <div style="font-size:11px;color:#374151;line-height:1.5;">{_html_escape(bear)}</div>
+              </div>
+            </div>{debate_rounds_html}"""
+
+            # ── Risk Management Team (Phase 2) ──
+            risk_section = ""
+            if isinstance(risk_debate, dict) and any(risk_debate.values()):
+                risk_defs = [
+                    ("aggressive", "Risky", "#f97316", "&#128293;"),
+                    ("neutral", "Neutral", "#3b82f6", "&#9878;"),
+                    ("conservative", "Safe", "#22c55e", "&#128737;"),
+                ]
+                risk_cards = ""
+                for key, label, color, icon in risk_defs:
+                    view = risk_debate.get(key, "")
+                    if not view:
+                        continue
+                    risk_cards += f"""
+                <div style="background:#1e1e2e;border-radius:8px;padding:10px 12px;margin-bottom:6px;border-left:3px solid {color};">
+                  <span style="color:{color};font-weight:bold;font-size:11px;">{icon} {label}:</span>
+                  <span style="color:#e0e0e0;font-size:11px;"> {_html_escape(view)}</span>
+                </div>"""
+                risk_section = f"""
+            <details style="margin-bottom:10px;">
+              <summary style="cursor:pointer;font-weight:bold;font-size:12px;color:#3b82f6;margin-bottom:6px;">&#128737; Risk Management Debate</summary>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+                <div style="flex:1;min-width:300px;">{risk_cards}</div>
+                <div style="flex:1;min-width:200px;background:#eff6ff;border-radius:10px;padding:12px;border-left:4px solid #3b82f6;">
+                  <div style="font-size:11px;font-weight:bold;color:#1e40af;margin-bottom:4px;">&#128100; Risk Synthesis</div>
+                  <div style="font-size:11px;color:#374151;line-height:1.5;">{_html_escape(risk)}</div>
+                </div>
+              </div>
+            </details>"""
+            elif risk:
+                risk_section = f"""
+            <details style="margin-bottom:6px;">
+              <summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#3b82f6;">&#128737; Risk Assessment</summary>
+              <div style="padding:8px 12px;font-size:11px;color:#374151;background:#eff6ff;border-radius:8px;margin-top:4px;line-height:1.5;">{_html_escape(risk)}</div>
+            </details>"""
+
+            # ── Assemble ticker card ──
+            ticker_cards_html += f"""
+          <div style="background:white;border-radius:12px;border:1px solid #e5e7eb;padding:16px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+              <div>
+                <span style="font-size:16px;font-weight:bold;color:#111827;">{_html_escape(str(ticker))}</span>
+                <span style="background:{rb};color:{rc};font-weight:bold;padding:3px 10px;border-radius:6px;font-size:12px;margin-left:8px;">{_html_escape(rating)} ({score:+.1f})</span>
+              </div>
+              <div style="font-size:11px;color:#9ca3af;">{'%d-round debate' % debate_rounds if debate_rounds > 1 else 'single pass'}</div>
+            </div>
+            <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:#374151;border-left:4px solid {rc};">
+              <strong>Verdict:</strong> {_html_escape(reasoning)}
+            </div>
+            {analyst_section}
+            {debate_section}
+            {risk_section}
+          </div>"""
+
+        if ticker_cards_html:
             n_analyzed = llm_agent_data.get("n_analyzed", 0)
+            # Portfolio reasoning (Phase 4)
+            portfolio_reasoning_html = ""
+            portfolio_reasoning = llm_agent_data.get("portfolio_reasoning")
+            if isinstance(portfolio_reasoning, dict):
+                pr_items = ""
+                for key, label, icon in [
+                    ("concentration_risk", "Concentration Risk", "&#128202;"),
+                    ("correlation_flag", "Correlation Flag", "&#128279;"),
+                    ("regime_check", "Regime Check", "&#127777;"),
+                    ("adjustments", "Weight Adjustments", "&#9878;"),
+                    ("overall", "Overall Assessment", "&#128161;"),
+                ]:
+                    val = portfolio_reasoning.get(key, "")
+                    if val:
+                        pr_items += f'<div style="padding:4px 0;font-size:11px;"><strong>{icon} {label}:</strong> {_html_escape(val)}</div>'
+                if pr_items:
+                    portfolio_reasoning_html = f"""
+    <div style="background:#faf5ff;border-radius:10px;padding:12px 14px;margin-bottom:14px;border-left:4px solid #8b5cf6;">
+      <div style="font-weight:bold;font-size:13px;color:#6d28d9;margin-bottom:8px;">&#128300; Portfolio-Level Reasoning</div>
+      {pr_items}
+    </div>"""
+
             llm_block = f"""
-  <h3 style="margin: 0 0 10px 0;">LLM Agent Analysis ({n_analyzed} tickers)</h3>
-  <div style="background:#f0fdf4;border-radius:8px;padding:12px 14px;margin: 0 0 18px 0;">
-    <table style="border-collapse:collapse;width:100%;font-size:13px;">
-      <thead>
-        <tr>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;width:80px;">Ticker</th>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;width:100px;">Rating</th>
-          <th style="text-align:left;padding:6px 8px;border-bottom:2px solid #111827;">Analysis</th>
-        </tr>
-      </thead>
-      <tbody>{llm_rows_html}</tbody>
-    </table>
+  <h3 style="margin:0 0 12px 0;">&#129302; Multi-Agent Trading Analysis ({n_analyzed} tickers)</h3>
+  <div style="background:#f8fafc;border-radius:12px;padding:14px;margin:0 0 18px 0;">
+    <div style="display:flex;gap:14px;margin-bottom:14px;flex-wrap:wrap;">
+      <div style="background:#1e1e2e;color:#e0e0e0;border-radius:8px;padding:8px 14px;font-size:11px;flex:1;min-width:120px;text-align:center;">
+        <div style="color:#f59e0b;font-weight:bold;margin-bottom:2px;">Analyst Team</div>
+        <div>Technical + Fundamental + Sentiment</div>
+      </div>
+      <div style="color:#9ca3af;display:flex;align-items:center;font-size:16px;">&#8594;</div>
+      <div style="background:#1e1e2e;color:#e0e0e0;border-radius:8px;padding:8px 14px;font-size:11px;flex:1;min-width:120px;text-align:center;">
+        <div style="font-weight:bold;margin-bottom:2px;"><span style="color:#059669;">Bull</span> vs <span style="color:#dc2626;">Bear</span></div>
+        <div>Researcher Debate</div>
+      </div>
+      <div style="color:#9ca3af;display:flex;align-items:center;font-size:16px;">&#8594;</div>
+      <div style="background:#1e1e2e;color:#e0e0e0;border-radius:8px;padding:8px 14px;font-size:11px;flex:1;min-width:120px;text-align:center;">
+        <div style="font-weight:bold;margin-bottom:2px;"><span style="color:#f97316;">Risky</span> / <span style="color:#3b82f6;">Neutral</span> / <span style="color:#22c55e;">Safe</span></div>
+        <div>Risk Management</div>
+      </div>
+      <div style="color:#9ca3af;display:flex;align-items:center;font-size:16px;">&#8594;</div>
+      <div style="background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:white;border-radius:8px;padding:8px 14px;font-size:11px;flex:1;min-width:100px;text-align:center;">
+        <div style="font-weight:bold;margin-bottom:2px;">&#128161; Decision</div>
+        <div>Portfolio Manager</div>
+      </div>
+    </div>
+    {portfolio_reasoning_html}
+    {ticker_cards_html}
   </div>
 """
 
