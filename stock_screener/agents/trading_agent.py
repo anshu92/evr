@@ -288,11 +288,15 @@ def _create_client(config: dict):
         return None
     if not config.get("api_key"):
         return None
-    return Groq(
-        api_key=config["api_key"],
-        base_url=config.get("base_url"),
-        timeout=config.get("timeout_seconds", 15),
-    )
+    # Only override base_url for non-groq providers; the Groq SDK already
+    # knows its own endpoint and passing it again doubles the path.
+    kwargs: dict[str, Any] = {
+        "api_key": config["api_key"],
+        "timeout": config.get("timeout_seconds", 15),
+    }
+    if config.get("provider") != "groq":
+        kwargs["base_url"] = config.get("base_url")
+    return Groq(**kwargs)
 
 
 def _create_smart_client(config: dict):
@@ -301,11 +305,13 @@ def _create_smart_client(config: dict):
         return None
     if not config.get("smart_api_key"):
         return None
-    return Groq(
-        api_key=config["smart_api_key"],
-        base_url=config.get("smart_base_url"),
-        timeout=config.get("timeout_seconds", 15),
-    )
+    kwargs: dict[str, Any] = {
+        "api_key": config["smart_api_key"],
+        "timeout": config.get("timeout_seconds", 15),
+    }
+    if config.get("smart_provider") != "groq":
+        kwargs["base_url"] = config.get("smart_base_url")
+    return Groq(**kwargs)
 
 
 _last_call_time: float = 0.0
