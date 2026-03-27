@@ -283,13 +283,27 @@ OVERALL: [one sentence portfolio assessment]"""
 
 
 def _create_client(config: dict):
-    """Create a Groq/OpenAI-compatible client."""
+    """Create an OpenAI-compatible client for the primary (fast) provider."""
     if not _GROQ_AVAILABLE:
         return None
     if not config.get("api_key"):
         return None
     return Groq(
         api_key=config["api_key"],
+        base_url=config.get("base_url"),
+        timeout=config.get("timeout_seconds", 15),
+    )
+
+
+def _create_smart_client(config: dict):
+    """Create a client for the smart provider (Gemini). Falls back to primary if unavailable."""
+    if not _GROQ_AVAILABLE:
+        return None
+    if not config.get("smart_api_key"):
+        return None
+    return Groq(
+        api_key=config["smart_api_key"],
+        base_url=config.get("smart_base_url"),
         timeout=config.get("timeout_seconds", 15),
     )
 
@@ -297,7 +311,10 @@ def _create_client(config: dict):
 _last_call_time: float = 0.0
 
 
-def _call_llm(client, config: dict, system: str, user: str, *, max_tokens_override: int | None = None) -> str:
+def _call_llm(
+    client, config: dict, system: str, user: str,
+    *, max_tokens_override: int | None = None, model_override: str | None = None,
+) -> str:
     """Make a single LLM call with rate limiting. Returns response text or empty string on failure."""
     global _last_call_time
     throttle = config.get("throttle_sleep_seconds", 2.0)
@@ -308,7 +325,7 @@ def _call_llm(client, config: dict, system: str, user: str, *, max_tokens_overri
 
     try:
         resp = client.chat.completions.create(
-            model=config["model"],
+            model=model_override or config["model"],
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -320,6 +337,27 @@ def _call_llm(client, config: dict, system: str, user: str, *, max_tokens_overri
     except Exception as e:
         logger.warning("LLM call failed: %s", e)
         return ""
+
+
+def _smart_call(
+    smart_client, fast_client, config: dict, system: str, user: str,
+    *, max_tokens_override: int | None = None,
+) -> str:
+    """Route to smart provider (Gemini) for critical decisions, fall back to fast (Groq).
+
+    Used for: PM decisions, portfolio reasoning, exit review.
+    """
+    if smart_client is not None:
+        result = _call_llm(
+            smart_client, config, system, user,
+            max_tokens_override=max_tokens_override,
+            model_override=config.get("smart_model"),
+        )
+        if result:
+            return result
+        logger.warning("Smart provider (%s) failed; falling back to fast provider", config.get("smart_provider"))
+    # Fallback to fast provider
+    return _call_llm(fast_client, config, system, user, max_tokens_override=max_tokens_override)
 
 
 def _parse_pm_response(response: str) -> tuple[str, float, str]:
@@ -958,13 +996,17 @@ def analyze_ticker(
     config: dict | None = None,
     primary_mode: bool = False,
 ) -> AgentDecision | None:
-    """Run the full multi-agent analysis pipeline for a single ticker."""
+    """Run the full multi-agent analysis pipeline for a single ticker.
+
+    Uses fast provider (Groq) for analysts/debates, smart provider (Gemini) for PM decision.
+    """
     cfg = config or get_agent_config()
     client = _create_client(cfg)
     if client is None:
         return None
+    smart_client = _create_smart_client(cfg)
 
-    # 1. Analyst report (generic or specialized)
+    # 1. Analyst report (generic or specialized) — uses FAST provider
     analyst_reports = None
     if cfg.get("specialized_analysts"):
         analyst_report, analyst_reports = _run_specialized_analysts(client, cfg, ticker, features)
@@ -1036,15 +1078,16 @@ def analyze_ticker(
             ),
         )
 
-    # 4. Portfolio manager final decision
+    # 4. Portfolio manager final decision — uses SMART provider (Gemini)
     position_size = "MEDIUM"
     target_weight = None
     suggested_stop_loss = None
     expected_hold_days = None
 
     if primary_mode:
-        pm_response = _call_llm(
-            client, cfg, "You are a portfolio manager making binding trading decisions.",
+        pm_response = _smart_call(
+            smart_client, client, cfg,
+            "You are a portfolio manager making binding trading decisions.",
             _PM_PROMPT_PRIMARY.format(
                 ticker=ticker, analyst_report=analyst_report,
                 bull_case=bull_case, bear_case=bear_case,
@@ -1058,8 +1101,9 @@ def analyze_ticker(
             _parse_pm_response_primary(pm_response)
         )
     else:
-        pm_response = _call_llm(
-            client, cfg, "You are a portfolio manager making trading decisions.",
+        pm_response = _smart_call(
+            smart_client, client, cfg,
+            "You are a portfolio manager making trading decisions.",
             _PM_PROMPT.format(
                 ticker=ticker, analyst_report=analyst_report,
                 bull_case=bull_case, bear_case=bear_case,
@@ -1203,12 +1247,13 @@ def analyze_portfolio(
     log: logging.Logger | None = None,
     primary_mode: bool = False,
 ) -> dict[str, Any] | None:
-    """Run portfolio-level LLM reasoning (Phase 4). Single call, not per-ticker."""
+    """Run portfolio-level LLM reasoning (Phase 4). Uses smart provider (Gemini)."""
     _log = log or logger
     cfg = config or get_agent_config()
     client = _create_client(cfg)
     if client is None:
         return None
+    smart_client = _create_smart_client(cfg)
 
     table_lines = []
     for c in candidates:
@@ -1226,8 +1271,8 @@ def analyze_portfolio(
         return None
 
     prompt_template = _PORTFOLIO_PROMPT_PRIMARY if primary_mode else _PORTFOLIO_PROMPT
-    response = _call_llm(
-        client, cfg,
+    response = _smart_call(
+        smart_client, client, cfg,
         "You are a portfolio strategist with binding authority." if primary_mode else "You are a portfolio strategist.",
         prompt_template.format(
             candidate_table="\n".join(table_lines),
@@ -1282,12 +1327,13 @@ def review_exits(
     config: dict | None = None,
     log: logging.Logger | None = None,
 ) -> dict[str, ExitReviewDecision]:
-    """Review held positions for potential LLM-recommended exits (Phase 5)."""
+    """Review held positions for potential LLM-recommended exits (Phase 5). Uses smart provider."""
     _log = log or logger
     cfg = config or get_agent_config()
     client = _create_client(cfg)
     if client is None:
         return {}
+    smart_client = _create_smart_client(cfg)
     if news_by_ticker is None:
         news_by_ticker = {}
     if market_conditions is None:
@@ -1336,8 +1382,8 @@ def review_exits(
                 news_text = "\n".join(news_lines)
 
         try:
-            response = _call_llm(
-                client, cfg, "You are an exit strategy specialist.",
+            response = _smart_call(
+                smart_client, client, cfg, "You are an exit strategy specialist.",
                 _EXIT_REVIEW_PROMPT.format(
                     ticker=ticker,
                     entry_price=entry_price,

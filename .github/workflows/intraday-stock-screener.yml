@@ -72,9 +72,11 @@ jobs:
       - name: Run intraday monitor
         env:
           INTRADAY_ENABLED: "1"
-          # LLM agent with fresh news + intraday prices
+          # LLM agent (dual-provider: Groq for analysis, Gemini for decisions)
           LLM_AGENT_ENABLED: ${{ vars.LLM_AGENT_ENABLED || '0' }}
+          LLM_DECISION_PRIMARY: ${{ vars.LLM_DECISION_PRIMARY || '1' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           INTRADAY_EXIT_ONLY: "0"  # Also execute new entries from daily target weights
           PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
           PORTFOLIO_BUDGET_CAD: "500"
