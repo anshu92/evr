@@ -365,6 +365,17 @@ def _call_llm(
         "max_tokens": max_tokens_override or config.get("max_tokens", 1024),
     }
 
+    # Only walk the fallback chain for the primary provider (no model_override).
+    # When model_override is set, this is a smart-provider call (e.g., Gemini)
+    # and the chain contains Groq models that won't work on Gemini's endpoint.
+    if model_override:
+        try:
+            resp = client.chat.completions.create(model=primary_model, messages=messages, **kwargs)
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning("LLM call failed on %s: %s", primary_model, e)
+            return ""
+
     # Build the ordered list of models to try: primary first, then chain
     chain = config.get("model_chain", [])
     models_to_try = [primary_model]
