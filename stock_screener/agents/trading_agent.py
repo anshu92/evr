@@ -336,8 +336,37 @@ def _create_smart_client(config: dict):
 _last_call_time: float = 0.0
 _rate_limited_models: set[str] = set()  # Models that returned 429 this run — skip them
 
-# Regex to strip <think>...</think> reasoning blocks from models like qwen3-32b
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+# Regex to handle <think>...</think> blocks from reasoning models (qwen3-32b etc.)
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>\s*", re.DOTALL)
+_THINK_TAG_RE = re.compile(r"</?think>")
+
+
+def _clean_think_response(raw: str) -> str:
+    """Clean LLM response that may contain <think>...</think> reasoning blocks.
+
+    Strategy: extract the content AFTER the think block as the "answer".
+    If the answer is too short (model put everything in <think>), use the
+    think content itself — it IS the real analysis, just wrapped in tags.
+    """
+    if "<think>" not in raw:
+        return raw.strip()
+
+    # Extract what comes AFTER the think block
+    answer = _THINK_BLOCK_RE.sub("", raw).strip()
+
+    # If the answer is substantial, use it (model followed instructions)
+    if len(answer) > 50:
+        return answer
+
+    # Answer is too short — the real content is inside <think>.
+    # Strip the tags but keep the reasoning.
+    think_match = _THINK_BLOCK_RE.search(raw)
+    think_content = think_match.group(1).strip() if think_match else ""
+
+    # Combine: think reasoning + any answer fragment
+    if answer and think_content:
+        return f"{think_content}\n\n{answer}"
+    return think_content or answer or raw.strip()
 
 
 def _call_llm(
@@ -372,7 +401,7 @@ def _call_llm(
     if model_override:
         try:
             resp = client.chat.completions.create(model=primary_model, messages=messages, **kwargs)
-            return _THINK_BLOCK_RE.sub("", resp.choices[0].message.content).strip()
+            return _clean_think_response(resp.choices[0].message.content)
         except Exception as e:
             logger.warning("LLM call failed on %s: %s", primary_model, e)
             return ""
@@ -392,7 +421,7 @@ def _call_llm(
     for model in models_to_try:
         try:
             resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
-            return _THINK_BLOCK_RE.sub("", resp.choices[0].message.content).strip()
+            return _clean_think_response(resp.choices[0].message.content)
         except Exception as e:
             last_error = e
             if "429" in str(e):
