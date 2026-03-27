@@ -333,6 +333,7 @@ def _create_smart_client(config: dict):
 
 
 _last_call_time: float = 0.0
+_rate_limited_models: set[str] = set()  # Models that returned 429 this run — skip them
 
 
 def _call_llm(
@@ -341,12 +342,10 @@ def _call_llm(
 ) -> str:
     """Make a single LLM call with rate limiting and automatic model fallback chain.
 
-    On 429 rate limit, walks down the model_chain in preference order:
-      1. llama-3.3-70b-versatile  (best reasoning, 100K TPD)
-      2. qwen/qwen3-32b          (strong, 500K TPD)
-      3. llama-4-scout-17b       (MoE, 500K TPD, 30K TPM)
-      4. kimi-k2-instruct        (good, 300K TPD)
-      5. llama-3.1-8b-instant    (fast, 500K TPD — last resort)
+    On 429 rate limit, marks the model as exhausted for the rest of the run
+    and immediately tries the next model in the chain (no repeated retries).
+
+    Chain (Groq): 70b → qwen3-32b → llama-4-scout → kimi-k2 → 8b-instant
     """
     global _last_call_time
     throttle = config.get("throttle_sleep_seconds", 2.0)
@@ -365,9 +364,7 @@ def _call_llm(
         "max_tokens": max_tokens_override or config.get("max_tokens", 1024),
     }
 
-    # Only walk the fallback chain for the primary provider (no model_override).
-    # When model_override is set, this is a smart-provider call (e.g., Gemini)
-    # and the chain contains Groq models that won't work on Gemini's endpoint.
+    # Smart-provider calls (model_override set): no chain, just try once
     if model_override:
         try:
             resp = client.chat.completions.create(model=primary_model, messages=messages, **kwargs)
@@ -376,12 +373,16 @@ def _call_llm(
             logger.warning("LLM call failed on %s: %s", primary_model, e)
             return ""
 
-    # Build the ordered list of models to try: primary first, then chain
+    # Build chain, skipping models already known to be rate-limited this run
     chain = config.get("model_chain", [])
-    models_to_try = [primary_model]
-    for m in chain:
-        if m != primary_model and m not in models_to_try:
+    models_to_try = []
+    for m in [primary_model] + [m for m in chain if m != primary_model]:
+        if m not in models_to_try and m not in _rate_limited_models:
             models_to_try.append(m)
+
+    if not models_to_try:
+        logger.warning("All models in chain are rate-limited for this run")
+        return ""
 
     last_error = None
     for model in models_to_try:
@@ -391,9 +392,9 @@ def _call_llm(
         except Exception as e:
             last_error = e
             if "429" in str(e):
-                logger.warning("Rate limit on %s; trying next in chain", model)
+                _rate_limited_models.add(model)
+                logger.warning("Rate limit on %s (skipping for rest of run); trying next", model)
                 continue
-            # Non-rate-limit error — don't try further models
             logger.warning("LLM call failed on %s: %s", model, e)
             return ""
 
