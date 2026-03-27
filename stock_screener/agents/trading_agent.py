@@ -392,10 +392,15 @@ def _call_llm(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-    kwargs = {
+    max_tok = max_tokens_override or config.get("max_tokens", 1024)
+    kwargs: dict[str, Any] = {
         "temperature": config.get("temperature", 0.3),
-        "max_tokens": max_tokens_override or config.get("max_tokens", 1024),
+        "max_completion_tokens": max_tok,
     }
+    # Disable thinking mode for reasoning models (qwen3-32b, etc.)
+    # This avoids <think> blocks that waste tokens and slow down responses.
+    if not model_override:  # Only for Groq fast-provider calls
+        kwargs["reasoning_effort"] = "none"
 
     # Smart-provider calls (model_override set): no chain, just try once
     if model_override:
