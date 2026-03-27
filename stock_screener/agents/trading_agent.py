@@ -321,10 +321,14 @@ def _call_llm(
     client, config: dict, system: str, user: str,
     *, max_tokens_override: int | None = None, model_override: str | None = None,
 ) -> str:
-    """Make a single LLM call with rate limiting and automatic model fallback on 429.
+    """Make a single LLM call with rate limiting and automatic model fallback chain.
 
-    If the primary model hits a rate limit (429), automatically retries once
-    with the fallback model (e.g., llama-3.1-8b-instant).
+    On 429 rate limit, walks down the model_chain in preference order:
+      1. llama-3.3-70b-versatile  (best reasoning, 100K TPD)
+      2. qwen/qwen3-32b          (strong, 500K TPD)
+      3. llama-4-scout-17b       (MoE, 500K TPD, 30K TPM)
+      4. kimi-k2-instruct        (good, 300K TPD)
+      5. llama-3.1-8b-instant    (fast, 500K TPD — last resort)
     """
     global _last_call_time
     throttle = config.get("throttle_sleep_seconds", 2.0)
@@ -333,7 +337,7 @@ def _call_llm(
         time.sleep(throttle - elapsed)
     _last_call_time = time.time()
 
-    model = model_override or config["model"]
+    primary_model = model_override or config["model"]
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -343,22 +347,29 @@ def _call_llm(
         "max_tokens": max_tokens_override or config.get("max_tokens", 1024),
     }
 
-    try:
-        resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        err_str = str(e)
-        fallback = config.get("fallback_model")
-        if "429" in err_str and fallback and fallback != model:
-            logger.warning("Rate limit on %s; retrying with fallback %s", model, fallback)
-            try:
-                resp = client.chat.completions.create(model=fallback, messages=messages, **kwargs)
-                return resp.choices[0].message.content.strip()
-            except Exception as e2:
-                logger.warning("Fallback model also failed: %s", e2)
-                return ""
-        logger.warning("LLM call failed: %s", e)
-        return ""
+    # Build the ordered list of models to try: primary first, then chain
+    chain = config.get("model_chain", [])
+    models_to_try = [primary_model]
+    for m in chain:
+        if m != primary_model and m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error = None
+    for model in models_to_try:
+        try:
+            resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            last_error = e
+            if "429" in str(e):
+                logger.warning("Rate limit on %s; trying next in chain", model)
+                continue
+            # Non-rate-limit error — don't try further models
+            logger.warning("LLM call failed on %s: %s", model, e)
+            return ""
+
+    logger.warning("All models in chain exhausted. Last error: %s", last_error)
+    return ""
 
 
 def _smart_call(
