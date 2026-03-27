@@ -33,7 +33,7 @@ permissions:
 jobs:
   intraday_monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,6 +77,11 @@ jobs:
           LLM_DECISION_PRIMARY: ${{ vars.LLM_DECISION_PRIMARY || '1' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Intraday LLM budget: fewer tickers, no expensive features
+          AGENT_MAX_LLM_TICKERS: "3"
+          AGENT_SPECIALIZED_ANALYSTS: "0"
+          AGENT_RISK_DEBATE_ENABLED: "0"
+          AGENT_MAX_DEBATE_ROUNDS: "1"
           INTRADAY_EXIT_ONLY: "0"  # Also execute new entries from daily target weights
           PORTFOLIO_STATE_PATH: "screener_portfolio_state.json"
           PORTFOLIO_BUDGET_CAD: "500"
