@@ -249,6 +249,9 @@ jobs:
           LLM_DECISION_PRIMARY: ${{ vars.LLM_DECISION_PRIMARY || '1' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Daily LLM budget: keep within 12min runtime
+          AGENT_MAX_LLM_TICKERS: "5"
+          AGENT_THROTTLE_SLEEP: "1.0"
           # Use SOTA ML by default. If ML is unavailable, default is HOLD_ONLY
           # unless ALLOW_BASELINE_TRADING is explicitly enabled.
           USE_ML: "1"
@@ -258,7 +261,7 @@ jobs:
           MODEL_PATH: "models/ensemble/manifest.json"
           STRICT_FEATURE_PARITY: "1"
           APPLY_PREDICTION_RECALIBRATION: ${{ vars.APPLY_PREDICTION_RECALIBRATION || '1' }}
-          MAX_DAILY_RUNTIME_MINUTES: "12"
+          MAX_DAILY_RUNTIME_MINUTES: "25"
           TURNOVER_PENALTY_BPS: "15"
           MIN_REBALANCE_WEIGHT_DELTA: "0.015"
           MIN_TRADE_NOTIONAL_CAD: "15"
