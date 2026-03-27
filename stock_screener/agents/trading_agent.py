@@ -10,6 +10,7 @@ providing qualitative analysis on the ~8 final candidates.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -335,6 +336,9 @@ def _create_smart_client(config: dict):
 _last_call_time: float = 0.0
 _rate_limited_models: set[str] = set()  # Models that returned 429 this run — skip them
 
+# Regex to strip <think>...</think> reasoning blocks from models like qwen3-32b
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
 
 def _call_llm(
     client, config: dict, system: str, user: str,
@@ -368,7 +372,7 @@ def _call_llm(
     if model_override:
         try:
             resp = client.chat.completions.create(model=primary_model, messages=messages, **kwargs)
-            return resp.choices[0].message.content.strip()
+            return _THINK_BLOCK_RE.sub("", resp.choices[0].message.content).strip()
         except Exception as e:
             logger.warning("LLM call failed on %s: %s", primary_model, e)
             return ""
@@ -388,7 +392,7 @@ def _call_llm(
     for model in models_to_try:
         try:
             resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
-            return resp.choices[0].message.content.strip()
+            return _THINK_BLOCK_RE.sub("", resp.choices[0].message.content).strip()
         except Exception as e:
             last_error = e
             if "429" in str(e):
