@@ -18,7 +18,8 @@ _PROVIDERS = {
     "groq": {
         "api_key_env": "GROQ_API_KEY",
         "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.1-8b-instant",  # 500K+ TPD limit (vs 100K for 70b)
+        "model": "llama-3.3-70b-versatile",
+        "fallback_model": "llama-3.1-8b-instant",  # Auto-fallback on 429 rate limit
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
@@ -46,6 +47,7 @@ def _build_provider_config(provider_name: str) -> dict:
         "api_key": os.getenv(preset["api_key_env"], ""),
         "base_url": os.getenv(f"AGENT_{provider_name.upper()}_BASE_URL", preset["base_url"]),
         "model": os.getenv(f"AGENT_{provider_name.upper()}_MODEL", preset["model"]),
+        "fallback_model": preset.get("fallback_model"),
     }
 
 
@@ -70,6 +72,7 @@ def get_agent_config() -> dict:
         "api_key": primary_cfg["api_key"],
         "base_url": os.getenv("AGENT_LLM_BASE_URL", primary_cfg["base_url"]),
         "model": os.getenv("AGENT_LLM_MODEL", primary_cfg["model"]),
+        "fallback_model": primary_cfg.get("fallback_model"),
         "temperature": float(os.getenv("AGENT_LLM_TEMPERATURE", "0.3")),
         "max_tokens": int(os.getenv("AGENT_LLM_MAX_TOKENS", "1024")),
         "timeout_seconds": int(os.getenv("AGENT_LLM_TIMEOUT", "15")),

@@ -321,7 +321,11 @@ def _call_llm(
     client, config: dict, system: str, user: str,
     *, max_tokens_override: int | None = None, model_override: str | None = None,
 ) -> str:
-    """Make a single LLM call with rate limiting. Returns response text or empty string on failure."""
+    """Make a single LLM call with rate limiting and automatic model fallback on 429.
+
+    If the primary model hits a rate limit (429), automatically retries once
+    with the fallback model (e.g., llama-3.1-8b-instant).
+    """
     global _last_call_time
     throttle = config.get("throttle_sleep_seconds", 2.0)
     elapsed = time.time() - _last_call_time
@@ -329,18 +333,30 @@ def _call_llm(
         time.sleep(throttle - elapsed)
     _last_call_time = time.time()
 
+    model = model_override or config["model"]
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    kwargs = {
+        "temperature": config.get("temperature", 0.3),
+        "max_tokens": max_tokens_override or config.get("max_tokens", 1024),
+    }
+
     try:
-        resp = client.chat.completions.create(
-            model=model_override or config["model"],
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=config.get("temperature", 0.3),
-            max_tokens=max_tokens_override or config.get("max_tokens", 1024),
-        )
+        resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
         return resp.choices[0].message.content.strip()
     except Exception as e:
+        err_str = str(e)
+        fallback = config.get("fallback_model")
+        if "429" in err_str and fallback and fallback != model:
+            logger.warning("Rate limit on %s; retrying with fallback %s", model, fallback)
+            try:
+                resp = client.chat.completions.create(model=fallback, messages=messages, **kwargs)
+                return resp.choices[0].message.content.strip()
+            except Exception as e2:
+                logger.warning("Fallback model also failed: %s", e2)
+                return ""
         logger.warning("LLM call failed: %s", e)
         return ""
 
