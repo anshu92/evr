@@ -18,7 +18,7 @@ _PROVIDERS = {
     "groq": {
         "api_key_env": "GROQ_API_KEY",
         "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.3-70b-versatile",
+        "model": "llama-3.1-8b-instant",  # 500K+ TPD limit (vs 100K for 70b)
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
@@ -80,7 +80,7 @@ def get_agent_config() -> dict:
         "smart_model": smart_cfg["model"] if smart_available else primary_cfg["model"],
         "smart_available": smart_available,
         # Debate configuration
-        "max_debate_rounds": int(os.getenv("AGENT_MAX_DEBATE_ROUNDS", "2")),
+        "max_debate_rounds": int(os.getenv("AGENT_MAX_DEBATE_ROUNDS", "1")),
         "max_risk_rounds": int(os.getenv("AGENT_MAX_RISK_ROUNDS", "1")),
         "debate_max_tokens": int(os.getenv("AGENT_DEBATE_MAX_TOKENS", "256")),
         "analyst_max_tokens": int(os.getenv("AGENT_ANALYST_MAX_TOKENS", "200")),
@@ -93,5 +93,5 @@ def get_agent_config() -> dict:
         "exit_review_enabled": os.getenv("AGENT_EXIT_REVIEW_ENABLED", "1").lower() in ("1", "true"),
         # Rate limiting
         "throttle_sleep_seconds": float(os.getenv("AGENT_THROTTLE_SLEEP", "2.0")),
-        "max_llm_tickers": int(os.getenv("AGENT_MAX_LLM_TICKERS", "8")),
+        "max_llm_tickers": int(os.getenv("AGENT_MAX_LLM_TICKERS", "5")),
     }
