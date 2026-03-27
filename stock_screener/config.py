@@ -169,6 +169,10 @@ class Config:
     llm_agent_enabled: bool = False  # Enable LLM agent layer after screening
     llm_agent_ml_weight: float = 0.7  # Weight for ML score in blended signal
     llm_agent_llm_weight: float = 0.3  # Weight for LLM score in blended signal
+    agent_specialized_analysts: bool = True  # Split analyst into technical/fundamental/sentiment
+    agent_risk_debate_enabled: bool = True  # 3-way aggressive/conservative/neutral risk debate
+    agent_portfolio_reasoning: bool = True  # Cross-ticker portfolio-level LLM reasoning
+    agent_exit_review_enabled: bool = True  # LLM exit review during intraday
 
     # Intraday monitoring (lightweight exit-only runs during market hours)
     intraday_enabled: bool = False  # Enable intraday monitoring pipeline
