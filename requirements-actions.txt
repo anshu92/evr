@@ -21,5 +21,6 @@ html5lib>=1.1,<2.0.0
 joblib>=1.3.0,<2.0.0
 # News sentiment scoring (lightweight, no GPU, ~50KB)
 vaderSentiment>=3.3.0,<4.0.0
-# LLM agent layer (Groq free tier, OpenAI-compatible SDK, ~1MB)
+# LLM agent layer (Groq for fast calls, OpenAI SDK for Gemini smart calls)
 groq>=0.9.0,<1.0.0
+openai>=1.0.0,<2.0.0

@@ -116,6 +116,12 @@ try:
 except ImportError:
     _GROQ_AVAILABLE = False
 
+try:
+    from openai import OpenAI as _OpenAI
+    _OPENAI_AVAILABLE = True
+except ImportError:
+    _OPENAI_AVAILABLE = False
+
 
 @dataclass
 class AgentDecision:
@@ -300,18 +306,30 @@ def _create_client(config: dict):
 
 
 def _create_smart_client(config: dict):
-    """Create a client for the smart provider (Gemini). Falls back to primary if unavailable."""
-    if not _GROQ_AVAILABLE:
-        return None
+    """Create a client for the smart provider.
+
+    Uses the OpenAI SDK for Gemini (the Groq SDK doesn't work with Gemini's
+    OpenAI-compatible endpoint). Falls back to Groq SDK for groq provider.
+    """
     if not config.get("smart_api_key"):
         return None
-    kwargs: dict[str, Any] = {
-        "api_key": config["smart_api_key"],
-        "timeout": config.get("timeout_seconds", 15),
-    }
-    if config.get("smart_provider") != "groq":
-        kwargs["base_url"] = config.get("smart_base_url")
-    return Groq(**kwargs)
+    provider = config.get("smart_provider", "groq")
+    if provider == "groq":
+        if not _GROQ_AVAILABLE:
+            return None
+        return Groq(
+            api_key=config["smart_api_key"],
+            timeout=config.get("timeout_seconds", 15),
+        )
+    # Non-groq providers (Gemini, OpenAI, OpenRouter) use the OpenAI SDK
+    if not _OPENAI_AVAILABLE:
+        logger.warning("openai package not installed; smart provider (%s) unavailable", provider)
+        return None
+    return _OpenAI(
+        api_key=config["smart_api_key"],
+        base_url=config.get("smart_base_url"),
+        timeout=config.get("timeout_seconds", 15),
+    )
 
 
 _last_call_time: float = 0.0
