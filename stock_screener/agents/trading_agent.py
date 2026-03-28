@@ -397,10 +397,6 @@ def _call_llm(
         "temperature": config.get("temperature", 0.3),
         "max_completion_tokens": max_tok,
     }
-    # Disable thinking mode for reasoning models (qwen3-32b, etc.)
-    # This avoids <think> blocks that waste tokens and slow down responses.
-    if not model_override:  # Only for Groq fast-provider calls
-        kwargs["reasoning_effort"] = "none"
 
     # Smart-provider calls (model_override set): no chain, just try once
     if model_override:
@@ -422,10 +418,16 @@ def _call_llm(
         logger.warning("All models in chain are rate-limited for this run")
         return ""
 
+    # Models that support reasoning_effort parameter (disable <think> blocks)
+    _REASONING_MODELS = {"qwen/qwen3-32b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"}
+
     last_error = None
     for model in models_to_try:
         try:
-            resp = client.chat.completions.create(model=model, messages=messages, **kwargs)
+            call_kwargs = dict(kwargs)
+            if model in _REASONING_MODELS:
+                call_kwargs["reasoning_effort"] = "none"
+            resp = client.chat.completions.create(model=model, messages=messages, **call_kwargs)
             return _clean_think_response(resp.choices[0].message.content)
         except Exception as e:
             last_error = e
