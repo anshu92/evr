@@ -208,14 +208,20 @@ _BULL_PROMPT = """You are a BULL researcher arguing FOR buying {ticker}.
 
 Analyst report: {analyst_report}
 
-Present the strongest 2-3 bullet points for why this stock will outperform in the next 1-5 trading days. Focus on specific catalysts, momentum patterns, and quantitative support from the ML model. Be concise."""
+Recent News:
+{news_headlines}
+
+Present the strongest 2-3 bullet points for why this stock will outperform in the next 1-5 trading days. Focus on specific catalysts, momentum patterns, and quantitative support from the ML model. Reference specific news headlines if relevant. Be concise."""
 
 _BEAR_PROMPT = """You are a BEAR researcher arguing AGAINST buying {ticker}.
 
 Analyst report: {analyst_report}
 Bull case: {bull_case}
 
-Counter the bull thesis with 2-3 specific risk factors. Focus on what could go wrong in the next 1-5 days: overextension, sentiment reversal, sector headwinds, vol expansion. Be concise."""
+Recent News:
+{news_headlines}
+
+Counter the bull thesis with 2-3 specific risk factors. Focus on what could go wrong in the next 1-5 days: overextension, sentiment reversal, sector headwinds, vol expansion. Reference specific news if relevant. Be concise."""
 
 _RISK_PROMPT = """You are a risk manager evaluating {ticker} for portfolio inclusion.
 
@@ -223,9 +229,12 @@ Analyst report: {analyst_report}
 Bull case: {bull_case}
 Bear case: {bear_case}
 
+Recent News:
+{news_headlines}
+
 Current portfolio: {portfolio_context}
 
-Assess: (1) position sizing risk given current portfolio exposure, (2) correlation with existing holdings, (3) downside scenario magnitude. Keep to 2-3 sentences."""
+Assess: (1) position sizing risk given current portfolio exposure, (2) correlation with existing holdings, (3) downside scenario magnitude. Flag any congressional trading activity or unusual news. Keep to 2-3 sentences."""
 
 _PM_PROMPT = """You are a portfolio manager making the FINAL decision on {ticker}.
 
@@ -702,6 +711,7 @@ _RISK_AGGRESSIVE_PROMPT = """You are an AGGRESSIVE risk manager who favors calcu
 Analyst report: {analyst_report}
 Bull case: {bull_case}
 Bear case: {bear_case}
+Recent News: {news_headlines}
 Current portfolio: {portfolio_context}
 
 Argue for a LARGER position: (1) asymmetric upside potential, (2) why bear risks are priced in or manageable, (3) opportunity cost of being too conservative. 3 sentences max."""
@@ -711,6 +721,7 @@ _RISK_CONSERVATIVE_PROMPT = """You are a CONSERVATIVE risk manager who prioritiz
 Analyst report: {analyst_report}
 Bull case: {bull_case}
 Bear case: {bear_case}
+Recent News: {news_headlines}
 Current portfolio: {portfolio_context}
 
 Aggressive view: {aggressive_view}
@@ -722,6 +733,7 @@ _RISK_NEUTRAL_PROMPT = """You are a NEUTRAL risk manager synthesizing the aggres
 Analyst report: {analyst_report}
 Bull case: {bull_case}
 Bear case: {bear_case}
+Recent News: {news_headlines}
 Current portfolio: {portfolio_context}
 
 Aggressive view: {aggressive_view}
@@ -888,24 +900,25 @@ def _format_debate_history(history: list[tuple[str, str]]) -> str:
 
 
 def _run_debate(
-    client, cfg: dict, ticker: str, analyst_report: str,
+    client, cfg: dict, ticker: str, analyst_report: str, news_headlines: str = "",
 ) -> tuple[str, str, list[tuple[str, str]]]:
     """Run multi-turn bull/bear debate. Returns (bull_closing, bear_closing, history)."""
     max_rounds = max(1, cfg.get("max_debate_rounds", 1))
     debate_tokens = cfg.get("debate_max_tokens", 256)
     history: list[tuple[str, str]] = []
+    _nh = news_headlines or "No recent news available"
 
     # Round 1: use original prompts (backward compatible)
     bull_r1 = _call_llm(
         client, cfg, "You are a bullish equity researcher.",
-        _BULL_PROMPT.format(ticker=ticker, analyst_report=analyst_report),
+        _BULL_PROMPT.format(ticker=ticker, analyst_report=analyst_report, news_headlines=_nh),
         max_tokens_override=debate_tokens,
     )
     history.append(("BULL", bull_r1))
 
     bear_r1 = _call_llm(
         client, cfg, "You are a bearish equity researcher.",
-        _BEAR_PROMPT.format(ticker=ticker, analyst_report=analyst_report, bull_case=bull_r1),
+        _BEAR_PROMPT.format(ticker=ticker, analyst_report=analyst_report, bull_case=bull_r1, news_headlines=_nh),
         max_tokens_override=debate_tokens,
     )
     history.append(("BEAR", bear_r1))
@@ -959,16 +972,18 @@ def _run_debate(
 def _run_risk_debate(
     client, cfg: dict, ticker: str, analyst_report: str,
     bull_case: str, bear_case: str, portfolio_context: str,
+    news_headlines: str = "",
 ) -> tuple[str, dict[str, str]]:
     """Run aggressive/conservative/neutral risk debate. Returns (synthesis, views_dict)."""
     risk_tokens = cfg.get("debate_max_tokens", 256)
+    _nh = news_headlines or "No recent news available"
 
     aggressive = _call_llm(
         client, cfg, "You are an aggressive risk manager.",
         _RISK_AGGRESSIVE_PROMPT.format(
             ticker=ticker, analyst_report=analyst_report,
             bull_case=bull_case, bear_case=bear_case,
-            portfolio_context=portfolio_context,
+            portfolio_context=portfolio_context, news_headlines=_nh,
         ),
         max_tokens_override=risk_tokens,
     )
@@ -978,7 +993,7 @@ def _run_risk_debate(
         _RISK_CONSERVATIVE_PROMPT.format(
             ticker=ticker, analyst_report=analyst_report,
             bull_case=bull_case, bear_case=bear_case,
-            portfolio_context=portfolio_context,
+            portfolio_context=portfolio_context, news_headlines=_nh,
             aggressive_view=aggressive or "(aggressive view unavailable)",
         ),
         max_tokens_override=risk_tokens,
@@ -989,7 +1004,7 @@ def _run_risk_debate(
         _RISK_NEUTRAL_PROMPT.format(
             ticker=ticker, analyst_report=analyst_report,
             bull_case=bull_case, bear_case=bear_case,
-            portfolio_context=portfolio_context,
+            portfolio_context=portfolio_context, news_headlines=_nh,
             aggressive_view=aggressive or "(unavailable)",
             conservative_view=conservative or "(unavailable)",
         ),
@@ -1166,8 +1181,13 @@ def analyze_ticker(
     if not analyst_report:
         return None
 
+    # Format news for debate/risk prompts (all agents see the same headlines)
+    _news_fmt = _format_news_headlines(features)
+
     # 2. Bull/bear debate (Phase 1: multi-turn when max_debate_rounds > 1)
-    bull_case, bear_case, debate_history = _run_debate(client, cfg, ticker, analyst_report)
+    bull_case, bear_case, debate_history = _run_debate(
+        client, cfg, ticker, analyst_report, news_headlines=_news_fmt,
+    )
 
     # 3. Risk assessment (Phase 2: 3-way debate when enabled)
     risk_debate = None
@@ -1175,6 +1195,7 @@ def analyze_ticker(
         risk_assessment, risk_debate = _run_risk_debate(
             client, cfg, ticker, analyst_report,
             bull_case, bear_case, portfolio_context,
+            news_headlines=_news_fmt,
         )
     else:
         risk_assessment = _call_llm(
@@ -1183,6 +1204,7 @@ def analyze_ticker(
                 ticker=ticker, analyst_report=analyst_report,
                 bull_case=bull_case, bear_case=bear_case,
                 portfolio_context=portfolio_context,
+                news_headlines=_news_fmt,
             ),
         )
 
