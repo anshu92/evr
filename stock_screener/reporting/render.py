@@ -1265,6 +1265,63 @@ def render_reports(
     portfolio_label = f"{len(weights):,} tickers (current holdings)" if not weights.empty else "No current holdings"
     _n_actions = len(trade_actions) if trade_actions else 0
 
+    # ── Action Summary (top-line with LLM reasoning) ──
+    _action_summary_lines: list[str] = []
+    _llm_decisions = {}
+    if isinstance(llm_agent_data, dict) and llm_agent_data.get("decisions"):
+        _llm_decisions = llm_agent_data["decisions"]
+
+    if trade_actions:
+        for a in trade_actions:
+            _a_ticker = str(_action_value(a, "ticker", ""))
+            _a_action = str(_action_value(a, "action", ""))
+            _a_reason = str(_action_value(a, "reason", ""))
+            if not _a_ticker or not _a_action:
+                continue
+
+            # Color per action
+            _a_colors = {"BUY": "#059669", "SELL": "#dc2626", "SELL_PARTIAL": "#dc2626", "HOLD": "#2563eb"}
+            _a_c = _a_colors.get(_a_action, "#6b7280")
+            _a_icons = {"BUY": "&#9650;", "SELL": "&#9660;", "SELL_PARTIAL": "&#9660;", "HOLD": "&#9654;"}
+            _a_icon = _a_icons.get(_a_action, "&#9679;")
+
+            # Get LLM reasoning for this ticker
+            _llm_info = _llm_decisions.get(_a_ticker, {}) if isinstance(_llm_decisions, dict) else {}
+            _llm_rating = _llm_info.get("rating", "") if isinstance(_llm_info, dict) else ""
+            _llm_reasoning = _llm_info.get("reasoning", "") if isinstance(_llm_info, dict) else ""
+            _llm_score = _llm_info.get("score", 0) if isinstance(_llm_info, dict) else 0
+
+            # Build summary line
+            _reason_display = _llm_reasoning[:100] if _llm_reasoning else _a_reason[:60]
+            _llm_badge = ""
+            if _llm_rating:
+                _lr_c = _a_colors.get(_llm_rating, "#6b7280")
+                _llm_badge = f' <span style="font-size:10px;color:{_lr_c};font-weight:600;">LLM: {_llm_rating} ({_llm_score:+.1f})</span>'
+
+            _action_summary_lines.append(
+                f'<tr>'
+                f'<td style="padding:6px 8px;white-space:nowrap;vertical-align:top;">'
+                f'<span style="color:{_a_c};font-weight:700;">{_a_icon} {_a_action}</span></td>'
+                f'<td style="padding:6px 8px;font-weight:700;vertical-align:top;">{_html_escape(_a_ticker)}{_llm_badge}</td>'
+                f'<td style="padding:6px 8px;color:#374151;font-size:12px;line-height:1.4;vertical-align:top;">'
+                f'{_html_escape(_reason_display)}</td>'
+                f'</tr>'
+            )
+
+    if _action_summary_lines:
+        _action_summary_html = f"""
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);border-left:4px solid #111827;">
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;">Today&#39;s Actions</div>
+    <table style="border-collapse:collapse;width:100%;font-size:13px;">
+      {''.join(_action_summary_lines)}
+    </table>
+  </div>"""
+    else:
+        _action_summary_html = """
+  <div style="background:#ffffff;border-radius:12px;padding:14px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);border-left:4px solid #6b7280;">
+    <div style="font-size:14px;font-weight:600;color:#6b7280;">No actions today &mdash; portfolio aligned.</div>
+  </div>"""
+
     # ── Executive Summary Cards data ──
     # Equity card
     _eq_display = f"${_fmt_money(_pnl_equity)}" if _pnl_equity is not None else "N/A"
@@ -1358,9 +1415,12 @@ def render_reports(
     </td>
   </tr></table>
 
-  <!-- ===== 3. ACTION CARDS ===== -->
+  <!-- ===== 2.5 ACTION SUMMARY (one-line-per-action with LLM reasoning) ===== -->
+  {_action_summary_html}
+
+  <!-- ===== 3. ACTION CARDS (full detail) ===== -->
   <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Recommended Actions</div>
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Action Details</div>
     {actions_html}
   </div>
 
