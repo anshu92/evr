@@ -1703,18 +1703,32 @@ def apply_portfolio_reasoning_enforced(
     max_position_pct: float = 0.20,
     log: logging.Logger | None = None,
 ) -> pd.DataFrame:
-    """Apply portfolio-level LLM reasoning as BINDING adjustments."""
+    """Apply portfolio-level LLM reasoning as adjustments to existing target weights.
+
+    IMPORTANT: Only adjusts weights for tickers already in target_weights.
+    Never introduces new tickers (that would override per-ticker PM decisions).
+    """
     _log = log or logger
     tw = target_weights.copy()
+    _existing_tickers = set(tw.index.str.upper())
 
-    # 1. Apply explicit ticker weights from LLM (case-insensitive match)
+    # 1. Apply ticker weight adjustments — ONLY for tickers already selected
     ticker_weights = portfolio_reasoning.get("ticker_weights", {})
     if isinstance(ticker_weights, dict) and ticker_weights:
+        applied = {}
+        skipped = {}
         for t, w in ticker_weights.items():
-            mask = tw.index.str.upper() == str(t).upper()
+            t_upper = str(t).upper()
+            mask = tw.index.str.upper() == t_upper
             if mask.any():
                 tw.loc[mask, "weight"] = min(float(w), max_position_pct)
-        _log.info("Enforced LLM ticker weights: %s", ticker_weights)
+                applied[t] = w
+            else:
+                skipped[t] = w  # Not in target_weights — ignore
+        if applied:
+            _log.info("Portfolio reasoning adjusted weights: %s", applied)
+        if skipped:
+            _log.info("Portfolio reasoning skipped (not in targets): %s", list(skipped.keys()))
 
     # 2. Exclude tickers flagged by LLM
     excluded = portfolio_reasoning.get("excluded", [])
