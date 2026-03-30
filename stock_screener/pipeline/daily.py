@@ -1539,16 +1539,20 @@ def run_daily(cfg: Config, logger) -> None:
         pre_rebalance_weights,
         target_gross=target_gross_exposure,
     )
+    # In LLM-primary mode, skip rebalance hysteresis — the LLM made explicit
+    # BUY/SELL decisions that should be executed. Hysteresis is designed for
+    # ML-mode where score changes are incremental and small trades are noise.
+    _skip_hysteresis = bool(_llm_primary_mode and _llm_primary_success)
     rebalance_result = _apply_rebalance_controls(
         target_weights,
         state=state,
         screened=screened,
         prices_cad=prices_cad,
         market_vol_regime=market_vol_regime,
-        min_rebalance_weight_delta=getattr(cfg, "min_rebalance_weight_delta", 0.015),
-        min_trade_notional_cad=getattr(cfg, "min_trade_notional_cad", 15.0),
-        turnover_penalty_bps=getattr(cfg, "turnover_penalty_bps", 15.0),
-        dynamic_band_enabled=getattr(cfg, "dynamic_no_trade_band_enabled", True),
+        min_rebalance_weight_delta=0.0 if _skip_hysteresis else getattr(cfg, "min_rebalance_weight_delta", 0.015),
+        min_trade_notional_cad=1.0 if _skip_hysteresis else getattr(cfg, "min_trade_notional_cad", 15.0),
+        turnover_penalty_bps=0.0 if _skip_hysteresis else getattr(cfg, "turnover_penalty_bps", 15.0),
+        dynamic_band_enabled=False if _skip_hysteresis else getattr(cfg, "dynamic_no_trade_band_enabled", True),
         uncertainty_weight=getattr(cfg, "dynamic_no_trade_uncertainty_weight", 1.2),
         liquidity_weight=getattr(cfg, "dynamic_no_trade_liquidity_weight", 0.8),
         vol_regime_weight=getattr(cfg, "dynamic_no_trade_vol_regime_weight", 0.8),
@@ -1558,9 +1562,11 @@ def run_daily(cfg: Config, logger) -> None:
         target_gross_exposure=target_gross_exposure,
         allow_leverage=allow_leverage,
         logger=logger,
-        apply_turnover_shrinkage=apply_post_turnover_shrink,
+        apply_turnover_shrinkage=False if _skip_hysteresis else apply_post_turnover_shrink,
         return_diagnostics=True,
     )
+    if _skip_hysteresis:
+        logger.info("LLM-primary: rebalance hysteresis bypassed (LLM decisions are explicit)")
     if isinstance(rebalance_result, tuple):
         target_weights, rebalance_diag = rebalance_result
     else:
