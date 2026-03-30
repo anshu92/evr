@@ -773,6 +773,7 @@ def run_daily(cfg: Config, logger) -> None:
                     if cfg.llm_portfolio_enforce and isinstance(_pr, dict):
                         target_weights = _enforce_pr(
                             target_weights, _pr, screened,
+                            decisions=_decisions,
                             sector_cap=cfg.llm_sector_cap,
                             regime_reduce_scalar=cfg.llm_regime_reduce_scalar,
                             max_position_pct=float(getattr(cfg, "max_position_pct", 0.20)),
@@ -1704,25 +1705,47 @@ def run_daily(cfg: Config, logger) -> None:
             if t in screened.index:
                 target_weights.loc[t, "pred_peak_days"] = screened.loc[t, "pred_peak_days"]
     
-    # ── LLM-primary rotation: sell holdings not in LLM targets to free cash ──
+    # ── LLM-primary rotation: sell held positions to buy better LLM picks ──
+    # Only sells if the best new BUY candidate has higher expected return
+    # than the held position. Compares ML pred_return for both.
     _llm_rotation_sells: list = []
     if _llm_primary_mode and _llm_primary_success and not target_weights.empty:
         _target_tickers_upper = set(str(t).upper() for t in target_weights.index)
+
+        # Expected return of best new BUY candidate (not currently held)
+        _new_picks_returns: list[float] = []
+        for t in target_weights.index:
+            if str(t).upper() not in {str(p.ticker).upper() for p in state.positions if p.status == "OPEN"}:
+                _r = float(screened.loc[t, "pred_return"]) if t in screened.index and "pred_return" in screened.columns else 0.0
+                _new_picks_returns.append(_r)
+        _best_new_return = max(_new_picks_returns) if _new_picks_returns else 0.0
+
         for p in state.positions:
             if getattr(p, "status", "OPEN") != "OPEN":
                 continue
             _t = str(p.ticker).upper()
-            if _t not in _target_tickers_upper and _t not in exited_sell_tickers:
-                _px = float(prices_cad.get(p.ticker, 0)) if p.ticker in prices_cad.index else 0.0
-                if _px > 0:
-                    _llm_rotation_sells.append(TradeAction(
-                        ticker=p.ticker, action="SELL",
-                        reason="LLM_ROTATE: not in LLM target portfolio",
-                        shares=float(p.shares), price_cad=_px,
-                    ))
-                    logger.info("LLM rotation SELL: %s (not in LLM targets)", p.ticker)
+            if _t in _target_tickers_upper or _t in exited_sell_tickers:
+                continue  # Keep positions that are in LLM targets or already exited
+
+            _px = float(prices_cad.get(p.ticker, 0)) if p.ticker in prices_cad.index else 0.0
+            if _px <= 0:
+                continue
+
+            # Compare: held position's expected return vs best new pick
+            _held_return = float(screened.loc[p.ticker, "pred_return"]) if p.ticker in screened.index and "pred_return" in screened.columns else 0.0
+            if _best_new_return > _held_return:
+                _llm_rotation_sells.append(TradeAction(
+                    ticker=p.ticker, action="SELL",
+                    reason=f"LLM_ROTATE: new pick has {_best_new_return:.2%} vs held {_held_return:.2%}",
+                    shares=float(p.shares), price_cad=_px,
+                ))
+                logger.info("LLM rotation SELL: %s (pred_return %.2f%% < new pick %.2f%%)",
+                            p.ticker, _held_return * 100, _best_new_return * 100)
+            else:
+                logger.info("LLM rotation SKIP: %s (pred_return %.2f%% >= new pick %.2f%%, keeping)",
+                            p.ticker, _held_return * 100, _best_new_return * 100)
+
         if _llm_rotation_sells:
-            # Execute sells to free cash
             for a in _llm_rotation_sells:
                 for p in state.positions:
                     if p.status == "OPEN" and p.ticker == a.ticker:
@@ -1731,8 +1754,8 @@ def run_daily(cfg: Config, logger) -> None:
                         break
             exit_actions.extend(_llm_rotation_sells)
             exited_sell_tickers.update(str(a.ticker).upper() for a in _llm_rotation_sells)
-            logger.info("LLM rotation: %d sells to free cash ($%.2f now available)",
-                        len(_llm_rotation_sells), state.cash_cad)
+            logger.info("LLM rotation: %d sells to free cash ($%.2f available), best new pick return: %.2f%%",
+                        len(_llm_rotation_sells), state.cash_cad, _best_new_return * 100)
 
     trade_plan = pm.build_trade_plan(
         state=state,

@@ -1698,6 +1698,7 @@ def apply_portfolio_reasoning_enforced(
     portfolio_reasoning: dict[str, Any],
     screened: pd.DataFrame,
     *,
+    decisions: dict | None = None,
     sector_cap: float = 0.30,
     regime_reduce_scalar: float = 0.50,
     max_position_pct: float = 0.20,
@@ -1730,12 +1731,26 @@ def apply_portfolio_reasoning_enforced(
         if skipped:
             _log.info("Portfolio reasoning skipped (not in targets): %s", list(skipped.keys()))
 
-    # 2. Exclusions — ADVISORY ONLY, logged but NOT enforced.
-    # The per-ticker PM already made BUY/SELL decisions. Portfolio reasoning
-    # should adjust weights, not override PM decisions by excluding BUY-rated tickers.
+    # 2. Exclude tickers — but only those the PM did NOT rate BUY/OVERWEIGHT.
+    # Portfolio reasoning can filter weak picks (HOLD/UNDERWEIGHT/SELL) but
+    # cannot override explicit BUY decisions from the per-ticker PM.
     excluded = portfolio_reasoning.get("excluded", [])
-    if isinstance(excluded, list) and excluded:
-        _log.info("Portfolio reasoning suggested excluding: %s (advisory only, not enforced)", excluded)
+    if isinstance(excluded, list) and excluded and decisions:
+        _buy_tickers = set()
+        for t, d in decisions.items():
+            rating = getattr(d, "rating", "") if hasattr(d, "rating") else (d.get("rating", "") if isinstance(d, dict) else "")
+            if rating in ("BUY", "OVERWEIGHT"):
+                _buy_tickers.add(str(t).upper())
+        _safe_to_exclude = [e for e in excluded if str(e).upper() not in _buy_tickers]
+        _protected = [e for e in excluded if str(e).upper() in _buy_tickers]
+        if _safe_to_exclude:
+            before = len(tw)
+            tw = tw[~tw.index.str.upper().isin([e.upper() for e in _safe_to_exclude])]
+            _log.info("Excluded %d non-BUY tickers per portfolio reasoning: %s", before - len(tw), _safe_to_exclude)
+        if _protected:
+            _log.info("Protected %d BUY-rated tickers from exclusion: %s", len(_protected), _protected)
+    elif isinstance(excluded, list) and excluded:
+        _log.info("Portfolio reasoning suggested excluding: %s (no decisions available to validate)", excluded)
 
     # 3. Concentration risk: cap sector weights
     conc = str(portfolio_reasoning.get("concentration_risk", "")).upper()
