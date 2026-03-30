@@ -616,6 +616,8 @@ def run_daily(cfg: Config, logger) -> None:
 
     # ── LLM trading agent layer (fail-soft) ──────────────────────
     _decisions: dict = {}  # initialized here; populated inside the try block below
+    _agent_candidates: list = []  # initialized here for portfolio reasoning safety
+    _portfolio_ctx: str = "No current positions"
     if cfg.llm_agent_enabled and not screened.empty:
         try:
             from stock_screener.agents.trading_agent import (
@@ -1198,9 +1200,9 @@ def run_daily(cfg: Config, logger) -> None:
 
     # Portfolio actions (stateful)
     # Use full `features` for exits so we can manage holdings even if they are not in today's top-N.
-    prices_cad = features["last_close_cad"].astype(float)
-    pred_return = features["pred_return"].astype(float) if "pred_return" in features.columns else None
-    score = scored["score"].astype(float) if "score" in scored.columns else None
+    prices_cad = features["last_close_cad"].astype(float) if not features.empty and "last_close_cad" in features.columns else pd.Series(dtype=float)
+    pred_return = features["pred_return"].astype(float) if not features.empty and "pred_return" in features.columns else None
+    score = scored["score"].astype(float) if scored is not None and not scored.empty and "score" in scored.columns else None
     # `state` is loaded and migration-normalized before optimizer sizing.
     
     # Apply drawdown-based position sizing if enabled
@@ -1511,7 +1513,10 @@ def run_daily(cfg: Config, logger) -> None:
                         continue
                     _veto = False
                     if _rv.urgency == "MEDIUM" and pred_return is not None:
-                        _pr_val = float(pred_return.get(_t, float("nan"))) if hasattr(pred_return, "get") else 0.0
+                        try:
+                            _pr_val = float(pred_return[_t]) if _t in pred_return.index else 0.0
+                        except (KeyError, TypeError):
+                            _pr_val = 0.0
                         if not pd.isna(_pr_val) and _pr_val > cfg.llm_exit_ml_veto_threshold:
                             _veto = True
                             logger.info("LLM EXIT vetoed by ML: %s pred_return=%.2f%% > %.2f%%", _t, _pr_val * 100, cfg.llm_exit_ml_veto_threshold * 100)
@@ -1713,9 +1718,9 @@ def run_daily(cfg: Config, logger) -> None:
     # trade plan so they appear in the report and email.  Place sells first.
     if exit_actions:
         exit_sell_tickers = {
-            a.ticker
+            str(a.ticker).upper()
             for a in exit_actions
-            if a.action in ("SELL", "SELL_PARTIAL")
+            if a.action in ("SELL", "SELL_PARTIAL") and getattr(a, "ticker", None)
         }
         base_actions = [
             a
@@ -2332,9 +2337,11 @@ def run_intraday(cfg, logger) -> None:
 
             _agent_cfg = _get_agent_config()
             _has_key = bool(_agent_cfg.get("api_key"))
+            _llm_pm_intra = bool(getattr(cfg, "llm_decision_primary", False))
             _llm_tickers = list(screened.index[:cfg.dynamic_size_max_positions])
-            logger.info("Intraday LLM agent: provider=%s, key=%s, tickers=%d",
-                        _agent_cfg.get("provider"), "set" if _has_key else "MISSING", len(_llm_tickers))
+            logger.info("Intraday LLM agent: provider=%s, key=%s, tickers=%d, primary=%s",
+                        _agent_cfg.get("provider"), "set" if _has_key else "MISSING",
+                        len(_llm_tickers), _llm_pm_intra)
 
             if not _has_key:
                 run_meta_intraday["llm_agent"] = {"status": "skipped", "reason": "no API key"}
@@ -2377,6 +2384,7 @@ def run_intraday(cfg, logger) -> None:
 
                 _decisions = analyze_candidates(
                     _agent_candidates, portfolio_context=_portfolio_ctx, log=logger,
+                    primary_mode=_llm_pm_intra,
                 )
 
                 if _decisions:
@@ -2489,10 +2497,10 @@ def run_intraday(cfg, logger) -> None:
             if _held_after_exits:
                 _exit_news: dict[str, list] = {}
                 try:
-                    from stock_screener.data.news import fetch_ticker_news as _fetch_news
+                    from stock_screener.data.news_sources import fetch_ticker_news_multi as _fetch_news_exit
                     for _p in _held_after_exits[:6]:
                         try:
-                            _exit_news[_p.ticker] = _fetch_news(str(_p.ticker), logger=logger)[:3]
+                            _exit_news[_p.ticker] = _fetch_news_exit(str(_p.ticker), logger_=logger)[:3]
                         except Exception:
                             _exit_news[_p.ticker] = []
                 except Exception:
@@ -2617,9 +2625,10 @@ def run_intraday(cfg, logger) -> None:
         holdings_weights["actual_weight"] = pd.to_numeric(holdings_weights["position_value_cad"], errors="coerce") / equity_cad_live
     else:
         holdings_weights["actual_weight"] = pd.NA
+    _tw_col = holdings_weights["target_weight"] if "target_weight" in holdings_weights.columns else pd.NA
     holdings_weights["weight"] = holdings_weights["actual_weight"].where(
         pd.notna(holdings_weights["actual_weight"]),
-        holdings_weights.get("target_weight", pd.NA),
+        _tw_col,
     )
 
     all_trade_actions = exit_actions + rotation_actions + entry_actions + hold_actions
