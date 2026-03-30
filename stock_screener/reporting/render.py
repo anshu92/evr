@@ -851,22 +851,31 @@ def render_reports(
               <div style="padding:8px 12px;font-size:11px;color:#374151;background:#eff6ff;border-radius:8px;margin-top:4px;line-height:1.5;">{_html_escape(risk)}</div>
             </details>"""
 
-            # ── Assemble ticker card ──
+            # ── Assemble ticker card (collapsible, shows ticker+rating+verdict) ──
+            _verdict_preview = _html_escape(reasoning[:120]) + ("..." if len(reasoning) > 120 else "") if reasoning else ""
             ticker_cards_html += f"""
-          <div style="background:white;border-radius:12px;border:1px solid #e5e7eb;padding:16px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-              <div>
-                <span style="font-size:16px;font-weight:bold;color:#111827;">{_html_escape(str(ticker))}</span>
-                <span style="background:{rb};color:{rc};font-weight:bold;padding:3px 10px;border-radius:6px;font-size:12px;margin-left:8px;">{_html_escape(rating)} ({score:+.1f})</span>
+          <div style="background:white;border-radius:12px;border:1px solid #e5e7eb;padding:0;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.06);overflow:hidden;">
+            <details>
+              <summary style="cursor:pointer;padding:14px 16px;list-style:none;margin:0;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                  <div>
+                    <span style="font-size:16px;font-weight:bold;color:#111827;">{_html_escape(str(ticker))}</span>
+                    <span style="background:{rb};color:{rc};font-weight:bold;padding:3px 10px;border-radius:6px;font-size:12px;margin-left:8px;">{_html_escape(rating)} ({score:+.1f})</span>
+                    <span style="font-size:11px;color:#9ca3af;margin-left:8px;">{'%d-round debate' % debate_rounds if debate_rounds > 1 else ''}</span>
+                  </div>
+                  <div style="font-size:11px;color:#6b7280;">&#9654; expand</div>
+                </div>
+                <div style="font-size:12px;color:#374151;margin-top:6px;border-left:4px solid {rc};padding-left:10px;">{_verdict_preview}</div>
+              </summary>
+              <div style="padding:0 16px 16px 16px;">
+                <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:#374151;border-left:4px solid {rc};">
+                  <strong>Full Verdict:</strong> {_html_escape(reasoning)}
+                </div>
+                {analyst_section}
+                {debate_section}
+                {risk_section}
               </div>
-              <div style="font-size:11px;color:#9ca3af;">{'%d-round debate' % debate_rounds if debate_rounds > 1 else 'single pass'}</div>
-            </div>
-            <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:#374151;border-left:4px solid {rc};">
-              <strong>Verdict:</strong> {_html_escape(reasoning)}
-            </div>
-            {analyst_section}
-            {debate_section}
-            {risk_section}
+            </details>
           </div>"""
 
         if ticker_cards_html:
@@ -1265,17 +1274,39 @@ def render_reports(
     </td>
   </tr></table>
 
-  <!-- ===== 3. ACTION CARDS ===== -->
-  <div style="margin:0 0 16px 0;">
-    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Recommended Actions</div>
-    {actions_html}
+  <!-- ===== 3. ACTION CARDS (open by default) ===== -->
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details open>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;list-style:none;">
+        <span style="margin-right:6px;">&#9660;</span> Recommended Actions
+      </summary>
+      {actions_html}
+    </details>
   </div>
 
-  <!-- ===== 4. RISK DASHBOARD ===== -->
-  {risk_block}
+  <!-- ===== 4. RISK DASHBOARD (collapsed) ===== -->
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;list-style:none;">
+        <span style="margin-right:6px;">&#9654;</span> Risk Dashboard
+      </summary>
+      <div style="margin-top:10px;">
+        {risk_block}
+      </div>
+    </details>
+  </div>
 
-  <!-- ===== 5. LLM AGENT BLOCK (kept as-is) ===== -->
-  {llm_block}
+  <!-- ===== 5. LLM AGENT BLOCK (collapsed) ===== -->
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+    <details>
+      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;list-style:none;">
+        <span style="margin-right:6px;">&#129302;</span> LLM Agent Analysis
+      </summary>
+      <div style="margin-top:10px;">
+        {llm_block}
+      </div>
+    </details>
+  </div>
 
   <!-- ===== 6. PORTFOLIO DETAILS ===== -->
   <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
