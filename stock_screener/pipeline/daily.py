@@ -1704,6 +1704,36 @@ def run_daily(cfg: Config, logger) -> None:
             if t in screened.index:
                 target_weights.loc[t, "pred_peak_days"] = screened.loc[t, "pred_peak_days"]
     
+    # ── LLM-primary rotation: sell holdings not in LLM targets to free cash ──
+    _llm_rotation_sells: list = []
+    if _llm_primary_mode and _llm_primary_success and not target_weights.empty:
+        _target_tickers_upper = set(str(t).upper() for t in target_weights.index)
+        for p in state.positions:
+            if getattr(p, "status", "OPEN") != "OPEN":
+                continue
+            _t = str(p.ticker).upper()
+            if _t not in _target_tickers_upper and _t not in exited_sell_tickers:
+                _px = float(prices_cad.get(p.ticker, 0)) if p.ticker in prices_cad.index else 0.0
+                if _px > 0:
+                    _llm_rotation_sells.append(TradeAction(
+                        ticker=p.ticker, action="SELL",
+                        reason="LLM_ROTATE: not in LLM target portfolio",
+                        shares=float(p.shares), price_cad=_px,
+                    ))
+                    logger.info("LLM rotation SELL: %s (not in LLM targets)", p.ticker)
+        if _llm_rotation_sells:
+            # Execute sells to free cash
+            for a in _llm_rotation_sells:
+                for p in state.positions:
+                    if p.status == "OPEN" and p.ticker == a.ticker:
+                        p.status = "CLOSED"
+                        state.cash_cad += float(a.shares) * float(a.price_cad)
+                        break
+            exit_actions.extend(_llm_rotation_sells)
+            exited_sell_tickers.update(str(a.ticker).upper() for a in _llm_rotation_sells)
+            logger.info("LLM rotation: %d sells to free cash ($%.2f now available)",
+                        len(_llm_rotation_sells), state.cash_cad)
+
     trade_plan = pm.build_trade_plan(
         state=state,
         screened=screened,

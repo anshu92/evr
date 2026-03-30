@@ -1730,12 +1730,12 @@ def apply_portfolio_reasoning_enforced(
         if skipped:
             _log.info("Portfolio reasoning skipped (not in targets): %s", list(skipped.keys()))
 
-    # 2. Exclude tickers flagged by LLM
+    # 2. Exclusions — ADVISORY ONLY, logged but NOT enforced.
+    # The per-ticker PM already made BUY/SELL decisions. Portfolio reasoning
+    # should adjust weights, not override PM decisions by excluding BUY-rated tickers.
     excluded = portfolio_reasoning.get("excluded", [])
     if isinstance(excluded, list) and excluded:
-        before = len(tw)
-        tw = tw[~tw.index.str.upper().isin([e.upper() for e in excluded])]
-        _log.info("Excluded %d tickers per LLM: %s", before - len(tw), excluded)
+        _log.info("Portfolio reasoning suggested excluding: %s (advisory only, not enforced)", excluded)
 
     # 3. Concentration risk: cap sector weights
     conc = str(portfolio_reasoning.get("concentration_risk", "")).upper()
