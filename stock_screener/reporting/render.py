@@ -773,11 +773,11 @@ def render_reports(
               </div>"""
                 if analyst_cards:
                     analyst_section = f"""
-            <details style="margin-bottom:10px;">
-              <summary style="cursor:pointer;font-weight:bold;font-size:12px;color:#f59e0b;margin-bottom:6px;">&#128269; Analyst Team Reports</summary>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">{analyst_cards}
+            <div style="margin-bottom:10px;">
+              <div style="font-weight:bold;font-size:12px;color:#f59e0b;margin-bottom:6px;">&#128269; Analyst Team Reports</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">{analyst_cards}
               </div>
-            </details>"""
+            </div>"""
 
             # ── Bull vs Bear Debate cards (Phase 1) ──
             debate_section = ""
@@ -793,10 +793,10 @@ def render_reports(
                     <strong style="color:{side_color};">{side_icon} R{round_num} {side}:</strong> {_html_escape(text)}
                   </div>"""
                     debate_rounds_html = f"""
-                <details style="margin-top:6px;">
-                  <summary style="cursor:pointer;font-size:10px;color:#6b7280;">Full debate ({len(debate_history)} exchanges)</summary>
-                  <div style="margin-top:4px;">{debate_rounds_html}</div>
-                </details>"""
+                <div style="margin-top:6px;border-top:1px solid #e5e7eb;padding-top:6px;">
+                  <div style="font-size:10px;color:#6b7280;margin-bottom:4px;">Full debate ({len(debate_history)} exchanges)</div>
+                  {debate_rounds_html}
+                </div>"""
 
                 debate_section = f"""
             <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;">
@@ -838,22 +838,22 @@ def render_reports(
                   <span style="color:#e0e0e0;font-size:11px;"> {_html_escape(view)}</span>
                 </div>"""
                 risk_section = f"""
-            <details style="margin-bottom:10px;">
-              <summary style="cursor:pointer;font-weight:bold;font-size:12px;color:#3b82f6;margin-bottom:6px;">&#128737; Risk Management Debate</summary>
-              <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px;">
+            <div style="margin-bottom:10px;">
+              <div style="font-weight:bold;font-size:12px;color:#3b82f6;margin-bottom:6px;">&#128737; Risk Management Debate</div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;">
                 <div style="flex:1;min-width:300px;">{risk_cards}</div>
                 <div style="flex:1;min-width:200px;background:#eff6ff;border-radius:10px;padding:12px;border-left:4px solid #3b82f6;">
                   <div style="font-size:11px;font-weight:bold;color:#1e40af;margin-bottom:4px;">&#128100; Risk Synthesis</div>
                   <div style="font-size:11px;color:#374151;line-height:1.5;">{_html_escape(risk)}</div>
                 </div>
               </div>
-            </details>"""
+            </div>"""
             elif risk:
                 risk_section = f"""
-            <details style="margin-bottom:6px;">
-              <summary style="cursor:pointer;font-size:12px;font-weight:bold;color:#3b82f6;">&#128737; Risk Assessment</summary>
-              <div style="padding:8px 12px;font-size:11px;color:#374151;background:#eff6ff;border-radius:8px;margin-top:4px;line-height:1.5;">{_html_escape(risk)}</div>
-            </details>"""
+            <div style="margin-bottom:6px;">
+              <div style="font-size:12px;font-weight:bold;color:#3b82f6;margin-bottom:4px;">&#128737; Risk Assessment</div>
+              <div style="padding:8px 12px;font-size:11px;color:#374151;background:#eff6ff;border-radius:8px;line-height:1.5;">{_html_escape(risk)}</div>
+            </div>"""
 
             # ── PM Decision card ──
             pm_section = ""
@@ -881,32 +881,23 @@ def render_reports(
               <div style="font-size:12px;color:#374151;margin-top:8px;line-height:1.5;">{_html_escape(reasoning)}</div>
             </div>"""
 
-            # ── Assemble ticker card (collapsible, shows ticker+rating+verdict) ──
-            _verdict_preview = _html_escape(reasoning[:120]) + ("..." if len(reasoning) > 120 else "") if reasoning else ""
+            # ── Assemble ticker card (always visible — Gmail strips <details>) ──
             ticker_cards_html += f"""
-          <div style="background:white;border-radius:12px;border:1px solid #e5e7eb;padding:0;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.06);overflow:hidden;">
-            <details>
-              <summary style="cursor:pointer;padding:14px 16px;list-style:none;margin:0;">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
-                  <div>
-                    <span style="font-size:16px;font-weight:bold;color:#111827;">{_html_escape(str(ticker))}</span>
-                    <span style="background:{rb};color:{rc};font-weight:bold;padding:3px 10px;border-radius:6px;font-size:12px;margin-left:8px;">{_html_escape(rating)} ({score:+.1f})</span>
-                    <span style="font-size:11px;color:#9ca3af;margin-left:8px;">{'%d-round debate' % debate_rounds if debate_rounds > 1 else ''}</span>
-                  </div>
-                  <div style="font-size:11px;color:#6b7280;">&#9654; expand</div>
-                </div>
-                <div style="font-size:12px;color:#374151;margin-top:6px;border-left:4px solid {rc};padding-left:10px;">{_verdict_preview}</div>
-              </summary>
-              <div style="padding:0 16px 16px 16px;">
-                <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:#374151;border-left:4px solid {rc};">
-                  <strong>Full Verdict:</strong> {_html_escape(reasoning)}
-                </div>
-                {analyst_section}
-                {debate_section}
-                {risk_section}
-                {pm_section}
+          <div style="background:white;border-radius:12px;border:1px solid #e5e7eb;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+              <div>
+                <span style="font-size:16px;font-weight:bold;color:#111827;">{_html_escape(str(ticker))}</span>
+                <span style="background:{rb};color:{rc};font-weight:bold;padding:3px 10px;border-radius:6px;font-size:12px;margin-left:8px;">{_html_escape(rating)} ({score:+.1f})</span>
+                <span style="font-size:11px;color:#9ca3af;margin-left:8px;">{'%d-round debate' % debate_rounds if debate_rounds > 1 else ''}</span>
               </div>
-            </details>
+            </div>
+            <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:#374151;border-left:4px solid {rc};">
+              <strong>Verdict:</strong> {_html_escape(reasoning)}
+            </div>
+            {pm_section}
+            {analyst_section}
+            {debate_section}
+            {risk_section}
           </div>"""
 
         if ticker_cards_html:
@@ -1305,101 +1296,66 @@ def render_reports(
     </td>
   </tr></table>
 
-  <!-- ===== 3. ACTION CARDS (open by default) ===== -->
+  <!-- ===== 3. ACTION CARDS ===== -->
   <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details open>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;list-style:none;">
-        <span style="margin-right:6px;">&#9660;</span> Recommended Actions
-      </summary>
-      {actions_html}
-    </details>
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:12px;">Recommended Actions</div>
+    {actions_html}
   </div>
 
-  <!-- ===== 4. RISK DASHBOARD (collapsed) ===== -->
+  <!-- ===== 4. RISK DASHBOARD ===== -->
   <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;list-style:none;">
-        <span style="margin-right:6px;">&#9654;</span> Risk Dashboard
-      </summary>
-      <div style="margin-top:10px;">
-        {risk_block}
-      </div>
-    </details>
+    <div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;">Risk Dashboard</div>
+    {risk_block}
   </div>
 
-  <!-- ===== 5. LLM AGENT BLOCK (collapsed) ===== -->
+  <!-- ===== 5. LLM AGENT BLOCK ===== -->
   <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;list-style:none;">
-        <span style="margin-right:6px;">&#129302;</span> LLM Agent Analysis
-      </summary>
-      <div style="margin-top:10px;">
-        {llm_block}
-      </div>
-    </details>
+    {llm_block}
   </div>
 
-  <!-- ===== 6. PORTFOLIO DETAILS ===== -->
-  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;margin-bottom:10px;">
-        P&amp;L Breakdown
-      </summary>
-      <div style="margin-top:10px;">
-        {pnl_block}
-      </div>
-    </details>
+  <!-- ===== 6. PORTFOLIO DETAILS (secondary — muted styling) ===== -->
+  <div style="border-top:2px solid #e5e7eb;margin:24px 0 16px 0;padding-top:16px;">
+    <div style="font-size:13px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:12px;">Portfolio Details</div>
+  </div>
+
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 12px 0;box-shadow:0 1px 2px rgba(0,0,0,0.05);">
+    <div style="font-size:14px;font-weight:700;color:#374151;margin-bottom:10px;">P&amp;L Breakdown</div>
+    {pnl_block}
   </div>
 
   {target_weights_html_block}
 
-  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;">
-        Current Portfolio Holdings ({portfolio_label})
-      </summary>
-      <div style="margin-top:12px;overflow-x:auto;">
-        <table style="border-collapse:collapse;width:100%;font-size:12px;">
-          <thead>
-            <tr style="background:#f9fafb;">{headers_html}</tr>
-          </thead>
-          <tbody>
-            {rows_html}
-          </tbody>
-        </table>
-      </div>
-    </details>
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 12px 0;box-shadow:0 1px 2px rgba(0,0,0,0.05);">
+    <div style="font-size:14px;font-weight:700;color:#374151;margin-bottom:10px;">Current Portfolio Holdings ({portfolio_label})</div>
+    <div style="overflow-x:auto;">
+      <table style="border-collapse:collapse;width:100%;font-size:12px;">
+        <thead>
+          <tr style="background:#f9fafb;">{headers_html}</tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+    </div>
   </div>
 
-  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;">
-        Universe &amp; Screening Stats
-      </summary>
-      <div style="margin-top:10px;">
-        <table style="border-collapse:collapse;width:100%;font-size:12px;">
-          <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Universe</td>
-              <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">US + TSX</td></tr>
-          <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Tickers Scanned</td>
-              <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">{total_scanned:,}</td></tr>
-          <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Top Screened</td>
-              <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">{len(screened):,} tickers</td></tr>
-          <tr><td style="padding:5px 8px;color:#6b7280;">Portfolio</td>
-              <td style="padding:5px 8px;font-weight:600;">{portfolio_label}</td></tr>
-        </table>
-      </div>
-    </details>
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 12px 0;box-shadow:0 1px 2px rgba(0,0,0,0.05);">
+    <div style="font-size:14px;font-weight:700;color:#374151;margin-bottom:10px;">Universe &amp; Screening Stats</div>
+    <table style="border-collapse:collapse;width:100%;font-size:12px;">
+      <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Universe</td>
+          <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">US + TSX</td></tr>
+      <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Tickers Scanned</td>
+          <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">{total_scanned:,}</td></tr>
+      <tr><td style="padding:5px 8px;color:#6b7280;border-bottom:1px solid #f3f4f6;">Top Screened</td>
+          <td style="padding:5px 8px;font-weight:600;border-bottom:1px solid #f3f4f6;">{len(screened):,} tickers</td></tr>
+      <tr><td style="padding:5px 8px;color:#6b7280;">Portfolio</td>
+          <td style="padding:5px 8px;font-weight:600;">{portfolio_label}</td></tr>
+    </table>
   </div>
 
-  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 16px 0;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-    <details>
-      <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#111827;">
-        Model Validation
-      </summary>
-      <div style="margin-top:10px;">
-        {model_block if model_block else '<div style="font-size:12px;color:#9ca3af;">No model validation data available.</div>'}
-      </div>
-    </details>
+  <div style="background:#ffffff;border-radius:12px;padding:16px 18px;margin:0 0 12px 0;box-shadow:0 1px 2px rgba(0,0,0,0.05);">
+    <div style="font-size:14px;font-weight:700;color:#374151;margin-bottom:10px;">Model Validation</div>
+    {model_block if model_block else '<div style="font-size:12px;color:#9ca3af;">No model validation data available.</div>'}
   </div>
 
   <div style="text-align:center;padding:16px 0 8px 0;font-size:11px;color:#9ca3af;">
