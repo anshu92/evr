@@ -559,20 +559,22 @@ def _format_news_sentiment(features: dict) -> str:
 
 
 def _format_news_headlines(features: dict) -> str:
-    """Format actual news headlines for the LLM prompt."""
+    """Format news headlines for the LLM prompt, showing source type."""
     headlines = features.get("news_headlines", [])
     if not headlines:
         return "No recent news available"
     lines = []
-    for i, article in enumerate(headlines[:5], 1):
+    for i, article in enumerate(headlines[:8], 1):
         title = article.get("title", "").strip()
         publisher = article.get("publisher", "")
         date = article.get("publish_date", "")
+        source_type = article.get("source_type", "")
         if not title:
             continue
         date_str = f" ({date[:10]})" if date else ""
         pub_str = f" — {publisher}" if publisher else ""
-        lines.append(f"  {i}. {title}{pub_str}{date_str}")
+        tag = f"[{source_type}] " if source_type else ""
+        lines.append(f"  {i}. {tag}{title}{pub_str}{date_str}")
     return "\n".join(lines) if lines else "No recent news available"
 
 

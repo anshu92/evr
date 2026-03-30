@@ -599,12 +599,12 @@ def run_daily(cfg: Config, logger) -> None:
                 run_meta["llm_agent"] = {"status": "skipped", "reason": "no API key configured"}
                 logger.warning("LLM agent: GROQ_API_KEY not set; skipping")
             else:
-                from stock_screener.data.news import fetch_ticker_news
+                from stock_screener.data.news_sources import fetch_ticker_news_multi, fetch_market_news
                 _llm_tickers = list(screened.index[:cfg.dynamic_size_max_positions])
                 _news_by_ticker: dict[str, list[dict]] = {}
                 for _nt in _llm_tickers:
                     try:
-                        _news_by_ticker[str(_nt)] = fetch_ticker_news(str(_nt), logger=logger)[:5]
+                        _news_by_ticker[str(_nt)] = fetch_ticker_news_multi(str(_nt), logger_=logger)[:8]
                     except Exception:
                         _news_by_ticker[str(_nt)] = []
 
@@ -2278,7 +2278,7 @@ def run_intraday(cfg, logger) -> None:
                 analyze_candidates, blend_llm_scores, build_agent_candidates, build_portfolio_context,
             )
             from stock_screener.agents.config import get_agent_config as _get_agent_config
-            from stock_screener.data.news import fetch_ticker_news
+            from stock_screener.data.news_sources import fetch_ticker_news_multi as _fetch_news_intra
 
             _agent_cfg = _get_agent_config()
             _has_key = bool(_agent_cfg.get("api_key"))
@@ -2310,7 +2310,7 @@ def run_intraday(cfg, logger) -> None:
                 _news_by_ticker: dict[str, list] = {}
                 for _nt in _llm_tickers:
                     try:
-                        _news_by_ticker[str(_nt)] = fetch_ticker_news(str(_nt), logger=logger)[:5]
+                        _news_by_ticker[str(_nt)] = _fetch_news_intra(str(_nt), logger_=logger)[:8]
                     except Exception:
                         _news_by_ticker[str(_nt)] = []
 
