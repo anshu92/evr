@@ -732,13 +732,32 @@ def render_reports(
     if isinstance(llm_agent_data, dict) and llm_agent_data.get("decisions"):
         ticker_cards_html = ""
         _model_symbols = {
+            # Groq models
             "llama-3.3-70b-versatile": ("&#129409;", "#f59e0b", "Llama 70B"),
             "qwen/qwen3-32b": ("&#9878;", "#3b82f6", "Qwen3 32B"),
             "meta-llama/llama-4-scout-17b-16e-instruct": ("&#128269;", "#10b981", "Llama 4 Scout"),
             "moonshotai/kimi-k2-instruct": ("&#127769;", "#8b5cf6", "Kimi K2"),
             "llama-3.1-8b-instant": ("&#9889;", "#6b7280", "Llama 8B"),
+            # Gemini
             "gemini-2.5-flash": ("&#128142;", "#059669", "Gemini 2.5"),
             "gemini-2.0-flash": ("&#128142;", "#059669", "Gemini 2.0"),
+            # OpenRouter models
+            "meta-llama/llama-3.3-70b-instruct:free": ("&#129409;", "#f59e0b", "Llama 70B OR"),
+            "nousresearch/hermes-3-llama-3.1-405b:free": ("&#128171;", "#dc2626", "Hermes 405B"),
+            "nvidia/nemotron-3-super-120b-a12b:free": ("&#128640;", "#22c55e", "Nemotron 120B"),
+            "openai/gpt-oss-120b:free": ("&#129302;", "#3b82f6", "GPT-OSS 120B"),
+            "qwen/qwen3-next-80b-a3b-instruct:free": ("&#9878;", "#3b82f6", "Qwen3 80B"),
+            "qwen/qwen3.6-plus-preview:free": ("&#9878;", "#8b5cf6", "Qwen3.6 Plus"),
+            "stepfun/step-3.5-flash:free": ("&#9733;", "#f59e0b", "Step 3.5"),
+            "z-ai/glm-4.5-air:free": ("&#127752;", "#10b981", "GLM 4.5"),
+            "arcee-ai/trinity-large-preview:free": ("&#9651;", "#6b7280", "Trinity Large"),
+            "google/gemma-3-27b-it:free": ("&#128308;", "#dc2626", "Gemma 27B"),
+            "nvidia/nemotron-3-nano-30b-a3b:free": ("&#128640;", "#22c55e", "Nemotron 30B"),
+            "minimax/minimax-m2.5:free": ("&#128172;", "#f59e0b", "MiniMax M2.5"),
+            "openai/gpt-oss-20b:free": ("&#129302;", "#6b7280", "GPT-OSS 20B"),
+            "google/gemma-3-12b-it:free": ("&#128308;", "#f59e0b", "Gemma 12B"),
+            "nvidia/nemotron-nano-9b-v2:free": ("&#128640;", "#6b7280", "Nemotron 9B"),
+            "arcee-ai/trinity-mini:free": ("&#9651;", "#9ca3af", "Trinity Mini"),
         }
         for ticker, info in llm_agent_data["decisions"].items():
             if not isinstance(info, dict):

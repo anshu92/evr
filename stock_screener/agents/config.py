@@ -29,21 +29,43 @@ from typing import Any
 # Provider determines which API key/base_url to use.
 
 _FAST_MODEL_CHAIN: list[tuple[str, str]] = [
-    ("llama-3.3-70b-versatile",                     "groq"),        # Best, 100K TPD
-    ("meta-llama/llama-3.3-70b-instruct:free",      "openrouter"),  # Same model, different quota
-    ("qwen/qwen3-32b",                              "groq"),        # Strong, 500K TPD
-    ("nousresearch/hermes-3-llama-3.1-405b:free",   "openrouter"),  # 405B when available
-    ("meta-llama/llama-4-scout-17b-16e-instruct",   "groq"),        # MoE, 500K TPD
-    ("google/gemma-3-27b-it:free",                  "openrouter"),  # Decent
-    ("moonshotai/kimi-k2-instruct",                 "groq"),        # Good, 300K TPD
-    ("llama-3.1-8b-instant",                        "groq"),        # Last resort
+    # Tier 1: Best reasoning (70B+)
+    ("llama-3.3-70b-versatile",                     "groq"),        # 70B, 100K TPD Groq
+    ("meta-llama/llama-3.3-70b-instruct:free",      "openrouter"),  # 70B, same quality different quota
+    ("nousresearch/hermes-3-llama-3.1-405b:free",   "openrouter"),  # 405B, best when available
+    ("nvidia/nemotron-3-super-120b-a12b:free",      "openrouter"),  # 120B MoE (12B active), 262K ctx
+    ("openai/gpt-oss-120b:free",                    "openrouter"),  # 120B, GPT-class
+    # Tier 2: Strong reasoning (30-80B)
+    ("qwen/qwen3-32b",                              "groq"),        # 32B, 500K TPD Groq
+    ("qwen/qwen3-next-80b-a3b-instruct:free",       "openrouter"),  # 80B MoE (3B active), 262K ctx
+    ("qwen/qwen3.6-plus-preview:free",              "openrouter"),  # Latest Qwen, 1M ctx
+    ("meta-llama/llama-4-scout-17b-16e-instruct",   "groq"),        # 17B MoE, 500K TPD Groq
+    ("stepfun/step-3.5-flash:free",                 "openrouter"),  # 256K ctx
+    ("z-ai/glm-4.5-air:free",                       "openrouter"),  # 131K ctx, GLM family
+    ("arcee-ai/trinity-large-preview:free",          "openrouter"),  # 131K ctx
+    # Tier 3: Good quality (9-30B)
+    ("moonshotai/kimi-k2-instruct",                 "groq"),        # 300K TPD Groq
+    ("google/gemma-3-27b-it:free",                  "openrouter"),  # 27B, 131K ctx
+    ("nvidia/nemotron-3-nano-30b-a3b:free",         "openrouter"),  # 30B MoE (3B active), 256K ctx
+    ("minimax/minimax-m2.5:free",                   "openrouter"),  # 196K ctx
+    ("openai/gpt-oss-20b:free",                     "openrouter"),  # 20B, GPT-class
+    ("google/gemma-3-12b-it:free",                  "openrouter"),  # 12B, 32K ctx
+    # Tier 4: Fast fallback (small models)
+    ("llama-3.1-8b-instant",                        "groq"),        # 8B, 500K TPD, 14K RPD
+    ("nvidia/nemotron-nano-9b-v2:free",             "openrouter"),  # 9B, 128K ctx
+    ("arcee-ai/trinity-mini:free",                  "openrouter"),  # Small, 131K ctx
 ]
 
 _SMART_MODEL_CHAIN: list[tuple[str, str]] = [
-    ("gemini-2.5-flash",                            "gemini"),      # Best for structured output
-    ("llama-3.3-70b-versatile",                     "groq"),        # Fallback
-    ("meta-llama/llama-3.3-70b-instruct:free",      "openrouter"),  # Fallback
-    ("qwen/qwen3-32b",                              "groq"),        # Fallback
+    # Best structured output + reasoning for PM decisions
+    ("gemini-2.5-flash",                            "gemini"),      # Best structured output
+    ("llama-3.3-70b-versatile",                     "groq"),        # Strong reasoning
+    ("meta-llama/llama-3.3-70b-instruct:free",      "openrouter"),  # Same quality
+    ("nousresearch/hermes-3-llama-3.1-405b:free",   "openrouter"),  # 405B massive
+    ("nvidia/nemotron-3-super-120b-a12b:free",      "openrouter"),  # 120B
+    ("openai/gpt-oss-120b:free",                    "openrouter"),  # 120B GPT-class
+    ("qwen/qwen3-32b",                              "groq"),        # Strong reasoning
+    ("qwen/qwen3.6-plus-preview:free",              "openrouter"),  # Latest Qwen
 ]
 
 # Provider connection presets
@@ -71,7 +93,14 @@ _PROVIDER_PRESETS: dict[str, dict[str, str]] = {
 }
 
 # Models that support reasoning_effort="none" to disable <think> blocks
-REASONING_MODELS: set[str] = {"qwen/qwen3-32b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"}
+REASONING_MODELS: set[str] = {
+    "qwen/qwen3-32b",
+    "qwen/qwen3-next-80b-a3b-instruct:free",
+    "qwen/qwen3.6-plus-preview:free",
+    "qwen/qwen3-coder:free",
+    "openai/gpt-oss-120b", "openai/gpt-oss-120b:free",
+    "openai/gpt-oss-20b", "openai/gpt-oss-20b:free",
+}
 
 
 def _get_available_providers() -> dict[str, str]:
