@@ -137,11 +137,25 @@ def run_daily(cfg: Config, logger) -> None:
     if cfg.max_total_tickers is not None:
         all_tickers = all_tickers[: cfg.max_total_tickers]
 
+    # Inject tickers from recent congressional trades into the universe
+    # so they get screened even if not in the standard US/TSX universe.
+    _congress_tickers: list[str] = []
+    try:
+        from stock_screener.data.news_sources import get_congress_traded_tickers
+        _congress_tickers = get_congress_traded_tickers(max_age_days=14)
+        _new_congress = [t for t in _congress_tickers if t not in all_tickers]
+        if _new_congress:
+            all_tickers.extend(_new_congress)
+            logger.info("Added %d congress-traded tickers to universe: %s", len(_new_congress), ", ".join(_new_congress[:10]))
+    except Exception as e:
+        logger.debug("Congress ticker fetch failed (continuing): %s", e)
+
     universe = Universe(
         tickers=all_tickers,
         meta={
             "us": us.meta,
             "tsx": tsx.meta,
+            "congress_tickers": _congress_tickers,
             "total_requested": len(all_tickers),
         },
     )

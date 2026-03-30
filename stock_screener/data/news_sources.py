@@ -171,13 +171,28 @@ def search_reddit_ticker(
 # ── Congressional Trading (Reddit r/CongressStockWatcher) ─────────────────
 
 _TICKER_RE = re.compile(r"\$([A-Z]{2,5})\b")
+_MAX_AGE_DAYS = 14  # Default: ignore posts older than 2 weeks
 
 
-def fetch_congress_trades(limit: int = 15, min_score: int = 3) -> list[dict[str, Any]]:
+def _is_recent(pub_date: str | None, max_age_days: int = _MAX_AGE_DAYS) -> bool:
+    """Check if a publish date is within max_age_days of now."""
+    if not pub_date:
+        return True  # No date = assume recent
+    try:
+        dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
+        age = (datetime.now(tz=timezone.utc) - dt).total_seconds() / 86400
+        return age <= max_age_days
+    except (ValueError, TypeError):
+        return True
+
+
+def fetch_congress_trades(
+    limit: int = 25, min_score: int = 1, max_age_days: int = _MAX_AGE_DAYS,
+) -> list[dict[str, Any]]:
     """Fetch recent congressional trading posts from r/CongressStockWatcher.
 
-    Returns article dicts with source_type="congress". Posts include
-    congress member trades, insider buys, and political trading signals.
+    Returns article dicts with source_type="congress", filtered to max_age_days.
+    Posts include congress member trades, insider buys, and political trading signals.
     No API key required.
     """
     articles: list[dict[str, Any]] = []
@@ -201,6 +216,8 @@ def fetch_congress_trades(limit: int = 15, min_score: int = 3) -> list[dict[str,
                     datetime.fromtimestamp(created, tz=timezone.utc).isoformat()
                     if created else None
                 )
+                if not _is_recent(pub_date, max_age_days):
+                    continue
                 # Extract tickers from title ($TICKER pattern)
                 tickers_found = _TICKER_RE.findall(title)
                 articles.append({
@@ -217,12 +234,32 @@ def fetch_congress_trades(limit: int = 15, min_score: int = 3) -> list[dict[str,
     return articles
 
 
-def get_congress_trades_for_ticker(ticker: str, limit: int = 15) -> list[dict[str, Any]]:
+def get_congress_traded_tickers(max_age_days: int = _MAX_AGE_DAYS) -> list[str]:
+    """Extract unique tickers from recent congressional trades.
+
+    Returns list of ticker symbols that congress members have recently traded.
+    Useful for adding to the screening universe as high-signal candidates.
+    """
+    trades = fetch_congress_trades(limit=25, min_score=1, max_age_days=max_age_days)
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for t in trades:
+        for ticker in t.get("tickers", []):
+            if ticker not in seen:
+                seen.add(ticker)
+                tickers.append(ticker)
+    return tickers
+
+
+def get_congress_trades_for_ticker(
+    ticker: str, limit: int = 25, max_age_days: int = _MAX_AGE_DAYS,
+) -> list[dict[str, Any]]:
     """Get congressional trading posts that mention a specific ticker.
 
     Searches post titles for $TICKER pattern and ticker name mentions.
+    Filtered to max_age_days.
     """
-    all_posts = fetch_congress_trades(limit=limit, min_score=1)
+    all_posts = fetch_congress_trades(limit=limit, min_score=1, max_age_days=max_age_days)
     ticker_upper = ticker.upper()
     matches: list[dict[str, Any]] = []
     for post in all_posts:
@@ -294,17 +331,22 @@ def fetch_finnhub_news(
 
 # ── Unified Aggregator ────────────────────────────────────────────────────
 
-def fetch_market_news(max_headlines: int = 15) -> list[dict[str, Any]]:
+def fetch_market_news(max_headlines: int = 20, max_age_days: int = 7) -> list[dict[str, Any]]:
     """Fetch general market news from all free sources (no ticker filter).
 
-    Combines: RSS feeds + Reddit hot posts + Congressional trades. No API key required.
-    Returns up to max_headlines articles sorted by recency.
+    Combines: Congressional trades (priority) + RSS feeds + Reddit hot posts.
+    Congress trades are listed first since they're high-signal for trading.
+    All articles filtered to max_age_days. No API key required.
     """
-    articles: list[dict[str, Any]] = []
-    articles.extend(fetch_rss_headlines(max_per_feed=8))
-    articles.extend(fetch_reddit_posts(limit=10, min_score=100))
-    articles.extend(fetch_congress_trades(limit=10, min_score=3))
-    # Deduplicate by title similarity (exact match after lowering)
+    # Congress trades first (highest signal)
+    congress = fetch_congress_trades(limit=15, min_score=1, max_age_days=max_age_days)
+    rss = [a for a in fetch_rss_headlines(max_per_feed=8) if _is_recent(a.get("publish_date"), max_age_days)]
+    reddit = [a for a in fetch_reddit_posts(limit=10, min_score=100) if _is_recent(a.get("publish_date"), max_age_days)]
+
+    # Congress first, then RSS, then Reddit
+    articles: list[dict[str, Any]] = congress + rss + reddit
+
+    # Deduplicate by title similarity
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for a in articles:
@@ -319,11 +361,12 @@ def fetch_market_news(max_headlines: int = 15) -> list[dict[str, Any]]:
 def fetch_ticker_news_multi(
     ticker: str,
     logger_: Any = None,
+    max_age_days: int = 7,
 ) -> list[dict[str, Any]]:
     """Fetch news for a specific ticker from ALL available sources.
 
-    Combines: yfinance (existing) + Finnhub + Reddit search.
-    Returns unified article list sorted by source priority.
+    Combines: yfinance + Finnhub + Reddit search + Congressional trades.
+    Filtered to max_age_days. Returns unified article list.
     """
     _log = logger_ or logger
     articles: list[dict[str, Any]] = []
@@ -347,13 +390,15 @@ def fetch_ticker_news_multi(
     articles.extend(reddit)
 
     # 4. Congressional trading (if any member traded this ticker)
-    congress = get_congress_trades_for_ticker(ticker)
+    congress = get_congress_trades_for_ticker(ticker, max_age_days=max_age_days)
     articles.extend(congress)
 
-    # Deduplicate by title
+    # Filter by age + deduplicate by title
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for a in articles:
+        if not _is_recent(a.get("publish_date"), max_age_days):
+            continue
         key = a["title"].lower().strip()[:60]
         if key in seen:
             continue
