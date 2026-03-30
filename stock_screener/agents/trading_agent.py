@@ -300,47 +300,50 @@ EXCLUDED: [comma-separated tickers to exclude, or NONE]
 OVERALL: [one sentence portfolio assessment]"""
 
 
+_client_cache: dict[str, Any] = {}  # provider:api_key -> client instance
+
+
+def _get_client(provider: str, api_key: str, base_url: str, sdk: str = "", timeout: int = 15):
+    """Get or create a client for any provider. Caches clients for reuse."""
+    cache_key = f"{provider}:{api_key[:8]}"
+    if cache_key in _client_cache:
+        return _client_cache[cache_key]
+
+    client = None
+    use_sdk = sdk or ("groq" if provider == "groq" else "openai")
+
+    if use_sdk == "groq" and _GROQ_AVAILABLE:
+        client = Groq(api_key=api_key, timeout=timeout)
+    elif use_sdk == "openai" and _OPENAI_AVAILABLE:
+        client = _OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    elif _GROQ_AVAILABLE:
+        # Fallback: use Groq SDK for unknown providers
+        client = Groq(api_key=api_key, timeout=timeout)
+
+    if client:
+        _client_cache[cache_key] = client
+    return client
+
+
 def _create_client(config: dict):
-    """Create an OpenAI-compatible client for the primary (fast) provider."""
-    if not _GROQ_AVAILABLE:
-        return None
+    """Create client for the primary provider (backward compat)."""
     if not config.get("api_key"):
         return None
-    # Only override base_url for non-groq providers; the Groq SDK already
-    # knows its own endpoint and passing it again doubles the path.
-    kwargs: dict[str, Any] = {
-        "api_key": config["api_key"],
-        "timeout": config.get("timeout_seconds", 15),
-    }
-    if config.get("provider") != "groq":
-        kwargs["base_url"] = config.get("base_url")
-    return Groq(**kwargs)
+    return _get_client(
+        config.get("provider", "groq"), config["api_key"],
+        config.get("base_url", ""), config.get("sdk", ""),
+        config.get("timeout_seconds", 15),
+    )
 
 
 def _create_smart_client(config: dict):
-    """Create a client for the smart provider.
-
-    Uses the OpenAI SDK for Gemini (the Groq SDK doesn't work with Gemini's
-    OpenAI-compatible endpoint). Falls back to Groq SDK for groq provider.
-    """
+    """Create client for the smart provider (backward compat)."""
     if not config.get("smart_api_key"):
         return None
-    provider = config.get("smart_provider", "groq")
-    if provider == "groq":
-        if not _GROQ_AVAILABLE:
-            return None
-        return Groq(
-            api_key=config["smart_api_key"],
-            timeout=config.get("timeout_seconds", 15),
-        )
-    # Non-groq providers (Gemini, OpenAI, OpenRouter) use the OpenAI SDK
-    if not _OPENAI_AVAILABLE:
-        logger.warning("openai package not installed; smart provider (%s) unavailable", provider)
-        return None
-    return _OpenAI(
-        api_key=config["smart_api_key"],
-        base_url=config.get("smart_base_url"),
-        timeout=config.get("timeout_seconds", 15),
+    return _get_client(
+        config.get("smart_provider", "groq"), config["smart_api_key"],
+        config.get("smart_base_url", ""), config.get("smart_sdk", ""),
+        config.get("timeout_seconds", 15),
     )
 
 
@@ -395,12 +398,12 @@ def _call_llm(
     client, config: dict, system: str, user: str,
     *, max_tokens_override: int | None = None, model_override: str | None = None,
 ) -> str:
-    """Make a single LLM call with rate limiting and automatic model fallback chain.
+    """Make a single LLM call walking a unified quality-ranked model chain.
 
-    On 429 rate limit, marks the model as exhausted for the rest of the run
-    and immediately tries the next model in the chain (no repeated retries).
+    Models are ranked by quality regardless of provider. On 429/failure,
+    the next model is tried — which may be on a completely different provider.
 
-    Chain (Groq): 70b → qwen3-32b → llama-4-scout → kimi-k2 → 8b-instant
+    Smart calls (model_override set) try the smart chain instead.
     """
     global _last_call_time
     throttle = config.get("throttle_sleep_seconds", 2.0)
@@ -409,89 +412,68 @@ def _call_llm(
         time.sleep(throttle - elapsed)
     _last_call_time = time.time()
 
-    primary_model = model_override or config["model"]
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
     max_tok = max_tokens_override or config.get("max_tokens", 1024)
-    kwargs: dict[str, Any] = {
+    base_kwargs: dict[str, Any] = {
         "temperature": config.get("temperature", 0.3),
         "max_completion_tokens": max_tok,
     }
 
-    # Smart-provider calls (model_override set): no chain, just try once
+    # Pick chain: smart (for model_override calls) or fast
     if model_override:
-        try:
-            resp = client.chat.completions.create(model=primary_model, messages=messages, **kwargs)
-            _model_usage[primary_model] = _model_usage.get(primary_model, 0) + 1
-            return _clean_think_response(resp.choices[0].message.content)
-        except Exception as e:
-            logger.warning("LLM call failed on %s: %s", primary_model, e)
-            return ""
+        chain = config.get("smart_chain", [])
+    else:
+        chain = config.get("model_chain", [])
 
-    # Build chain, skipping models already known to be rate-limited this run
-    chain = config.get("model_chain", [])
-    models_to_try = []
-    for m in [primary_model] + [m for m in chain if m != primary_model]:
-        if m not in models_to_try and m not in _rate_limited_models:
-            models_to_try.append(m)
+    # Fallback: if chain is old-style list[str], wrap in dicts for backward compat
+    if chain and isinstance(chain[0], str):
+        chain = [{"model": m, "provider": config.get("provider", "groq"),
+                  "api_key": config.get("api_key", ""), "base_url": config.get("base_url", ""),
+                  "sdk": config.get("sdk", "groq")} for m in chain]
 
-    if not models_to_try:
-        logger.warning("All models in chain are rate-limited for this run")
+    if not chain:
+        logger.warning("No models available in chain")
         return ""
 
-    # Models that support reasoning_effort parameter (disable <think> blocks)
-    _REASONING_MODELS = {"qwen/qwen3-32b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"}
+    from stock_screener.agents.config import REASONING_MODELS
 
     last_error = None
-    for model in models_to_try:
+    for entry in chain:
+        model = entry["model"]
+        if model in _rate_limited_models:
+            continue
+
+        # Get or create client for this model's provider
+        model_client = _get_client(
+            entry.get("provider", "groq"), entry.get("api_key", ""),
+            entry.get("base_url", ""), entry.get("sdk", ""),
+            config.get("timeout_seconds", 15),
+        )
+        if not model_client:
+            continue
+
         try:
-            call_kwargs = dict(kwargs)
-            if model in _REASONING_MODELS:
+            call_kwargs = dict(base_kwargs)
+            if model in REASONING_MODELS:
                 call_kwargs["reasoning_effort"] = "none"
-            resp = client.chat.completions.create(model=model, messages=messages, **call_kwargs)
+            resp = model_client.chat.completions.create(model=model, messages=messages, **call_kwargs)
             _model_usage[model] = _model_usage.get(model, 0) + 1
             return _clean_think_response(resp.choices[0].message.content)
         except Exception as e:
             last_error = e
-            if "429" in str(e):
+            err_str = str(e)
+            if "429" in err_str or "503" in err_str:
                 _rate_limited_models.add(model)
-                logger.warning("Rate limit on %s (skipping for rest of run); trying next", model)
+                logger.warning("Rate limit on %s [%s]; trying next in chain", model, entry.get("provider"))
                 continue
-            logger.warning("LLM call failed on %s: %s", model, e)
-            return ""
+            # Non-rate-limit error — skip this model but try next (different provider might work)
+            logger.warning("LLM call failed on %s [%s]: %s", model, entry.get("provider"), e)
+            continue
 
-    # All primary models exhausted — try fallback provider (OpenRouter) if available
-    fb_key = config.get("fallback_api_key", "")
-    fb_chain = config.get("fallback_model_chain", [])
-    if fb_key and fb_chain:
-        try:
-            fb_client = _OpenAI(
-                api_key=fb_key,
-                base_url=config.get("fallback_base_url"),
-                timeout=config.get("timeout_seconds", 15),
-            ) if _OPENAI_AVAILABLE else None
-            if fb_client:
-                for fb_model in fb_chain:
-                    if fb_model in _rate_limited_models:
-                        continue
-                    try:
-                        resp = fb_client.chat.completions.create(model=fb_model, messages=messages, **kwargs)
-                        _model_usage[fb_model] = _model_usage.get(fb_model, 0) + 1
-                        logger.info("Fallback to OpenRouter %s succeeded", fb_model)
-                        return _clean_think_response(resp.choices[0].message.content)
-                    except Exception as fb_e:
-                        if "429" in str(fb_e) or "503" in str(fb_e):
-                            _rate_limited_models.add(fb_model)
-                            logger.warning("Fallback %s also rate-limited; trying next", fb_model)
-                            continue
-                        logger.warning("Fallback %s failed: %s", fb_model, fb_e)
-                        break
-        except Exception as fb_init_e:
-            logger.debug("Fallback provider init failed: %s", fb_init_e)
-
-    logger.warning("All providers exhausted (primary + fallback). Last error: %s", last_error)
+    logger.warning("All %d models in chain exhausted. Last error: %s", len(chain), last_error)
     return ""
 
 
@@ -499,20 +481,21 @@ def _smart_call(
     smart_client, fast_client, config: dict, system: str, user: str,
     *, max_tokens_override: int | None = None,
 ) -> str:
-    """Route to smart provider (Gemini) for critical decisions, fall back to fast (Groq).
+    """Route to smart model chain for critical decisions.
 
-    Used for: PM decisions, portfolio reasoning, exit review.
+    Uses the smart_chain (Gemini → 70b → qwen3) which is quality-ranked.
+    Falls back to the fast chain if all smart models fail.
     """
-    if smart_client is not None:
-        result = _call_llm(
-            smart_client, config, system, user,
-            max_tokens_override=max_tokens_override,
-            model_override=config.get("smart_model"),
-        )
-        if result:
-            return result
-        logger.warning("Smart provider (%s) failed; falling back to fast provider", config.get("smart_provider"))
-    # Fallback to fast provider
+    # Try smart chain first (walks Gemini → Groq 70b → OpenRouter 70b → etc.)
+    result = _call_llm(
+        smart_client, config, system, user,
+        max_tokens_override=max_tokens_override,
+        model_override=config.get("smart_model"),  # Triggers smart_chain in _call_llm
+    )
+    if result:
+        return result
+    # All smart models failed — fall back to fast chain
+    logger.warning("Smart chain exhausted; falling back to fast chain")
     return _call_llm(fast_client, config, system, user, max_tokens_override=max_tokens_override)
 
 

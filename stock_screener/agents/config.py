@@ -1,119 +1,145 @@
 """Configuration for the LLM trading agent layer.
 
-Dual-provider architecture:
-  - "fast" provider (Groq, default): high-volume per-ticker analysis
-    (analysts, bull/bear debate, risk debate rounds)
-  - "smart" provider (Gemini, optional): few critical decisions
-    (portfolio manager, portfolio reasoning, exit review)
+Unified model ranking: models are ranked by quality regardless of provider.
+On 429/failure, the next model in the ranked list is tried automatically.
+Each model specifies its provider so the correct client is created.
 
-Model fallback chain (Groq): when a model hits 429 rate limit, the next
-model in the chain is tried automatically. Ordered by preference:
-  1. llama-3.3-70b-versatile   (best reasoning, 100K TPD)
-  2. qwen/qwen3-32b            (strong reasoning, 500K TPD, 60 RPM)
-  3. meta-llama/llama-4-scout-17b-16e-instruct  (MoE, 500K TPD, 30K TPM)
-  4. moonshotai/kimi-k2-instruct (good reasoning, 300K TPD, 60 RPM)
-  5. llama-3.1-8b-instant       (fast fallback, 500K TPD, 14.4K RPD)
+Ranking (fast calls — analysts, debates, risk):
+  1. llama-3.3-70b      (Groq)        — best reasoning, 100K TPD
+  2. llama-3.3-70b      (OpenRouter)   — same quality, different quota
+  3. qwen3-32b          (Groq)         — strong reasoning, 500K TPD
+  4. hermes-3-405b      (OpenRouter)   — massive 405B when available
+  5. llama-4-scout-17b  (Groq)         — MoE, 500K TPD
+  6. gemma-3-27b        (OpenRouter)   — decent quality
+  7. kimi-k2            (Groq)         — good quality, 300K TPD
+  8. llama-3.1-8b       (Groq)         — fast last resort
+
+Ranking (smart calls — PM decisions, portfolio, exits):
+  1. gemini-2.5-flash   (Gemini)       — best structured output
+  Then falls back to the fast chain above.
 """
 from __future__ import annotations
 
 import os
+from typing import Any
 
-# Groq model chain: ordered by reasoning quality, each with progressively
-# higher token limits as fallback. On 429, walk down the chain.
-_GROQ_MODEL_CHAIN: list[str] = [
-    "llama-3.3-70b-versatile",                       # 100K TPD, 12K TPM — best quality
-    "qwen/qwen3-32b",                                # 500K TPD,  6K TPM — strong reasoning
-    "meta-llama/llama-4-scout-17b-16e-instruct",     # 500K TPD, 30K TPM — MoE, fast
-    "moonshotai/kimi-k2-instruct",                   # 300K TPD, 10K TPM — good quality
-    "llama-3.1-8b-instant",                          # 500K TPD,  6K TPM — last resort
+
+# ── Unified model ranking ─────────────────────────────────────────────────
+# Each entry: (model_id, provider, notes)
+# Provider determines which API key/base_url to use.
+
+_FAST_MODEL_CHAIN: list[tuple[str, str]] = [
+    ("llama-3.3-70b-versatile",                     "groq"),        # Best, 100K TPD
+    ("meta-llama/llama-3.3-70b-instruct:free",      "openrouter"),  # Same model, different quota
+    ("qwen/qwen3-32b",                              "groq"),        # Strong, 500K TPD
+    ("nousresearch/hermes-3-llama-3.1-405b:free",   "openrouter"),  # 405B when available
+    ("meta-llama/llama-4-scout-17b-16e-instruct",   "groq"),        # MoE, 500K TPD
+    ("google/gemma-3-27b-it:free",                  "openrouter"),  # Decent
+    ("moonshotai/kimi-k2-instruct",                 "groq"),        # Good, 300K TPD
+    ("llama-3.1-8b-instant",                        "groq"),        # Last resort
 ]
 
-# Provider presets
-_PROVIDERS = {
+_SMART_MODEL_CHAIN: list[tuple[str, str]] = [
+    ("gemini-2.5-flash",                            "gemini"),      # Best for structured output
+    ("llama-3.3-70b-versatile",                     "groq"),        # Fallback
+    ("meta-llama/llama-3.3-70b-instruct:free",      "openrouter"),  # Fallback
+    ("qwen/qwen3-32b",                              "groq"),        # Fallback
+]
+
+# Provider connection presets
+_PROVIDER_PRESETS: dict[str, dict[str, str]] = {
     "groq": {
         "api_key_env": "GROQ_API_KEY",
         "base_url": "https://api.groq.com/openai/v1",
-        "model": _GROQ_MODEL_CHAIN[0],
-        "model_chain": _GROQ_MODEL_CHAIN,
+        "sdk": "groq",  # Use Groq SDK (don't pass base_url)
     },
     "gemini": {
         "api_key_env": "GEMINI_API_KEY",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-2.5-flash",
+        "sdk": "openai",  # Use OpenAI SDK
     },
     "openrouter": {
         "api_key_env": "OPENROUTER_API_KEY",
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "meta-llama/llama-3.3-70b-instruct:free",
-        "model_chain": [
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "nousresearch/hermes-3-llama-3.1-405b:free",
-            "google/gemma-3-27b-it:free",
-            "nvidia/nemotron-nano-9b-v2:free",
-        ],
+        "sdk": "openai",  # Use OpenAI SDK
     },
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4o-mini",
+        "sdk": "openai",
     },
 }
 
+# Models that support reasoning_effort="none" to disable <think> blocks
+REASONING_MODELS: set[str] = {"qwen/qwen3-32b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"}
 
-def _build_provider_config(provider_name: str) -> dict:
-    """Build config dict for a single provider."""
-    preset = _PROVIDERS.get(provider_name, _PROVIDERS["groq"])
-    api_key = os.getenv(preset["api_key_env"], "").strip()  # strip whitespace
-    return {
-        "provider": provider_name,
-        "api_key": api_key,
-        "base_url": os.getenv(f"AGENT_{provider_name.upper()}_BASE_URL", preset["base_url"]),
-        "model": os.getenv(f"AGENT_{provider_name.upper()}_MODEL", preset["model"]),
-        "model_chain": preset.get("model_chain", [preset["model"]]),
-    }
+
+def _get_available_providers() -> dict[str, str]:
+    """Return {provider_name: api_key} for providers with valid API keys."""
+    available: dict[str, str] = {}
+    for name, preset in _PROVIDER_PRESETS.items():
+        key = os.getenv(preset["api_key_env"], "").strip()
+        if key:
+            available[name] = key
+    return available
+
+
+def _build_model_chain(
+    chain: list[tuple[str, str]],
+    available_providers: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Build resolved model chain, filtering out models whose provider has no API key."""
+    result: list[dict[str, Any]] = []
+    for model_id, provider in chain:
+        if provider not in available_providers:
+            continue
+        preset = _PROVIDER_PRESETS[provider]
+        result.append({
+            "model": model_id,
+            "provider": provider,
+            "api_key": available_providers[provider],
+            "base_url": preset["base_url"],
+            "sdk": preset["sdk"],
+        })
+    return result
 
 
 def get_agent_config() -> dict:
     """Build agent config from environment variables.
 
-    Dual-provider: "fast" (Groq) for volume, "smart" (Gemini) for decisions.
-    Override primary provider with AGENT_LLM_PROVIDER.
+    Models ranked by quality, not grouped by provider.
     """
-    primary = os.getenv("AGENT_LLM_PROVIDER", "groq").lower()
-    smart_provider = os.getenv("AGENT_SMART_PROVIDER", "gemini").lower()
-    fallback_provider = os.getenv("AGENT_FALLBACK_PROVIDER", "openrouter").lower()
+    available = _get_available_providers()
 
-    primary_cfg = _build_provider_config(primary)
-    smart_cfg = _build_provider_config(smart_provider)
-    fallback_cfg = _build_provider_config(fallback_provider)
+    fast_chain = _build_model_chain(_FAST_MODEL_CHAIN, available)
+    smart_chain = _build_model_chain(_SMART_MODEL_CHAIN, available)
 
-    # Smart provider falls back to primary if no API key
-    smart_available = bool(smart_cfg.get("api_key"))
-    fallback_available = bool(fallback_cfg.get("api_key"))
+    # Primary model = first available in fast chain
+    primary = fast_chain[0] if fast_chain else {"model": "", "provider": "", "api_key": "", "base_url": "", "sdk": "groq"}
+    # Smart model = first available in smart chain
+    smart = smart_chain[0] if smart_chain else primary
 
     return {
-        # Primary (fast) provider — used for analysts, debates, risk rounds
-        "provider": primary_cfg["provider"],
-        "api_key": primary_cfg["api_key"],
-        "base_url": os.getenv("AGENT_LLM_BASE_URL", primary_cfg["base_url"]),
-        "model": os.getenv("AGENT_LLM_MODEL", primary_cfg["model"]),
-        "model_chain": primary_cfg["model_chain"],
-        # Fallback provider (OpenRouter) — used when primary chain exhausted
-        "fallback_provider": fallback_cfg["provider"] if fallback_available else "",
-        "fallback_api_key": fallback_cfg["api_key"] if fallback_available else "",
-        "fallback_base_url": fallback_cfg["base_url"] if fallback_available else "",
-        "fallback_model": fallback_cfg["model"] if fallback_available else "",
-        "fallback_model_chain": fallback_cfg.get("model_chain", []) if fallback_available else [],
-        "fallback_available": fallback_available,
+        # Primary model + full ranked chain
+        "provider": primary["provider"],
+        "api_key": primary["api_key"],
+        "base_url": primary["base_url"],
+        "sdk": primary["sdk"],
+        "model": primary["model"],
+        "model_chain": fast_chain,  # Full ranked list with provider info
         "temperature": float(os.getenv("AGENT_LLM_TEMPERATURE", "0.3")),
         "max_tokens": int(os.getenv("AGENT_LLM_MAX_TOKENS", "1024")),
         "timeout_seconds": int(os.getenv("AGENT_LLM_TIMEOUT", "15")),
-        # Smart provider — used for PM decisions, portfolio reasoning, exit review
-        "smart_provider": smart_cfg["provider"] if smart_available else primary_cfg["provider"],
-        "smart_api_key": smart_cfg["api_key"] if smart_available else primary_cfg["api_key"],
-        "smart_base_url": smart_cfg["base_url"] if smart_available else primary_cfg["base_url"],
-        "smart_model": smart_cfg["model"] if smart_available else primary_cfg["model"],
-        "smart_available": smart_available,
+        # Smart model + chain (for PM decisions, portfolio, exits)
+        "smart_provider": smart["provider"],
+        "smart_api_key": smart["api_key"],
+        "smart_base_url": smart["base_url"],
+        "smart_sdk": smart["sdk"],
+        "smart_model": smart["model"],
+        "smart_chain": smart_chain,
+        "smart_available": bool(smart_chain),
+        # Available providers (for client creation)
+        "available_providers": available,
         # Debate configuration
         "max_debate_rounds": int(os.getenv("AGENT_MAX_DEBATE_ROUNDS", "1")),
         "max_risk_rounds": int(os.getenv("AGENT_MAX_RISK_ROUNDS", "1")),
