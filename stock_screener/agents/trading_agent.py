@@ -347,26 +347,29 @@ def _clean_think_response(raw: str) -> str:
     Strategy: extract the content AFTER the think block as the "answer".
     If the answer is too short (model put everything in <think>), use the
     think content itself — it IS the real analysis, just wrapped in tags.
+    Handles multiple think blocks, unclosed tags, and nested tags.
     """
     if "<think>" not in raw:
         return raw.strip()
 
-    # Extract what comes AFTER the think block
+    # Extract what comes AFTER all think blocks
     answer = _THINK_BLOCK_RE.sub("", raw).strip()
+    # Also strip any orphaned/unclosed <think> or </think> tags
+    answer = _THINK_TAG_RE.sub("", answer).strip()
 
     # If the answer is substantial, use it (model followed instructions)
     if len(answer) > 50:
         return answer
 
     # Answer is too short — the real content is inside <think>.
-    # Strip the tags but keep the reasoning.
-    think_match = _THINK_BLOCK_RE.search(raw)
-    think_content = think_match.group(1).strip() if think_match else ""
+    # Collect ALL think block contents.
+    think_parts = _THINK_BLOCK_RE.findall(raw)
+    think_content = "\n\n".join(p.strip() for p in think_parts if p.strip())
 
     # Combine: think reasoning + any answer fragment
     if answer and think_content:
         return f"{think_content}\n\n{answer}"
-    return think_content or answer or raw.strip()
+    return think_content or answer or _THINK_TAG_RE.sub("", raw).strip()
 
 
 def _call_llm(
@@ -1653,12 +1656,13 @@ def apply_portfolio_reasoning_enforced(
     _log = log or logger
     tw = target_weights.copy()
 
-    # 1. Apply explicit ticker weights from LLM
+    # 1. Apply explicit ticker weights from LLM (case-insensitive match)
     ticker_weights = portfolio_reasoning.get("ticker_weights", {})
     if isinstance(ticker_weights, dict) and ticker_weights:
         for t, w in ticker_weights.items():
-            if t in tw.index:
-                tw.loc[t, "weight"] = min(float(w), max_position_pct)
+            mask = tw.index.str.upper() == str(t).upper()
+            if mask.any():
+                tw.loc[mask, "weight"] = min(float(w), max_position_pct)
         _log.info("Enforced LLM ticker weights: %s", ticker_weights)
 
     # 2. Exclude tickers flagged by LLM

@@ -579,6 +579,7 @@ def run_daily(cfg: Config, logger) -> None:
     _check_runtime_budget(started_utc, cfg, logger, "screening")
 
     # ── LLM trading agent layer (fail-soft) ──────────────────────
+    _decisions: dict = {}  # initialized here; populated inside the try block below
     if cfg.llm_agent_enabled and not screened.empty:
         try:
             from stock_screener.agents.trading_agent import (
@@ -699,6 +700,7 @@ def run_daily(cfg: Config, logger) -> None:
     # ── LLM-primary decision mode: LLM drives ticker selection + weighting ──
     _llm_primary_mode = bool(getattr(cfg, "llm_decision_primary", False))
     _llm_primary_success = False
+    # _decisions initialized at line 582; guaranteed to exist here
 
     if _llm_primary_mode and cfg.llm_agent_enabled and not screened.empty:
         _llm_agent_status = run_meta.get("llm_agent", {}).get("status") if isinstance(run_meta.get("llm_agent"), dict) else None

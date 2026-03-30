@@ -57,9 +57,10 @@ _PROVIDERS = {
 def _build_provider_config(provider_name: str) -> dict:
     """Build config dict for a single provider."""
     preset = _PROVIDERS.get(provider_name, _PROVIDERS["groq"])
+    api_key = os.getenv(preset["api_key_env"], "").strip()  # strip whitespace
     return {
         "provider": provider_name,
-        "api_key": os.getenv(preset["api_key_env"], ""),
+        "api_key": api_key,
         "base_url": os.getenv(f"AGENT_{provider_name.upper()}_BASE_URL", preset["base_url"]),
         "model": os.getenv(f"AGENT_{provider_name.upper()}_MODEL", preset["model"]),
         "model_chain": preset.get("model_chain", [preset["model"]]),
