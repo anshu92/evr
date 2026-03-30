@@ -1123,6 +1123,8 @@ def run_daily(cfg: Config, logger) -> None:
     cash_from_regime = 0.0
     regime_enabled = getattr(cfg, "regime_exposure_enabled", True)
     if regime_enabled:
+        # In LLM-primary mode, raise the floor — LLM already assessed risk
+        _regime_min = 0.7 if (_llm_primary_mode and _llm_primary_success) else getattr(cfg, "regime_min_scalar", 0.5)
         target_weights, cash_from_regime, regime_info = apply_regime_exposure(
             target_weights,
             features=screened,
@@ -1130,7 +1132,7 @@ def run_daily(cfg: Config, logger) -> None:
             trend_weight=getattr(cfg, "regime_trend_weight", 0.4),
             breadth_weight=getattr(cfg, "regime_breadth_weight", 0.3),
             vol_weight=getattr(cfg, "regime_vol_weight", 0.3),
-            min_scalar=getattr(cfg, "regime_min_scalar", 0.5),
+            min_scalar=_regime_min,
             max_scalar=getattr(cfg, "regime_max_scalar", 1.2),
             logger=logger,
         )
@@ -1173,12 +1175,16 @@ def run_daily(cfg: Config, logger) -> None:
             except Exception as e:
                 logger.warning("Adaptive vol target failed: %s; using base target", e)
 
+        # In LLM-primary mode, soften vol targeting — LLM made explicit BUY
+        # decisions that shouldn't be completely negated by high-vol regime.
+        # min_scalar=0.6 means vol targeting keeps at least 60% of LLM weights.
+        _vt_min = 0.6 if (_llm_primary_mode and _llm_primary_success) else 0.5
         target_weights, cash_from_vol_targeting = apply_volatility_targeting(
             target_weights,
             prices=prices,
             target_vol=effective_vol_target,
             lookback_days=20,
-            min_scalar=0.5,
+            min_scalar=_vt_min,
             max_scalar=1.0,
             logger=logger,
         )
