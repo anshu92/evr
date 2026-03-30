@@ -744,6 +744,10 @@ def render_reports(
             analyst_reports = info.get("analyst_reports")
             debate_history = info.get("debate_history", [])
             debate_rounds = info.get("debate_rounds", 1)
+            position_size = info.get("position_size", "")
+            target_weight = info.get("target_weight")
+            suggested_stop = info.get("suggested_stop_loss")
+            hold_days = info.get("expected_hold_days")
             rating_colors = {"BUY": "#059669", "OVERWEIGHT": "#10b981", "HOLD": "#6b7280", "UNDERWEIGHT": "#f59e0b", "SELL": "#dc2626"}
             rating_bg = {"BUY": "#ecfdf5", "OVERWEIGHT": "#ecfdf5", "HOLD": "#f3f4f6", "UNDERWEIGHT": "#fffbeb", "SELL": "#fef2f2"}
             rc = rating_colors.get(rating, "#6b7280")
@@ -851,6 +855,32 @@ def render_reports(
               <div style="padding:8px 12px;font-size:11px;color:#374151;background:#eff6ff;border-radius:8px;margin-top:4px;line-height:1.5;">{_html_escape(risk)}</div>
             </details>"""
 
+            # ── PM Decision card ──
+            pm_section = ""
+            _pm_items: list[str] = []
+            if rating and rating != "N/A":
+                _pm_items.append(f'<span style="background:{rb};color:{rc};font-weight:700;padding:2px 8px;border-radius:5px;font-size:11px;">{_html_escape(rating)}</span>')
+                _pm_items.append(f'<span style="font-size:12px;color:#6b7280;margin-left:6px;">Score: {score:+.1f}</span>')
+            if position_size:
+                _sz_colors = {"SMALL": "#6b7280", "MEDIUM": "#2563eb", "FULL": "#059669", "NONE": "#dc2626"}
+                _sz_c = _sz_colors.get(position_size, "#6b7280")
+                _pm_items.append(f'<span style="background:{_sz_c}15;color:{_sz_c};font-weight:600;padding:2px 8px;border-radius:5px;font-size:11px;margin-left:6px;">Size: {position_size}</span>')
+            if target_weight is not None:
+                _pm_items.append(f'<span style="font-size:12px;color:#374151;margin-left:8px;">Weight: {target_weight:.1%}</span>')
+            if suggested_stop is not None:
+                _pm_items.append(f'<span style="font-size:12px;color:#dc2626;margin-left:8px;">Stop: {suggested_stop:.1%}</span>')
+            if hold_days is not None:
+                _pm_items.append(f'<span style="font-size:12px;color:#6b7280;margin-left:8px;">Hold: {hold_days}d</span>')
+            if _pm_items:
+                pm_section = f"""
+            <div style="background:linear-gradient(135deg,#eff6ff,#f5f3ff);border-radius:10px;padding:12px;margin-bottom:12px;border-left:4px solid #8b5cf6;">
+              <div style="font-size:11px;font-weight:700;color:#6d28d9;margin-bottom:8px;">&#128161; Portfolio Manager Decision</div>
+              <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;">
+                {' '.join(_pm_items)}
+              </div>
+              <div style="font-size:12px;color:#374151;margin-top:8px;line-height:1.5;">{_html_escape(reasoning)}</div>
+            </div>"""
+
             # ── Assemble ticker card (collapsible, shows ticker+rating+verdict) ──
             _verdict_preview = _html_escape(reasoning[:120]) + ("..." if len(reasoning) > 120 else "") if reasoning else ""
             ticker_cards_html += f"""
@@ -874,6 +904,7 @@ def render_reports(
                 {analyst_section}
                 {debate_section}
                 {risk_section}
+                {pm_section}
               </div>
             </details>
           </div>"""
