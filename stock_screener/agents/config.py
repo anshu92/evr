@@ -101,10 +101,10 @@ def get_agent_config() -> dict:
         # Debate configuration
         "max_debate_rounds": int(os.getenv("AGENT_MAX_DEBATE_ROUNDS", "1")),
         "max_risk_rounds": int(os.getenv("AGENT_MAX_RISK_ROUNDS", "1")),
-        "debate_max_tokens": int(os.getenv("AGENT_DEBATE_MAX_TOKENS", "256")),
-        "analyst_max_tokens": int(os.getenv("AGENT_ANALYST_MAX_TOKENS", "200")),
-        "portfolio_max_tokens": int(os.getenv("AGENT_PORTFOLIO_MAX_TOKENS", "512")),
-        "exit_review_max_tokens": int(os.getenv("AGENT_EXIT_MAX_TOKENS", "256")),
+        "debate_max_tokens": int(os.getenv("AGENT_DEBATE_MAX_TOKENS", "400")),
+        "analyst_max_tokens": int(os.getenv("AGENT_ANALYST_MAX_TOKENS", "400")),
+        "portfolio_max_tokens": int(os.getenv("AGENT_PORTFOLIO_MAX_TOKENS", "600")),
+        "exit_review_max_tokens": int(os.getenv("AGENT_EXIT_MAX_TOKENS", "400")),
         # Feature toggles
         "specialized_analysts": os.getenv("AGENT_SPECIALIZED_ANALYSTS", "1").lower() in ("1", "true"),
         "risk_debate_enabled": os.getenv("AGENT_RISK_DEBATE_ENABLED", "1").lower() in ("1", "true"),

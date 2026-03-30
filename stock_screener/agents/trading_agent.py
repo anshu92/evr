@@ -219,12 +219,11 @@ Present the strongest 2-3 bullet points for why this stock will outperform in th
 _BEAR_PROMPT = """You are a BEAR researcher arguing AGAINST buying {ticker}.
 
 Analyst report: {analyst_report}
-Bull case: {bull_case}
 
 Recent News:
 {news_headlines}
 
-Counter the bull thesis with 2-3 specific risk factors. Focus on what could go wrong in the next 1-5 days: overextension, sentiment reversal, sector headwinds, vol expansion. Reference specific news if relevant. Be concise."""
+Present 2-3 specific risk factors for why this stock could UNDERPERFORM in the next 1-5 trading days. Focus on: overextension, sentiment reversal, sector headwinds, vol expansion, negative news catalysts. Be independent — argue from the data, not against another thesis. Be concise."""
 
 _RISK_PROMPT = """You are a risk manager evaluating {ticker} for portfolio inclusion.
 
@@ -488,25 +487,54 @@ def _smart_call(
     return _call_llm(fast_client, config, system, user, max_tokens_override=max_tokens_override)
 
 
-def _parse_pm_response(response: str) -> tuple[str, float, str]:
-    """Parse the portfolio manager's structured response."""
-    rating = "HOLD"
-    score = 0.0
-    reason = ""
-
+def _extract_field(response: str, field: str) -> str | None:
+    """Extract a field value from LLM response, case-insensitive, tolerant of formatting."""
+    field_upper = field.upper()
     for line in response.split("\n"):
-        line = line.strip()
-        if line.upper().startswith("RATING:"):
-            raw = line.split(":", 1)[1].strip().upper()
-            if raw in ("BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"):
-                rating = raw
-        elif line.upper().startswith("SCORE:"):
-            try:
-                score = max(-1.0, min(1.0, float(line.split(":", 1)[1].strip())))
-            except ValueError:
-                pass
-        elif line.upper().startswith("REASON:"):
-            reason = line.split(":", 1)[1].strip()
+        stripped = line.strip()
+        # Handle: "RATING: BUY", "**RATING:** BUY", "rating: buy"
+        cleaned = re.sub(r"\*+", "", stripped)  # strip markdown bold
+        if cleaned.upper().startswith(field_upper + ":"):
+            return cleaned.split(":", 1)[1].strip()
+        # Handle: "RATING BUY" (no colon)
+        if cleaned.upper().startswith(field_upper + " "):
+            rest = cleaned[len(field):].strip().lstrip(":").strip()
+            if rest:
+                return rest
+    return None
+
+
+def _parse_pm_response(response: str) -> tuple[str, float, str]:
+    """Parse the portfolio manager's structured response. Case-insensitive, format-tolerant."""
+    _valid_ratings = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
+
+    raw_rating = _extract_field(response, "RATING")
+    rating = "HOLD"
+    _parse_ok = False
+    if raw_rating:
+        # Extract first valid rating word (handles "BUY (strong momentum)")
+        for word in raw_rating.upper().split():
+            if word in _valid_ratings:
+                rating = word
+                _parse_ok = True
+                break
+
+    score = 0.0
+    raw_score = _extract_field(response, "SCORE")
+    if raw_score:
+        try:
+            # Extract first number from the field (handles "0.8 out of 1.0")
+            nums = re.findall(r"-?[0-9]+\.?[0-9]*", raw_score)
+            if nums:
+                score = max(-1.0, min(1.0, float(nums[0])))
+                _parse_ok = True
+        except (ValueError, IndexError):
+            pass
+
+    reason = _extract_field(response, "REASON") or ""
+
+    if not _parse_ok:
+        logger.warning("PM parse: no valid RATING/SCORE found in response (%d chars)", len(response))
 
     if score == 0.0 and rating != "HOLD":
         score = {"BUY": 0.8, "OVERWEIGHT": 0.4, "UNDERWEIGHT": -0.4, "SELL": -0.8}.get(rating, 0.0)
@@ -515,33 +543,47 @@ def _parse_pm_response(response: str) -> tuple[str, float, str]:
 
 
 def _parse_pm_response_primary(response: str) -> tuple[str, float, str, str, float | None, float | None, int | None]:
-    """Parse the enhanced PM response for LLM-primary mode."""
+    """Parse the enhanced PM response for LLM-primary mode. Uses _extract_field for robustness."""
     rating, score, reason = _parse_pm_response(response)
     position_size = "MEDIUM"
     target_weight = None
     stop_loss = None
     hold_days = None
-    for line in response.split("\n"):
-        line = line.strip()
-        if line.upper().startswith("POSITION_SIZE:"):
-            raw = line.split(":", 1)[1].strip().upper()
-            if raw in ("SMALL", "MEDIUM", "FULL", "NONE"):
-                position_size = raw
-        elif line.upper().startswith("TARGET_WEIGHT:"):
+
+    raw_ps = _extract_field(response, "POSITION_SIZE")
+    if raw_ps:
+        for word in raw_ps.upper().split():
+            if word in ("SMALL", "MEDIUM", "FULL", "NONE"):
+                position_size = word
+                break
+
+    raw_tw = _extract_field(response, "TARGET_WEIGHT")
+    if raw_tw:
+        nums = re.findall(r"[0-9]+\.?[0-9]*", raw_tw)
+        if nums:
             try:
-                target_weight = max(0.0, min(0.20, float(line.split(":", 1)[1].strip())))
+                target_weight = max(0.0, min(0.20, float(nums[0])))
             except ValueError:
                 pass
-        elif line.upper().startswith("STOP_LOSS:"):
+
+    raw_sl = _extract_field(response, "STOP_LOSS")
+    if raw_sl:
+        nums = re.findall(r"[0-9]+\.?[0-9]*", raw_sl)
+        if nums:
             try:
-                stop_loss = max(0.01, min(0.30, float(line.split(":", 1)[1].strip())))
+                stop_loss = max(0.01, min(0.30, float(nums[0])))
             except ValueError:
                 pass
-        elif line.upper().startswith("HOLD_DAYS:"):
+
+    raw_hd = _extract_field(response, "HOLD_DAYS")
+    if raw_hd:
+        nums = re.findall(r"[0-9]+", raw_hd)
+        if nums:
             try:
-                hold_days = max(1, min(10, int(line.split(":", 1)[1].strip())))
+                hold_days = max(1, min(10, int(nums[0])))
             except ValueError:
                 pass
+
     return rating, score, reason, position_size, target_weight, stop_loss, hold_days
 
 
@@ -719,7 +761,7 @@ Summarize in 2-3 bullet points: (1) the single biggest risk, (2) why the bull's 
 
 # -- Phase 2: Risk debate prompts -----------------------------------------
 
-_RISK_AGGRESSIVE_PROMPT = """You are an AGGRESSIVE risk manager who favors calculated risk-taking for {ticker}.
+_RISK_UNIFIED_PROMPT = """You are a senior risk officer evaluating {ticker} from THREE perspectives.
 
 Analyst report: {analyst_report}
 Bull case: {bull_case}
@@ -727,43 +769,12 @@ Bear case: {bear_case}
 Recent News: {news_headlines}
 Current portfolio: {portfolio_context}
 
-Argue for a LARGER position: (1) asymmetric upside potential, (2) why bear risks are priced in or manageable, (3) opportunity cost of being too conservative. 3 sentences max."""
+Provide your assessment from all three risk perspectives, then synthesize:
 
-_RISK_CONSERVATIVE_PROMPT = """You are a CONSERVATIVE risk manager who prioritizes capital preservation for {ticker}.
-
-Analyst report: {analyst_report}
-Bull case: {bull_case}
-Bear case: {bear_case}
-Recent News: {news_headlines}
-Current portfolio: {portfolio_context}
-
-Aggressive view: {aggressive_view}
-
-Argue for a SMALLER position or no position: (1) maximum realistic downside in 1-5 days, (2) correlation with existing holdings, (3) tail risks the bull case ignores. 3 sentences max."""
-
-_RISK_NEUTRAL_PROMPT = """You are a NEUTRAL risk manager synthesizing the aggressive and conservative views on {ticker}.
-
-Analyst report: {analyst_report}
-Bull case: {bull_case}
-Bear case: {bear_case}
-Recent News: {news_headlines}
-Current portfolio: {portfolio_context}
-
-Aggressive view: {aggressive_view}
-Conservative view: {conservative_view}
-
-Balance both perspectives. Provide: (1) recommended position size (SMALL/MEDIUM/FULL), (2) the ONE factor that should determine sizing, (3) suggested stop-loss rationale. 3 sentences max."""
-
-_RISK_SYNTHESIS_PROMPT = """You are a senior risk officer making the final risk determination for {ticker}.
-
-Three risk perspectives were debated:
-AGGRESSIVE: {aggressive_view}
-CONSERVATIVE: {conservative_view}
-NEUTRAL: {neutral_view}
-
-Portfolio context: {portfolio_context}
-
-Synthesize into a 2-3 sentence risk assessment covering: (1) recommended position size (SMALL/MEDIUM/FULL), (2) key risk to monitor, (3) suggested stop-loss level."""
+AGGRESSIVE: [1-2 sentences arguing for LARGER position: asymmetric upside, bear risks priced in, opportunity cost]
+CONSERVATIVE: [1-2 sentences arguing for SMALLER/NO position: max downside, correlation, tail risks]
+NEUTRAL: [1-2 sentences balancing both: recommended size SMALL/MEDIUM/FULL, key factor, stop-loss]
+SYNTHESIS: [2-3 sentences: final position size recommendation, key risk to monitor, stop-loss level]"""
 
 # -- Phase 3: Specialized analyst prompts ----------------------------------
 
@@ -878,11 +889,12 @@ _EXIT_REVIEW_PROMPT = """You are an exit strategy specialist reviewing whether t
 POSITION:
 - Entry price: ${entry_price:.2f} CAD | Current: ${current_price:.2f} CAD
 - Unrealized P&L: {pnl_pct:+.2%}
-- Days held: {days_held} (max holding: {max_hold} days)
+- Days held: {days_held} of {max_hold} max (remaining: {remaining_days} trading days)
 - Entry ML prediction: {entry_pred_return:.2%} return over 5 days
 
 CURRENT SIGNALS:
-- Current ML predicted return: {current_pred_return:.2%}
+- Current ML predicted return: {current_pred_return:.2%} (vs {entry_pred_return:.2%} at entry)
+- Signal change: {'IMPROVING' if current_pred_return > entry_pred_return else 'DETERIORATING' if current_pred_return < entry_pred_return else 'STABLE'}
 - RSI(14): {rsi:.1f}
 - Today's price change: {intraday_change:+.2%}
 - Drawdown from peak since entry: {peak_drawdown:.2%}
@@ -892,7 +904,7 @@ RECENT NEWS:
 
 Market: Vol regime={vol_regime:.2f}, trend={market_trend:.2%}
 
-Mechanical exit rules say HOLD. Should you override?
+Mechanical exit rules (stop-loss, trailing stop, max hold) say HOLD. Consider whether news, signal deterioration, or market conditions warrant overriding.
 
 Respond with EXACTLY this format:
 ACTION: [HOLD|TIGHTEN_STOP|EXIT]
@@ -921,7 +933,7 @@ def _run_debate(
     history: list[tuple[str, str]] = []
     _nh = news_headlines or "No recent news available"
 
-    # Round 1: use original prompts (backward compatible)
+    # Round 1: independent arguments (no asymmetry — both see only analyst report)
     bull_r1 = _call_llm(
         client, cfg, "You are a bullish equity researcher.",
         _BULL_PROMPT.format(ticker=ticker, analyst_report=analyst_report, news_headlines=_nh),
@@ -931,7 +943,7 @@ def _run_debate(
 
     bear_r1 = _call_llm(
         client, cfg, "You are a bearish equity researcher.",
-        _BEAR_PROMPT.format(ticker=ticker, analyst_report=analyst_report, bull_case=bull_r1, news_headlines=_nh),
+        _BEAR_PROMPT.format(ticker=ticker, analyst_report=analyst_report, news_headlines=_nh),
         max_tokens_override=debate_tokens,
     )
     history.append(("BEAR", bear_r1))
@@ -987,53 +999,25 @@ def _run_risk_debate(
     bull_case: str, bear_case: str, portfolio_context: str,
     news_headlines: str = "",
 ) -> tuple[str, dict[str, str]]:
-    """Run aggressive/conservative/neutral risk debate. Returns (synthesis, views_dict)."""
-    risk_tokens = cfg.get("debate_max_tokens", 256)
+    """Run unified risk assessment (1 call instead of 4). Returns (synthesis, views_dict)."""
+    risk_tokens = cfg.get("debate_max_tokens", 256) * 2  # More budget for unified output
     _nh = news_headlines or "No recent news available"
 
-    aggressive = _call_llm(
-        client, cfg, "You are an aggressive risk manager.",
-        _RISK_AGGRESSIVE_PROMPT.format(
-            ticker=ticker, analyst_report=analyst_report,
-            bull_case=bull_case, bear_case=bear_case,
-            portfolio_context=portfolio_context, news_headlines=_nh,
-        ),
-        max_tokens_override=risk_tokens,
-    )
-
-    conservative = _call_llm(
-        client, cfg, "You are a conservative risk manager.",
-        _RISK_CONSERVATIVE_PROMPT.format(
-            ticker=ticker, analyst_report=analyst_report,
-            bull_case=bull_case, bear_case=bear_case,
-            portfolio_context=portfolio_context, news_headlines=_nh,
-            aggressive_view=aggressive or "(aggressive view unavailable)",
-        ),
-        max_tokens_override=risk_tokens,
-    )
-
-    neutral = _call_llm(
-        client, cfg, "You are a neutral risk manager.",
-        _RISK_NEUTRAL_PROMPT.format(
-            ticker=ticker, analyst_report=analyst_report,
-            bull_case=bull_case, bear_case=bear_case,
-            portfolio_context=portfolio_context, news_headlines=_nh,
-            aggressive_view=aggressive or "(unavailable)",
-            conservative_view=conservative or "(unavailable)",
-        ),
-        max_tokens_override=risk_tokens,
-    )
-
-    synthesis = _call_llm(
+    response = _call_llm(
         client, cfg, "You are a senior risk officer.",
-        _RISK_SYNTHESIS_PROMPT.format(
-            ticker=ticker, portfolio_context=portfolio_context,
-            aggressive_view=aggressive or "(unavailable)",
-            conservative_view=conservative or "(unavailable)",
-            neutral_view=neutral or "(unavailable)",
+        _RISK_UNIFIED_PROMPT.format(
+            ticker=ticker, analyst_report=analyst_report,
+            bull_case=bull_case, bear_case=bear_case,
+            portfolio_context=portfolio_context, news_headlines=_nh,
         ),
         max_tokens_override=risk_tokens,
     )
+
+    # Parse the unified response into views
+    aggressive = _extract_field(response, "AGGRESSIVE") or ""
+    conservative = _extract_field(response, "CONSERVATIVE") or ""
+    neutral = _extract_field(response, "NEUTRAL") or ""
+    synthesis = _extract_field(response, "SYNTHESIS") or response  # Fallback to full response
 
     views = {"aggressive": aggressive, "conservative": conservative, "neutral": neutral}
     return synthesis, views
@@ -1194,12 +1178,23 @@ def analyze_ticker(
     if not analyst_report:
         return None
 
+    # Enrich analyst report with specialist summaries if available
+    _enriched_report = analyst_report
+    if isinstance(analyst_reports, dict):
+        _specialist_lines = []
+        for key, label in [("technical", "Technical"), ("fundamental", "Fundamental"), ("sentiment", "Sentiment")]:
+            rpt = analyst_reports.get(key, "")
+            if rpt:
+                _specialist_lines.append(f"[{label}] {rpt[:150]}")
+        if _specialist_lines:
+            _enriched_report = analyst_report + "\n\nSpecialist Signals:\n" + "\n".join(_specialist_lines)
+
     # Format news for debate/risk prompts (all agents see the same headlines)
     _news_fmt = _format_news_headlines(features)
 
-    # 2. Bull/bear debate (Phase 1: multi-turn when max_debate_rounds > 1)
+    # 2. Bull/bear debate — uses enriched report so specialists feed into debate
     bull_case, bear_case, debate_history = _run_debate(
-        client, cfg, ticker, analyst_report, news_headlines=_news_fmt,
+        client, cfg, ticker, _enriched_report, news_headlines=_news_fmt,
     )
 
     # 3. Risk assessment (Phase 2: 3-way debate when enabled)
@@ -1540,6 +1535,7 @@ def review_exits(
                     pnl_pct=pnl_pct,
                     days_held=days_held,
                     max_hold=max_hold_days,
+                    remaining_days=max(0, max_hold_days - days_held),
                     entry_pred_return=float(getattr(pos, "pred_return", 0) or 0),
                     current_pred_return=current_pred,
                     rsi=rsi,
