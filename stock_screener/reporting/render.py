@@ -731,6 +731,15 @@ def render_reports(
 """
     if isinstance(llm_agent_data, dict) and llm_agent_data.get("decisions"):
         ticker_cards_html = ""
+        _model_symbols = {
+            "llama-3.3-70b-versatile": ("&#129409;", "#f59e0b", "Llama 70B"),
+            "qwen/qwen3-32b": ("&#9878;", "#3b82f6", "Qwen3 32B"),
+            "meta-llama/llama-4-scout-17b-16e-instruct": ("&#128269;", "#10b981", "Llama 4 Scout"),
+            "moonshotai/kimi-k2-instruct": ("&#127769;", "#8b5cf6", "Kimi K2"),
+            "llama-3.1-8b-instant": ("&#9889;", "#6b7280", "Llama 8B"),
+            "gemini-2.5-flash": ("&#128142;", "#059669", "Gemini 2.5"),
+            "gemini-2.0-flash": ("&#128142;", "#059669", "Gemini 2.0"),
+        }
         for ticker, info in llm_agent_data["decisions"].items():
             if not isinstance(info, dict):
                 continue
@@ -939,17 +948,8 @@ def render_reports(
       {pr_items}
     </div>"""
 
-            # Build model legend from usage stats
+            # Build model legend from usage stats (reuses _model_symbols defined above)
             _model_usage = llm_agent_data.get("model_usage", {})
-            _model_symbols = {
-                "llama-3.3-70b-versatile": ("&#129409;", "#f59e0b", "Llama 70B"),      # 🦙
-                "qwen/qwen3-32b": ("&#9878;", "#3b82f6", "Qwen3 32B"),                 # ⚖
-                "meta-llama/llama-4-scout-17b-16e-instruct": ("&#128269;", "#10b981", "Llama 4 Scout"),  # 🔍
-                "moonshotai/kimi-k2-instruct": ("&#127769;", "#8b5cf6", "Kimi K2"),     # 🌙
-                "llama-3.1-8b-instant": ("&#9889;", "#6b7280", "Llama 8B"),             # ⚡
-                "gemini-2.5-flash": ("&#128142;", "#059669", "Gemini 2.5"),             # 💎
-                "gemini-2.0-flash": ("&#128142;", "#059669", "Gemini 2.0"),             # 💎
-            }
             _legend_items = ""
             for model_name, count in sorted(_model_usage.items(), key=lambda x: -x[1]):
                 sym, color, label = _model_symbols.get(model_name, ("&#9679;", "#6b7280", model_name))
