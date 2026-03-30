@@ -752,6 +752,8 @@ def render_reports(
             rating_bg = {"BUY": "#ecfdf5", "OVERWEIGHT": "#ecfdf5", "HOLD": "#f3f4f6", "UNDERWEIGHT": "#fffbeb", "SELL": "#fef2f2"}
             rc = rating_colors.get(rating, "#6b7280")
             rb = rating_bg.get(rating, "#f3f4f6")
+            _ticker_pm_model = info.get("pm_model", "")
+            _ticker_analyst_model = info.get("analyst_model", "")
 
             # ── Analyst Team cards (Phase 3) ──
             analyst_section = ""
@@ -881,6 +883,18 @@ def render_reports(
               <div style="font-size:12px;color:#374151;margin-top:8px;line-height:1.5;">{_html_escape(reasoning)}</div>
             </div>"""
 
+            # ── Model badges for this ticker ──
+            _pm_sym = _model_symbols.get(_ticker_pm_model, ("&#9679;", "#6b7280", _ticker_pm_model))
+            _an_sym = _model_symbols.get(_ticker_analyst_model, ("&#9679;", "#6b7280", _ticker_analyst_model))
+            _model_badges = ""
+            if _ticker_pm_model or _ticker_analyst_model:
+                _badges: list[str] = []
+                if _ticker_analyst_model:
+                    _badges.append(f'<span style="color:{_an_sym[1]};font-size:11px;" title="Analyst: {_an_sym[2]}">{_an_sym[0]}</span>')
+                if _ticker_pm_model and _ticker_pm_model != _ticker_analyst_model:
+                    _badges.append(f'<span style="color:{_pm_sym[1]};font-size:11px;" title="PM: {_pm_sym[2]}">{_pm_sym[0]}</span>')
+                _model_badges = ' '.join(_badges)
+
             # ── Assemble ticker card (always visible — Gmail strips <details>) ──
             ticker_cards_html += f"""
           <div style="background:white;border-radius:12px;border:1px solid #e5e7eb;padding:16px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
@@ -890,6 +904,7 @@ def render_reports(
                 <span style="background:{rb};color:{rc};font-weight:bold;padding:3px 10px;border-radius:6px;font-size:12px;margin-left:8px;">{_html_escape(rating)} ({score:+.1f})</span>
                 <span style="font-size:11px;color:#9ca3af;margin-left:8px;">{'%d-round debate' % debate_rounds if debate_rounds > 1 else ''}</span>
               </div>
+              <div style="font-size:13px;">{_model_badges}</div>
             </div>
             <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:#374151;border-left:4px solid {rc};">
               <strong>Verdict:</strong> {_html_escape(reasoning)}
@@ -924,6 +939,33 @@ def render_reports(
       {pr_items}
     </div>"""
 
+            # Build model legend from usage stats
+            _model_usage = llm_agent_data.get("model_usage", {})
+            _model_symbols = {
+                "llama-3.3-70b-versatile": ("&#129409;", "#f59e0b", "Llama 70B"),      # 🦙
+                "qwen/qwen3-32b": ("&#9878;", "#3b82f6", "Qwen3 32B"),                 # ⚖
+                "meta-llama/llama-4-scout-17b-16e-instruct": ("&#128269;", "#10b981", "Llama 4 Scout"),  # 🔍
+                "moonshotai/kimi-k2-instruct": ("&#127769;", "#8b5cf6", "Kimi K2"),     # 🌙
+                "llama-3.1-8b-instant": ("&#9889;", "#6b7280", "Llama 8B"),             # ⚡
+                "gemini-2.5-flash": ("&#128142;", "#059669", "Gemini 2.5"),             # 💎
+                "gemini-2.0-flash": ("&#128142;", "#059669", "Gemini 2.0"),             # 💎
+            }
+            _legend_items = ""
+            for model_name, count in sorted(_model_usage.items(), key=lambda x: -x[1]):
+                sym, color, label = _model_symbols.get(model_name, ("&#9679;", "#6b7280", model_name))
+                _legend_items += (
+                    f'<span style="display:inline-block;margin-right:12px;font-size:11px;">'
+                    f'<span style="color:{color};font-size:13px;">{sym}</span> '
+                    f'<span style="color:#374151;font-weight:600;">{label}</span>'
+                    f'<span style="color:#9ca3af;"> ({count} calls)</span></span>'
+                )
+            _model_legend_html = ""
+            if _legend_items:
+                _model_legend_html = f"""
+    <div style="background:#f3f4f6;border-radius:8px;padding:8px 12px;margin-bottom:14px;font-size:11px;">
+      <span style="font-weight:700;color:#6b7280;margin-right:8px;">Models:</span> {_legend_items}
+    </div>"""
+
             llm_block = f"""
   <h3 style="margin:0 0 12px 0;">&#129302; Multi-Agent Trading Analysis ({n_analyzed} tickers)</h3>
   <div style="background:#f8fafc;border-radius:12px;padding:14px;margin:0 0 18px 0;">
@@ -949,6 +991,7 @@ def render_reports(
       </div>
     </div>
     {portfolio_reasoning_html}
+    {_model_legend_html}
     {ticker_cards_html}
   </div>
 """

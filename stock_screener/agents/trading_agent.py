@@ -139,6 +139,9 @@ class AgentDecision:
     debate_history: list[tuple[str, str]] = field(default_factory=list)
     risk_debate: dict[str, str] | None = None
     analyst_reports: dict[str, str] | None = None
+    # Model tracking (which model served the PM decision)
+    pm_model: str = ""
+    analyst_model: str = ""
     # LLM-primary mode fields (populated when primary_mode=True)
     position_size: str = "MEDIUM"  # SMALL | MEDIUM | FULL | NONE
     target_weight: float | None = None  # 0.0-0.20, LLM-suggested weight
@@ -345,6 +348,14 @@ def _create_smart_client(config: dict):
 _last_call_time: float = 0.0
 _rate_limited_models: set[str] = set()  # Models that returned 429 this run — skip them
 
+# Track which model actually served each call (for reporting/audit)
+_model_usage: dict[str, int] = {}  # model_name -> call_count
+
+
+def get_model_usage() -> dict[str, int]:
+    """Return model usage counters for the current run (for email legend)."""
+    return dict(_model_usage)
+
 # Regex to handle <think>...</think> blocks from reasoning models (qwen3-32b etc.)
 _THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>\s*", re.DOTALL)
 _THINK_TAG_RE = re.compile(r"</?think>")
@@ -414,6 +425,7 @@ def _call_llm(
     if model_override:
         try:
             resp = client.chat.completions.create(model=primary_model, messages=messages, **kwargs)
+            _model_usage[primary_model] = _model_usage.get(primary_model, 0) + 1
             return _clean_think_response(resp.choices[0].message.content)
         except Exception as e:
             logger.warning("LLM call failed on %s: %s", primary_model, e)
@@ -440,6 +452,7 @@ def _call_llm(
             if model in _REASONING_MODELS:
                 call_kwargs["reasoning_effort"] = "none"
             resp = client.chat.completions.create(model=model, messages=messages, **call_kwargs)
+            _model_usage[model] = _model_usage.get(model, 0) + 1
             return _clean_think_response(resp.choices[0].message.content)
         except Exception as e:
             last_error = e
@@ -1244,6 +1257,10 @@ def analyze_ticker(
         )
         rating, score, reason = _parse_pm_response(pm_response)
 
+    # Determine which models were used
+    _pm_model = cfg.get("smart_model", cfg["model"]) if smart_client else cfg["model"]
+    _analyst_model = cfg["model"]  # Analysts always use fast provider
+
     return AgentDecision(
         ticker=ticker, rating=rating, score=score, reasoning=reason,
         bull_thesis=bull_case, bear_thesis=bear_case, risk_assessment=risk_assessment,
@@ -1251,6 +1268,8 @@ def analyze_ticker(
         debate_history=debate_history,
         risk_debate=risk_debate,
         analyst_reports=analyst_reports,
+        pm_model=_pm_model,
+        analyst_model=_analyst_model,
         position_size=position_size,
         target_weight=target_weight,
         suggested_stop_loss=suggested_stop_loss,

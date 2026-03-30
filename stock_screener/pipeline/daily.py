@@ -665,10 +665,18 @@ def run_daily(cfg: Config, logger) -> None:
                                 "target_weight": getattr(d, "target_weight", None),
                                 "suggested_stop_loss": getattr(d, "suggested_stop_loss", None),
                                 "expected_hold_days": getattr(d, "expected_hold_days", None),
+                                "pm_model": getattr(d, "pm_model", ""),
+                                "analyst_model": getattr(d, "analyst_model", ""),
                             }
                             for t, d in _decisions.items()
                         },
                     }
+                    # Record model usage stats
+                    try:
+                        from stock_screener.agents.trading_agent import get_model_usage
+                        run_meta["llm_agent"]["model_usage"] = get_model_usage()
+                    except Exception:
+                        pass
                     logger.info("LLM agent: blended scores for %d tickers", len(_decisions))
                 else:
                     run_meta["llm_agent"] = {"status": "no_results", "reason": "API returned no decisions (check logs for warnings)"}
