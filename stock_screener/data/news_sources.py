@@ -73,6 +73,7 @@ def fetch_rss_headlines(max_per_feed: int = 10) -> list[dict[str, Any]]:
 # ── Reddit (no API key, ~60 req/min with User-Agent) ──────────────────────
 
 _REDDIT_SUBREDDITS = ["wallstreetbets", "stocks"]
+_REDDIT_CONGRESS_SUBS = ["CongressStockWatcher"]
 
 
 def fetch_reddit_posts(
@@ -167,6 +168,74 @@ def search_reddit_ticker(
     return articles
 
 
+# ── Congressional Trading (Reddit r/CongressStockWatcher) ─────────────────
+
+_TICKER_RE = re.compile(r"\$([A-Z]{2,5})\b")
+
+
+def fetch_congress_trades(limit: int = 15, min_score: int = 3) -> list[dict[str, Any]]:
+    """Fetch recent congressional trading posts from r/CongressStockWatcher.
+
+    Returns article dicts with source_type="congress". Posts include
+    congress member trades, insider buys, and political trading signals.
+    No API key required.
+    """
+    articles: list[dict[str, Any]] = []
+    for sub in _REDDIT_CONGRESS_SUBS:
+        url = f"https://www.reddit.com/r/{sub}/new.json?limit={limit}"
+        data = _http_get(url)
+        if not data:
+            continue
+        try:
+            payload = json.loads(data)
+            for child in payload.get("data", {}).get("children", []):
+                post = child.get("data", {})
+                score = post.get("score", 0)
+                if score < min_score:
+                    continue
+                title = post.get("title", "").strip()
+                if not title:
+                    continue
+                created = post.get("created_utc")
+                pub_date = (
+                    datetime.fromtimestamp(created, tz=timezone.utc).isoformat()
+                    if created else None
+                )
+                # Extract tickers from title ($TICKER pattern)
+                tickers_found = _TICKER_RE.findall(title)
+                articles.append({
+                    "title": title,
+                    "publisher": f"r/{sub}",
+                    "publish_date": pub_date,
+                    "link": f"https://reddit.com{post.get('permalink', '')}",
+                    "source_type": "congress",
+                    "score": score,
+                    "tickers": tickers_found,
+                })
+        except (json.JSONDecodeError, KeyError):
+            logger.debug("Reddit congress parse failed for r/%s", sub)
+    return articles
+
+
+def get_congress_trades_for_ticker(ticker: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Get congressional trading posts that mention a specific ticker.
+
+    Searches post titles for $TICKER pattern and ticker name mentions.
+    """
+    all_posts = fetch_congress_trades(limit=limit, min_score=1)
+    ticker_upper = ticker.upper()
+    matches: list[dict[str, Any]] = []
+    for post in all_posts:
+        # Match by $TICKER tag
+        if ticker_upper in post.get("tickers", []):
+            matches.append(post)
+            continue
+        # Match by ticker appearing in title
+        if f" {ticker_upper} " in f" {post['title'].upper()} ":
+            matches.append(post)
+    return matches
+
+
 # ── Finnhub (free API key, 60 calls/sec) ──────────────────────────────────
 
 def fetch_finnhub_news(
@@ -228,12 +297,13 @@ def fetch_finnhub_news(
 def fetch_market_news(max_headlines: int = 15) -> list[dict[str, Any]]:
     """Fetch general market news from all free sources (no ticker filter).
 
-    Combines: RSS feeds + Reddit hot posts. No API key required.
+    Combines: RSS feeds + Reddit hot posts + Congressional trades. No API key required.
     Returns up to max_headlines articles sorted by recency.
     """
     articles: list[dict[str, Any]] = []
     articles.extend(fetch_rss_headlines(max_per_feed=8))
     articles.extend(fetch_reddit_posts(limit=10, min_score=100))
+    articles.extend(fetch_congress_trades(limit=10, min_score=3))
     # Deduplicate by title similarity (exact match after lowering)
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
@@ -275,6 +345,10 @@ def fetch_ticker_news_multi(
     # 3. Reddit ticker search
     reddit = search_reddit_ticker(ticker, limit=3)
     articles.extend(reddit)
+
+    # 4. Congressional trading (if any member traded this ticker)
+    congress = get_congress_trades_for_ticker(ticker)
+    articles.extend(congress)
 
     # Deduplicate by title
     seen: set[str] = set()
