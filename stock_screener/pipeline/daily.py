@@ -592,6 +592,28 @@ def run_daily(cfg: Config, logger) -> None:
         run_meta["entry_filters"] = entry_filter_stats
     _check_runtime_budget(started_utc, cfg, logger, "screening")
 
+    # ── Wild card tickers: inject high-signal Reddit/news tickers into screened ──
+    _wildcards_added: list[str] = []
+    try:
+        from stock_screener.data.news_sources import get_wildcard_tickers
+        _wc = get_wildcard_tickers(max_age_days=7, min_reddit_score=200)
+        for wc in _wc[:3]:  # max 3 wild cards
+            t = wc["ticker"]
+            if t in screened.index:
+                continue  # already screened
+            if t in features.index:
+                # Ticker is in the universe with ML features — add it to screened
+                screened = pd.concat([screened, features.loc[[t]]])
+                _wildcards_added.append(t)
+                logger.info(
+                    "Wild card added: %s (source=%s, reason=%s)",
+                    t, wc["source"], wc["reason"][:50],
+                )
+        if _wildcards_added:
+            run_meta["wildcards"] = _wildcards_added
+    except Exception as e:
+        logger.debug("Wild card ticker extraction failed: %s", e)
+
     # ── LLM trading agent layer (fail-soft) ──────────────────────
     _decisions: dict = {}  # initialized here; populated inside the try block below
     if cfg.llm_agent_enabled and not screened.empty:

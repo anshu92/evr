@@ -273,6 +273,87 @@ def get_congress_trades_for_ticker(
     return matches
 
 
+# ── Wild Card Ticker Extraction ────────────────────────────────────────────
+
+def get_wildcard_tickers(max_age_days: int = 7, min_reddit_score: int = 200) -> list[dict[str, Any]]:
+    """Extract high-signal tickers from Reddit and news that deserve LLM evaluation.
+
+    Returns list of dicts: {"ticker": str, "source": str, "reason": str, "score": int}
+    Sorted by signal strength (Reddit upvotes, congress trade).
+    """
+    seen: set[str] = set()
+    wildcards: list[dict[str, Any]] = []
+
+    # 1. Congressional trades (highest signal)
+    congress = fetch_congress_trades(limit=25, min_score=1, max_age_days=max_age_days)
+    for post in congress:
+        for ticker in post.get("tickers", []):
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            wildcards.append({
+                "ticker": ticker,
+                "source": "congress",
+                "reason": post["title"][:80],
+                "score": post.get("score", 0) + 1000,  # Congress trades get priority boost
+            })
+
+    # 2. Reddit trending (high-upvote posts with $TICKER mentions)
+    for sub in _REDDIT_SUBREDDITS:
+        url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25"
+        data = _http_get(url)
+        if not data:
+            continue
+        try:
+            payload = json.loads(data)
+            for child in payload.get("data", {}).get("children", []):
+                post = child.get("data", {})
+                score = post.get("score", 0)
+                if score < min_reddit_score:
+                    continue
+                title = post.get("title", "")
+                tickers_found = _TICKER_RE.findall(title)
+                created = post.get("created_utc")
+                if created:
+                    pub_date = datetime.fromtimestamp(created, tz=timezone.utc).isoformat()
+                    if not _is_recent(pub_date, max_age_days):
+                        continue
+                for ticker in tickers_found:
+                    if ticker in seen:
+                        continue
+                    seen.add(ticker)
+                    wildcards.append({
+                        "ticker": ticker,
+                        "source": f"r/{sub}",
+                        "reason": title[:80],
+                        "score": score,
+                    })
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 3. RSS headline tickers (MarketWatch, Seeking Alpha)
+    rss = fetch_rss_headlines(max_per_feed=10)
+    for article in rss:
+        title = article.get("title", "")
+        tickers_found = _TICKER_RE.findall(title)
+        if not _is_recent(article.get("publish_date"), max_age_days):
+            continue
+        for ticker in tickers_found:
+            if ticker in seen:
+                continue
+            seen.add(ticker)
+            wildcards.append({
+                "ticker": ticker,
+                "source": article.get("publisher", "RSS"),
+                "reason": title[:80],
+                "score": 50,  # RSS gets base score
+            })
+
+    # Sort by score descending
+    wildcards.sort(key=lambda x: x["score"], reverse=True)
+    return wildcards
+
+
 # ── Finnhub (free API key, 60 calls/sec) ──────────────────────────────────
 
 def fetch_finnhub_news(
