@@ -462,7 +462,36 @@ def _call_llm(
             logger.warning("LLM call failed on %s: %s", model, e)
             return ""
 
-    logger.warning("All models in chain exhausted. Last error: %s", last_error)
+    # All primary models exhausted — try fallback provider (OpenRouter) if available
+    fb_key = config.get("fallback_api_key", "")
+    fb_chain = config.get("fallback_model_chain", [])
+    if fb_key and fb_chain:
+        try:
+            fb_client = _OpenAI(
+                api_key=fb_key,
+                base_url=config.get("fallback_base_url"),
+                timeout=config.get("timeout_seconds", 15),
+            ) if _OPENAI_AVAILABLE else None
+            if fb_client:
+                for fb_model in fb_chain:
+                    if fb_model in _rate_limited_models:
+                        continue
+                    try:
+                        resp = fb_client.chat.completions.create(model=fb_model, messages=messages, **kwargs)
+                        _model_usage[fb_model] = _model_usage.get(fb_model, 0) + 1
+                        logger.info("Fallback to OpenRouter %s succeeded", fb_model)
+                        return _clean_think_response(resp.choices[0].message.content)
+                    except Exception as fb_e:
+                        if "429" in str(fb_e) or "503" in str(fb_e):
+                            _rate_limited_models.add(fb_model)
+                            logger.warning("Fallback %s also rate-limited; trying next", fb_model)
+                            continue
+                        logger.warning("Fallback %s failed: %s", fb_model, fb_e)
+                        break
+        except Exception as fb_init_e:
+            logger.debug("Fallback provider init failed: %s", fb_init_e)
+
+    logger.warning("All providers exhausted (primary + fallback). Last error: %s", last_error)
     return ""
 
 

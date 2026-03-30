@@ -250,6 +250,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           # Daily LLM budget: keep within 12min runtime
           AGENT_MAX_LLM_TICKERS: "5"
           AGENT_THROTTLE_SLEEP: "1.0"

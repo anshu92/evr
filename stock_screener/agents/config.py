@@ -44,7 +44,13 @@ _PROVIDERS = {
     "openrouter": {
         "api_key_env": "OPENROUTER_API_KEY",
         "base_url": "https://openrouter.ai/api/v1",
-        "model": "meta-llama/llama-3.1-8b-instruct:free",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "model_chain": [
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "nousresearch/hermes-3-llama-3.1-405b:free",
+            "google/gemma-3-27b-it:free",
+            "nvidia/nemotron-nano-9b-v2:free",
+        ],
     },
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
@@ -75,12 +81,15 @@ def get_agent_config() -> dict:
     """
     primary = os.getenv("AGENT_LLM_PROVIDER", "groq").lower()
     smart_provider = os.getenv("AGENT_SMART_PROVIDER", "gemini").lower()
+    fallback_provider = os.getenv("AGENT_FALLBACK_PROVIDER", "openrouter").lower()
 
     primary_cfg = _build_provider_config(primary)
     smart_cfg = _build_provider_config(smart_provider)
+    fallback_cfg = _build_provider_config(fallback_provider)
 
     # Smart provider falls back to primary if no API key
     smart_available = bool(smart_cfg.get("api_key"))
+    fallback_available = bool(fallback_cfg.get("api_key"))
 
     return {
         # Primary (fast) provider — used for analysts, debates, risk rounds
@@ -89,6 +98,13 @@ def get_agent_config() -> dict:
         "base_url": os.getenv("AGENT_LLM_BASE_URL", primary_cfg["base_url"]),
         "model": os.getenv("AGENT_LLM_MODEL", primary_cfg["model"]),
         "model_chain": primary_cfg["model_chain"],
+        # Fallback provider (OpenRouter) — used when primary chain exhausted
+        "fallback_provider": fallback_cfg["provider"] if fallback_available else "",
+        "fallback_api_key": fallback_cfg["api_key"] if fallback_available else "",
+        "fallback_base_url": fallback_cfg["base_url"] if fallback_available else "",
+        "fallback_model": fallback_cfg["model"] if fallback_available else "",
+        "fallback_model_chain": fallback_cfg.get("model_chain", []) if fallback_available else [],
+        "fallback_available": fallback_available,
         "temperature": float(os.getenv("AGENT_LLM_TEMPERATURE", "0.3")),
         "max_tokens": int(os.getenv("AGENT_LLM_MAX_TOKENS", "1024")),
         "timeout_seconds": int(os.getenv("AGENT_LLM_TIMEOUT", "15")),
