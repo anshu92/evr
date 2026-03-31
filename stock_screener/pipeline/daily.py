@@ -1704,7 +1704,95 @@ def run_daily(cfg: Config, logger) -> None:
         for t in target_weights.index:
             if t in screened.index:
                 target_weights.loc[t, "pred_peak_days"] = screened.loc[t, "pred_peak_days"]
-    
+
+    # ── Professional trading gates (Minervini/O'Neil/PTJ rules) ────────
+    try:
+        from stock_screener.agents.trade_rules import (
+            check_market_direction, filter_by_risk_reward,
+            compute_risk_based_size, log_trade_entry, compute_scaled_entry,
+        )
+
+        # Gate 1: Market Direction — block BUYs in hostile conditions
+        _mkt_vol = float(screened["market_vol_regime"].iloc[0]) if "market_vol_regime" in screened.columns and len(screened) > 0 else None
+        _mkt_trend = float(screened["market_trend_20d"].iloc[0]) if "market_trend_20d" in screened.columns and len(screened) > 0 else None
+        _mkt_breadth = float(screened["market_breadth"].iloc[0]) if "market_breadth" in screened.columns and len(screened) > 0 else None
+        _mkt_gate = check_market_direction(_mkt_vol, _mkt_trend, _mkt_breadth)
+        run_meta["market_gate"] = _mkt_gate
+
+        if not _mkt_gate["allow_buys"] and not target_weights.empty:
+            # Hostile market: zero out new BUY weights (keep existing HOLD positions)
+            _held_tickers = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
+            _new_buys = [t for t in target_weights.index if str(t).upper() not in _held_tickers]
+            if _new_buys:
+                target_weights = target_weights.drop(_new_buys, errors="ignore")
+                logger.warning("Market gate BLOCKED %d new BUYs: %s (hostile market)", len(_new_buys), _new_buys[:5])
+                # Re-normalize remaining
+                if not target_weights.empty and "weight" in target_weights.columns:
+                    _wsum = target_weights["weight"].sum()
+                    if _wsum > 0:
+                        target_weights["weight"] /= _wsum
+
+        # Gate 2: Risk/Reward — reject trades with R:R < 2:1
+        if not target_weights.empty and "pred_return" in target_weights.columns:
+            _held_tickers_upper = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
+            _new_buy_tickers = [t for t in target_weights.index if str(t).upper() not in _held_tickers_upper]
+            if _new_buy_tickers:
+                _prices_dict = {t: float(prices_cad.get(t, 0)) for t in _new_buy_tickers if t in prices_cad.index}
+                _preds_dict = {t: float(target_weights.loc[t, "pred_return"]) for t in _new_buy_tickers if "pred_return" in target_weights.columns}
+                _rr_passed, _rr_details = filter_by_risk_reward(
+                    _new_buy_tickers, _prices_dict, _preds_dict,
+                    stop_loss_pct=float(getattr(cfg, "vol_adjusted_stop_base", 0.08)),
+                    log=logger,
+                )
+                run_meta["rr_gate"] = _rr_details
+                _rr_rejected = [t for t in _new_buy_tickers if t not in _rr_passed]
+                if _rr_rejected:
+                    target_weights = target_weights.drop(_rr_rejected, errors="ignore")
+                    logger.warning("R:R gate REJECTED %d trades: %s", len(_rr_rejected), _rr_rejected[:5])
+                    if not target_weights.empty and "weight" in target_weights.columns:
+                        _wsum = target_weights["weight"].sum()
+                        if _wsum > 0:
+                            target_weights["weight"] /= _wsum
+
+        # Gate 3: Risk-based sizing — replace LLM weights with calculated sizes
+        if _llm_primary_mode and _llm_primary_success and not target_weights.empty:
+            _equity = float(state.cash_cad) + sum(
+                float(prices_cad.get(p.ticker, 0)) * float(p.shares)
+                for p in state.positions if getattr(p, "status", "OPEN") == "OPEN" and p.ticker in prices_cad.index
+            )
+            if _equity > 0:
+                for t in target_weights.index:
+                    _px = float(prices_cad.get(t, 0)) if t in prices_cad.index else 0.0
+                    if _px > 0:
+                        _sizing = compute_risk_based_size(
+                            _equity, _px,
+                            risk_per_trade_pct=0.02,
+                            stop_loss_pct=float(getattr(cfg, "vol_adjusted_stop_base", 0.08)),
+                            max_position_pct=float(getattr(cfg, "max_position_pct", 0.20)),
+                        )
+                        # Use the smaller of LLM weight and risk-based weight
+                        _llm_w = float(target_weights.loc[t, "weight"])
+                        _risk_w = _sizing["weight"]
+                        target_weights.loc[t, "weight"] = min(_llm_w, _risk_w)
+                # Re-normalize
+                if "weight" in target_weights.columns:
+                    _wsum = target_weights["weight"].sum()
+                    if _wsum > 0:
+                        target_weights["weight"] /= _wsum
+                logger.info("Risk-based sizing applied (2%% risk per trade, equity=$%.0f)", _equity)
+
+        # Gate 5: Scaling — new positions enter at 50% size
+        if _llm_primary_mode and _llm_primary_success and not target_weights.empty:
+            _held_upper = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
+            for t in target_weights.index:
+                if str(t).upper() not in _held_upper:
+                    _scaled = compute_scaled_entry(float(target_weights.loc[t, "weight"]), initial_pct=0.5)
+                    target_weights.loc[t, "weight"] = _scaled["initial_weight"]
+            logger.info("Scaling: new positions enter at 50%% (add remaining on confirmation)")
+
+    except Exception as e:
+        logger.warning("Trade rules gate failed (continuing without): %s", e)
+
     # ── LLM-primary rotation: sell held positions to buy better LLM picks ──
     # Only sells if the best new BUY candidate has higher expected return
     # than the held position. Compares ML pred_return for both.
@@ -2173,6 +2261,39 @@ def run_daily(cfg: Config, logger) -> None:
             )
         except Exception as e:
             logger.warning("Action reward tracker save error (non-fatal): %s", e)
+
+    # ── Trade Journal: log all trade actions for learning ──
+    try:
+        from stock_screener.agents.trade_rules import log_trade_entry, log_trade_exit
+        _journal_path = Path(cfg.cache_dir) / "trade_journal.jsonl"
+        for a in trade_plan.actions:
+            _act = getattr(a, "action", "")
+            _tkr = getattr(a, "ticker", "")
+            _px = float(getattr(a, "price_cad", 0) or 0)
+            if _act == "BUY" and _tkr and _px > 0:
+                _pr = float(getattr(a, "pred_return", 0) or 0)
+                _llm_d = _decisions.get(_tkr, {})
+                _llm_rating = _llm_d.get("rating", "") if isinstance(_llm_d, dict) else getattr(_llm_d, "rating", "")
+                _llm_sc = _llm_d.get("score", 0) if isinstance(_llm_d, dict) else getattr(_llm_d, "score", 0)
+                log_trade_entry(
+                    _journal_path, _tkr, "BUY", _px, float(getattr(a, "shares", 0) or 0),
+                    reason=str(getattr(a, "reason", "")),
+                    llm_rating=str(_llm_rating), llm_score=float(_llm_sc),
+                    pred_return=_pr,
+                    market_regime=run_meta.get("market_gate"),
+                )
+            elif _act in ("SELL", "SELL_PARTIAL") and _tkr and _px > 0:
+                _entry_px = float(getattr(a, "entry_price", 0) or 0)
+                _pr_at_entry = float(getattr(a, "pred_return", 0) or 0)
+                log_trade_exit(
+                    _journal_path, _tkr, _px, float(getattr(a, "shares", 0) or 0),
+                    entry_price=_entry_px,
+                    reason=str(getattr(a, "reason", "")),
+                    days_held=int(getattr(a, "days_held", 0) or 0),
+                    pred_return_at_entry=_pr_at_entry,
+                )
+    except Exception as e:
+        logger.debug("Trade journal logging failed: %s", e)
 
     if cfg.reward_model_enabled and reward_policy is not None:
         try:
