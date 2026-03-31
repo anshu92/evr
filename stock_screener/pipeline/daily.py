@@ -2500,6 +2500,7 @@ def run_intraday(cfg, logger) -> None:
         "intraday": True,
         "started_utc": started_utc.isoformat(),
         "label_horizon_days": getattr(cfg, "label_horizon_days", 5),
+        "llm_primary": {"mode": "active"} if getattr(cfg, "llm_decision_primary", False) else False,
     }
     if cfg.llm_agent_enabled and not screened.empty:
         try:
@@ -2727,6 +2728,81 @@ def run_intraday(cfg, logger) -> None:
     rotation_actions = []
     _pre_trade_positions = list(state.positions)
     _pre_trade_cash = state.cash_cad
+
+    # ── Professional trading gates (intraday — same rules as daily) ────
+    _intra_llm_primary = bool(getattr(cfg, "llm_decision_primary", False))
+    try:
+        from stock_screener.agents.trade_rules import (
+            check_market_direction as _mkt_gate_intra,
+            filter_by_risk_reward as _rr_gate_intra,
+            compute_risk_based_size as _risk_size_intra,
+            compute_scaled_entry as _scale_intra,
+        )
+
+        # Gate 1: Market Direction
+        _mv = float(screened["market_vol_regime"].iloc[0]) if "market_vol_regime" in screened.columns and len(screened) > 0 else None
+        _mt = float(screened["market_trend_20d"].iloc[0]) if "market_trend_20d" in screened.columns and len(screened) > 0 else None
+        _mb = float(screened["market_breadth"].iloc[0]) if "market_breadth" in screened.columns and len(screened) > 0 else None
+        _mg = _mkt_gate_intra(_mv, _mt, _mb)
+        run_meta_intraday["market_gate"] = _mg
+
+        if not _mg["allow_buys"] and not target_weights.empty:
+            _held = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
+            _new = [t for t in target_weights.index if str(t).upper() not in _held]
+            if _new:
+                target_weights = target_weights.drop(_new, errors="ignore")
+                logger.warning("Intraday market gate BLOCKED %d new BUYs (hostile market)", len(_new))
+                if not target_weights.empty and "weight" in target_weights.columns:
+                    _ws = target_weights["weight"].sum()
+                    if _ws > 0:
+                        target_weights["weight"] /= _ws
+
+        # Gate 2: R:R filter
+        if not target_weights.empty and "pred_return" in target_weights.columns:
+            _held_u = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
+            _new_buys = [t for t in target_weights.index if str(t).upper() not in _held_u]
+            if _new_buys:
+                _px_d = {t: float(prices_cad.get(t, 0)) for t in _new_buys if t in prices_cad.index}
+                _pr_d = {t: float(target_weights.loc[t, "pred_return"]) for t in _new_buys}
+                _passed, _rr_det = _rr_gate_intra(_new_buys, _px_d, _pr_d, log=logger)
+                run_meta_intraday["rr_gate"] = _rr_det
+                _rejected = [t for t in _new_buys if t not in _passed]
+                if _rejected:
+                    target_weights = target_weights.drop(_rejected, errors="ignore")
+                    logger.warning("Intraday R:R gate REJECTED %d trades", len(_rejected))
+                    if not target_weights.empty and "weight" in target_weights.columns:
+                        _ws = target_weights["weight"].sum()
+                        if _ws > 0:
+                            target_weights["weight"] /= _ws
+
+        # Gate 3: Risk-based sizing
+        if not target_weights.empty:
+            _eq = float(state.cash_cad) + sum(
+                float(prices_cad.get(p.ticker, 0)) * float(p.shares)
+                for p in state.positions if getattr(p, "status", "OPEN") == "OPEN" and p.ticker in prices_cad.index
+            )
+            if _eq > 0:
+                for t in target_weights.index:
+                    _px = float(prices_cad.get(t, 0)) if t in prices_cad.index else 0.0
+                    if _px > 0:
+                        _sz = _risk_size_intra(_eq, _px, risk_per_trade_pct=0.02)
+                        _lw = float(target_weights.loc[t, "weight"])
+                        target_weights.loc[t, "weight"] = min(_lw, _sz["weight"])
+                if "weight" in target_weights.columns:
+                    _ws = target_weights["weight"].sum()
+                    if _ws > 0:
+                        target_weights["weight"] /= _ws
+
+        # Gate 5: Scaling — new positions at 50%
+        if not target_weights.empty:
+            _held_u2 = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
+            for t in target_weights.index:
+                if str(t).upper() not in _held_u2:
+                    _sc = _scale_intra(float(target_weights.loc[t, "weight"]), initial_pct=0.5)
+                    target_weights.loc[t, "weight"] = _sc["initial_weight"]
+
+    except Exception as e:
+        logger.warning("Intraday trade rules failed (continuing): %s", e)
 
     if not target_weights.empty:
         try:
