@@ -1205,7 +1205,24 @@ def render_reports(
     if _halt:
         _risk_alerts.append("TRADING HALTED: TRADING_HALT is active. No new trades will be executed.")
     _kill_color = "#dc2626" if _halt else "#059669"
-    _kill_label = "HALTED" if _halt else "Active"
+    _kill_label = "HALTED" if _halt else "Normal"
+
+    # Market gate status (from run_meta)
+    _mkt_gate = (run_meta.get("market_gate") or {}) if isinstance(run_meta, dict) else {}
+    _mkt_allow = _mkt_gate.get("allow_buys", True)
+    _mkt_hostile = _mkt_gate.get("hostile_count", 0)
+    _mkt_reasons = _mkt_gate.get("reasons") or []
+    if not _mkt_allow:
+        _gate_color = "#dc2626"
+        _gate_label = f"BLOCKED ({_mkt_hostile}/3)"
+        _gate_reasons_str = "; ".join(_mkt_reasons[:2]) if _mkt_reasons else "hostile market"
+        _risk_alerts.append(f"Market Gate: New BUYs blocked — {_gate_reasons_str}")
+    elif _mkt_hostile == 1:
+        _gate_color = "#f59e0b"
+        _gate_label = f"Caution ({_mkt_hostile}/3)"
+    else:
+        _gate_color = "#059669"
+        _gate_label = "Open"
 
     # LLM agent status
     _llm_status = (run_meta.get("llm_agent", {}) or {}).get("status", "disabled") if isinstance(run_meta, dict) else "disabled"
@@ -1245,13 +1262,19 @@ def render_reports(
           background:{_data_freshness_color}20;color:{_data_freshness_color};">{_data_freshness_label}</div>
       </td>
       <!-- Kill switch -->
-      <td style="vertical-align:top;padding:0 12px;width:20%;">
+      <td style="vertical-align:top;padding:0 8px;width:15%;">
         <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Kill Switch</div>
         <div style="display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;
           background:{_kill_color}20;color:{_kill_color};">{_kill_label}</div>
       </td>
+      <!-- Market Gate -->
+      <td style="vertical-align:top;padding:0 8px;width:15%;">
+        <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Market Gate</div>
+        <div style="display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;
+          background:{_gate_color}20;color:{_gate_color};">{_gate_label}</div>
+      </td>
       <!-- Settlement -->
-      <td style="vertical-align:top;padding:0 0 0 12px;width:25%;">
+      <td style="vertical-align:top;padding:0 0 0 8px;width:20%;">
         <div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">Settlement</div>
         <div style="display:inline-block;padding:3px 10px;border-radius:6px;font-size:12px;font-weight:600;
           background:{_settle_color}20;color:{_settle_color};">{_settle_label}</div>
