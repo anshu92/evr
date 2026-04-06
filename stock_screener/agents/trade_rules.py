@@ -90,14 +90,18 @@ def calculate_risk_reward(
     stop_price: float | None,
     pred_return: float = 0.0,
     stop_loss_pct: float = 0.08,
+    min_rr: float = 2.0,
 ) -> dict[str, Any]:
     """Calculate risk/reward ratio for a potential trade.
 
     Based on PTJ: "I seek a 5:1 risk-reward ratio for every trade."
-    Minimum acceptable: 2:1.
 
     If target_price or stop_price is not provided, estimates from
     pred_return and stop_loss_pct.
+
+    Note: when pred_return is a short-term ML prediction (e.g. 5-day), use
+    min_rr=0.5 — requiring pred_return >= stop*0.5 (positive expectancy).
+    The classic 2:1 applies to swing/position trades with explicit price targets.
     """
     if entry_price <= 0:
         return {"rr_ratio": 0.0, "pass": False, "reason": "invalid entry price"}
@@ -121,13 +125,13 @@ def calculate_risk_reward(
 
     return {
         "rr_ratio": round(rr_ratio, 2),
-        "pass": rr_ratio >= 2.0,
+        "pass": rr_ratio >= min_rr,
         "entry": round(entry_price, 2),
         "target": round(target_price, 2),
         "stop": round(stop_price, 2),
         "upside": round(upside, 2),
         "downside": round(downside, 2),
-        "reason": f"R:R {rr_ratio:.1f}:1 {'≥' if rr_ratio >= 2.0 else '<'} 2:1 minimum",
+        "reason": f"R:R {rr_ratio:.1f}:1 {'≥' if rr_ratio >= min_rr else '<'} {min_rr:.1f}:1 minimum",
     }
 
 
@@ -147,7 +151,7 @@ def filter_by_risk_reward(
     for t in tickers:
         px = prices.get(t, 0)
         pred = predictions.get(t, 0)
-        rr = calculate_risk_reward(px, None, None, pred_return=pred, stop_loss_pct=stop_loss_pct)
+        rr = calculate_risk_reward(px, None, None, pred_return=pred, stop_loss_pct=stop_loss_pct, min_rr=min_rr)
         details[t] = rr
 
         if rr["pass"]:

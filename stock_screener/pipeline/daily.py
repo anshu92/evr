@@ -1742,6 +1742,9 @@ def run_daily(cfg: Config, logger) -> None:
                 _rr_passed, _rr_details = filter_by_risk_reward(
                     _new_buy_tickers, _prices_dict, _preds_dict,
                     stop_loss_pct=float(getattr(cfg, "vol_adjusted_stop_base", 0.08)),
+                    # Use 0.5:1 for short-term ML predictions (5-day pred_return / 8% stop).
+                    # Classic 2:1 would require 16%+ predicted return — unrealistic for 5-day trades.
+                    min_rr=0.5,
                     log=logger,
                 )
                 run_meta["rr_gate"] = _rr_details
@@ -2834,7 +2837,7 @@ def run_intraday(cfg, logger) -> None:
             if _new_buys:
                 _px_d = {t: float(prices_cad.get(t, 0)) for t in _new_buys if t in prices_cad.index}
                 _pr_d = {t: float(target_weights.loc[t, "pred_return"]) for t in _new_buys}
-                _passed, _rr_det = _rr_gate_intra(_new_buys, _px_d, _pr_d, log=logger)
+                _passed, _rr_det = _rr_gate_intra(_new_buys, _px_d, _pr_d, min_rr=0.5, log=logger)
                 run_meta_intraday["rr_gate"] = _rr_det
                 _rejected = [t for t in _new_buys if t not in _passed]
                 if _rejected:
