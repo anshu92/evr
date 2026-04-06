@@ -2589,6 +2589,50 @@ def run_intraday(cfg, logger) -> None:
                         },
                     }
                     logger.info("Intraday LLM: blended scores for %d tickers", len(_decisions))
+
+                    # ── LLM-primary: rebuild target_weights from fresh LLM decisions ──
+                    # The cached target_weights.parquet may be stale (e.g. daily run had
+                    # market gate BLOCKED → wrote empty weights). In LLM-primary mode,
+                    # always recompute weights from today's LLM BUY/OVERWEIGHT decisions.
+                    if _llm_pm_intra:
+                        try:
+                            from stock_screener.agents.trading_agent import (
+                                select_tickers_llm_primary as _sel_intra,
+                                compute_llm_primary_weights as _wts_intra,
+                            )
+                            _intra_max_pos = intraday_cache.get("portfolio_size", cfg.dynamic_size_max_positions)
+                            _sel = _sel_intra(screened, _decisions, _intra_max_pos)
+                            if _sel:
+                                _ranges = {
+                                    "small": (
+                                        getattr(cfg, "llm_weight_small_min", 0.05),
+                                        getattr(cfg, "llm_weight_small_max", 0.10),
+                                    ),
+                                    "medium": (
+                                        getattr(cfg, "llm_weight_medium_min", 0.10),
+                                        getattr(cfg, "llm_weight_medium_max", 0.15),
+                                    ),
+                                    "full": (
+                                        getattr(cfg, "llm_weight_full_min", 0.15),
+                                        getattr(cfg, "llm_weight_full_max", 0.20),
+                                    ),
+                                }
+                                _tw_intra = _wts_intra(_sel, _decisions, screened, _ranges)
+                                if not _tw_intra.empty:
+                                    target_weights = _tw_intra
+                                    logger.info(
+                                        "Intraday LLM-primary: rebuilt target_weights from %d BUY decisions "
+                                        "(was %s stale cached tickers)",
+                                        len(_tw_intra),
+                                        0 if 'target_weights' not in dir() else "possibly",
+                                    )
+                                    run_meta_intraday["llm_primary"] = {
+                                        "mode": "active",
+                                        "n_selected": len(_sel),
+                                        "source": "intraday_llm_rebuild",
+                                    }
+                        except Exception as _e_intra:
+                            logger.warning("Intraday LLM-primary weight rebuild failed: %s", _e_intra)
                 else:
                     run_meta_intraday["llm_agent"] = {"status": "no_results", "reason": "API returned empty"}
         except Exception as e:
