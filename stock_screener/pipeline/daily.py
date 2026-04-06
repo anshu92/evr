@@ -2315,8 +2315,11 @@ def run_daily(cfg: Config, logger) -> None:
         _intraday_data_dir.mkdir(parents=True, exist_ok=True)
         if not screened.empty:
             screened.to_parquet(_intraday_data_dir / "screened.parquet", engine="auto")
-        if target_weights is not None and not target_weights.empty:
-            target_weights.to_parquet(_intraday_data_dir / "target_weights.parquet", engine="auto")
+        # Always write target_weights.parquet — even when empty (Market Gate blocked).
+        # Intraday runs must be able to distinguish "no targets today" from "stale cache".
+        # If we skip writing when empty, intraday loads yesterday's stale parquet instead.
+        _tw_to_save = target_weights if (target_weights is not None) else pd.DataFrame()
+        _tw_to_save.to_parquet(_intraday_data_dir / "target_weights.parquet", engine="auto")
 
         _intraday_cache = {
             "run_utc": datetime.now(tz=timezone.utc).isoformat(),
@@ -2328,6 +2331,14 @@ def run_daily(cfg: Config, logger) -> None:
         # Cache market regime scalar (single value, same for all tickers)
         if "market_vol_regime" in screened.columns and not screened.empty:
             _intraday_cache["market_vol_regime"] = float(screened["market_vol_regime"].iloc[0])
+        # Cache market gate result so intraday knows if daily blocked buys and why
+        _daily_mkt_gate = run_meta.get("market_gate")
+        if isinstance(_daily_mkt_gate, dict):
+            _intraday_cache["daily_market_gate"] = {
+                "allow_buys": _daily_mkt_gate.get("allow_buys", True),
+                "hostile_count": _daily_mkt_gate.get("hostile_count", 0),
+                "reasons": _daily_mkt_gate.get("reasons", []),
+            }
         write_json(cache_dir / "intraday_cache.json", _intraday_cache)
         logger.info("Saved intraday cache: %d screened tickers, %d held, %d target weights",
                    len(screened), len(_open_tickers),
@@ -2441,13 +2452,28 @@ def run_intraday(cfg, logger) -> None:
         tw_path = intraday_data_dir / "target_weights.parquet"
         if tw_path.exists():
             target_weights = pd.read_parquet(tw_path)
-            logger.info("Loaded target weights cache: %d tickers", len(target_weights))
+            if target_weights.empty:
+                _daily_gate = intraday_cache.get("daily_market_gate", {})
+                if _daily_gate and not _daily_gate.get("allow_buys", True):
+                    logger.info(
+                        "Daily run wrote empty target_weights (Market Gate blocked: %s). "
+                        "Intraday LLM-primary will rebuild from fresh decisions.",
+                        "; ".join(_daily_gate.get("reasons", []))
+                    )
+                else:
+                    logger.info("Loaded empty target weights cache from daily run (no BUY signals)")
+            else:
+                logger.info("Loaded target weights cache: %d tickers", len(target_weights))
     except Exception as e:
         logger.warning("Could not load target weights cache: %s", e)
 
     if screened.empty and target_weights.empty:
-        _empty_report("no_cache", "No cached screened data or target weights; skipping intraday run")
-        return
+        # Allow intraday to proceed if LLM agent is enabled — it will rebuild weights from fresh decisions
+        _llm_can_rebuild = bool(getattr(cfg, "llm_decision_primary", False) and getattr(cfg, "llm_agent_enabled", False))
+        if not _llm_can_rebuild:
+            _empty_report("no_cache", "No cached screened data or target weights; skipping intraday run")
+            return
+        logger.info("No cached weights but LLM-primary enabled — will attempt fresh analysis")
 
     fx_rate = intraday_cache.get("fx_usdcad", 1.35)
     market_vol_regime = intraday_cache.get("market_vol_regime")
