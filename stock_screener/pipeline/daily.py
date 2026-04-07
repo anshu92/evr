@@ -2646,7 +2646,12 @@ def run_intraday(cfg, logger) -> None:
                                         getattr(cfg, "llm_weight_full_max", 0.20),
                                     ),
                                 }
-                                _tw_intra = _wts_intra(_sel, _decisions, screened, _ranges)
+                                _tw_intra = _wts_intra(
+                                    _sel, _decisions, screened,
+                                    small_range=_ranges["small"],
+                                    medium_range=_ranges["medium"],
+                                    full_range=_ranges["full"],
+                                )
                                 if not _tw_intra.empty:
                                     target_weights = _tw_intra
                                     logger.info(
