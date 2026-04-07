@@ -1007,7 +1007,14 @@ def run_daily(cfg: Config, logger) -> None:
     )
 
     # Optional single-pass constrained optimizer (replaces sequential transforms).
+    # In LLM-primary mode, skip the optimizer — the LLM already set weights through
+    # analyst/debate/risk pipeline. The optimizer uses blended ML+LLM alpha which
+    # lets ML's negative pred_return override the LLM's BUY decision via the objective
+    # function. Hard constraints (position cap, drawdown, stops) still apply downstream.
     unified_opt_enabled = bool(getattr(cfg, "unified_optimizer_enabled", True))
+    if _llm_primary_success:
+        unified_opt_enabled = False
+        logger.info("Unified optimizer skipped — LLM-primary set weights directly")
     optimizer_weights_snapshot: pd.DataFrame | None = None
     if unified_opt_enabled:
         current_weights = None
@@ -1052,6 +1059,10 @@ def run_daily(cfg: Config, logger) -> None:
             "use_shrinkage_cov": bool(getattr(cfg, "optimizer_use_shrinkage_cov", True)),
             "shrinkage_min_obs": int(getattr(cfg, "optimizer_shrinkage_min_obs", 40)),
         }
+    elif _llm_primary_success:
+        # LLM-primary: skip legacy transforms too — same rationale as optimizer skip.
+        # Hard constraints (max position cap, drawdown, stops) apply via trade gates below.
+        logger.info("Legacy sequential transforms skipped — LLM-primary mode")
     else:
         # Legacy sequential transforms.
         if "pred_confidence" in screened.columns:
