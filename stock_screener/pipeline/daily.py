@@ -559,11 +559,20 @@ def run_daily(cfg: Config, logger) -> None:
         logger=logger,
     )
     if bool(entry_thresholds.get("hold_only_recommended", False)) and strategy_mode != "HOLD_ONLY":
-        strategy_mode = "HOLD_ONLY"
-        strategy_reason = "entry_stress_guard_hold_only"
-        logger.warning(
-            "Entry stress guard escalated strategy mode to HOLD_ONLY (vol/breadth stress).",
-        )
+        # In LLM-primary mode, the LLM is the decision engine and already evaluates
+        # market conditions via the Market Gate. Don't let the stress guard override
+        # it to HOLD_ONLY — that would block all entries even when the LLM sees opportunity.
+        if not _llm_primary_active:
+            strategy_mode = "HOLD_ONLY"
+            strategy_reason = "entry_stress_guard_hold_only"
+            logger.warning(
+                "Entry stress guard escalated strategy mode to HOLD_ONLY (vol/breadth stress).",
+            )
+        else:
+            logger.info(
+                "Entry stress guard recommends HOLD_ONLY but LLM-primary is active "
+                "— LLM + Market Gate will handle market conditions.",
+            )
     if isinstance(run_meta.get("strategy_mode"), dict):
         run_meta["strategy_mode"]["mode"] = strategy_mode
         run_meta["strategy_mode"]["reason"] = strategy_reason
@@ -573,6 +582,15 @@ def run_daily(cfg: Config, logger) -> None:
         run_meta["strategy_mode"]["entry_stress_hold_only_recommended"] = bool(
             entry_thresholds.get("hold_only_recommended", False)
         )
+
+    # LLM-primary mode: preserve pre-filter screened for the LLM to analyze.
+    # The LLM is the decision engine — ML entry filters are informational only.
+    # Hard constraints (price, liquidity, vol cap) already applied by score_universe().
+    _llm_primary_active = bool(
+        getattr(cfg, "llm_decision_primary", False) and cfg.llm_agent_enabled
+    )
+    _screened_for_llm = screened.copy() if _llm_primary_active else None
+
     screened, entry_filter_stats = apply_entry_filters(
         screened,
         min_confidence=entry_thresholds.get("min_confidence"),
@@ -582,6 +600,23 @@ def run_daily(cfg: Config, logger) -> None:
         momentum_alignment=getattr(cfg, "entry_momentum_alignment", True),
         logger=logger,
     )
+
+    # In LLM-primary mode, if entry filters eliminated all candidates, restore
+    # the pre-filter set so the LLM can make its own BUY/HOLD/SELL decisions.
+    # The LLM sees ML features (confidence, momentum, volatility) as context and
+    # can make informed choices that the mechanical filters would reject.
+    if _llm_primary_active and screened.empty and _screened_for_llm is not None and not _screened_for_llm.empty:
+        screened = _screened_for_llm
+        logger.info(
+            "LLM-primary: restored %d candidates that entry filters rejected "
+            "(LLM will decide; hard constraints still apply downstream)",
+            len(screened),
+        )
+        run_meta["llm_primary_entry_filter_bypass"] = {
+            "restored_count": len(screened),
+            "filter_rejection_reasons": entry_filter_stats.get("rejection_reasons", {}),
+        }
+
     if (
         entry_thresholds.get("dynamic_applied")
         or entry_thresholds.get("stress_guard_triggered")
