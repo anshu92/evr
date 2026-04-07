@@ -1767,8 +1767,11 @@ def run_daily(cfg: Config, logger) -> None:
                     if _wsum > 0:
                         target_weights["weight"] /= _wsum
 
-        # Gate 2: Risk/Reward — reject trades with R:R < 2:1
-        if not target_weights.empty and "pred_return" in target_weights.columns:
+        # Gate 2: Risk/Reward — reject trades with poor R:R based on ML pred_return.
+        # In LLM-primary mode, skip this gate: the LLM already evaluated risk/reward
+        # through analyst reports, bull/bear debate, and risk management synthesis.
+        # Using ML's pred_return to veto the LLM's BUY defeats the purpose of LLM-primary.
+        if not _llm_primary_mode and not target_weights.empty and "pred_return" in target_weights.columns:
             _held_tickers_upper = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
             _new_buy_tickers = [t for t in target_weights.index if str(t).upper() not in _held_tickers_upper]
             if _new_buy_tickers:
@@ -1777,8 +1780,6 @@ def run_daily(cfg: Config, logger) -> None:
                 _rr_passed, _rr_details = filter_by_risk_reward(
                     _new_buy_tickers, _prices_dict, _preds_dict,
                     stop_loss_pct=float(getattr(cfg, "vol_adjusted_stop_base", 0.08)),
-                    # Use 0.5:1 for short-term ML predictions (5-day pred_return / 8% stop).
-                    # Classic 2:1 would require 16%+ predicted return — unrealistic for 5-day trades.
                     min_rr=0.5,
                     log=logger,
                 )
@@ -1791,6 +1792,8 @@ def run_daily(cfg: Config, logger) -> None:
                         _wsum = target_weights["weight"].sum()
                         if _wsum > 0:
                             target_weights["weight"] /= _wsum
+        elif _llm_primary_mode:
+            logger.info("R:R gate skipped — LLM-primary mode (LLM already assessed risk/reward)")
 
         # Gate 3: Risk-based sizing — replace LLM weights with calculated sizes
         if _llm_primary_mode and _llm_primary_success and not target_weights.empty:
@@ -2870,8 +2873,8 @@ def run_intraday(cfg, logger) -> None:
                     if _ws > 0:
                         target_weights["weight"] /= _ws
 
-        # Gate 2: R:R filter
-        if not target_weights.empty and "pred_return" in target_weights.columns:
+        # Gate 2: R:R filter (ML-primary only; LLM already assessed risk/reward)
+        if not _intra_llm_primary and not target_weights.empty and "pred_return" in target_weights.columns:
             _held_u = {str(p.ticker).upper() for p in state.positions if getattr(p, "status", "OPEN") == "OPEN"}
             _new_buys = [t for t in target_weights.index if str(t).upper() not in _held_u]
             if _new_buys:
@@ -2887,6 +2890,8 @@ def run_intraday(cfg, logger) -> None:
                         _ws = target_weights["weight"].sum()
                         if _ws > 0:
                             target_weights["weight"] /= _ws
+        elif _intra_llm_primary:
+            logger.info("Intraday R:R gate skipped — LLM-primary mode")
 
         # Gate 3: Risk-based sizing
         if not target_weights.empty:
