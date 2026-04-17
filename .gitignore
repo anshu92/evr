@@ -186,8 +186,10 @@ config_local.yml
 .local.yaml
 .local.yml
 
-# Data files (top-level only)
-/data/
+# Data files (top-level only): ignore bulk datasets; keep checked-in macro reference JSON.
+/data/*
+!/data/macro_baskets.json
+!/data/macro_exposure_universe.json
 *.parquet
 *.feather
 *.h5

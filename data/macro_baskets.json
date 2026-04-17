@@ -1,0 +1,146 @@
+[
+  {
+    "basket_key": "rates_up_banks",
+    "theme_keys": ["rates_up", "rates", "banks"],
+    "theme_cluster": "rates",
+    "anchor_etf": "XLF",
+    "eligible_etfs": ["XLF", "KRE"],
+    "eligible_stocks": ["JPM", "BAC", "GS", "MS", "WFC"],
+    "notes": "Higher rates narrative; large banks"
+  },
+  {
+    "basket_key": "rates_down_duration",
+    "theme_keys": ["rates_down", "duration", "bonds"],
+    "theme_cluster": "rates",
+    "anchor_etf": "TLT",
+    "eligible_etfs": ["TLT", "IEF", "AGG"],
+    "eligible_stocks": [],
+    "notes": "Duration / lower yields"
+  },
+  {
+    "basket_key": "usd_strength_exporters",
+    "theme_keys": ["usd_strength", "dxy", "dollar"],
+    "theme_cluster": "fx",
+    "anchor_etf": "UUP",
+    "eligible_etfs": ["UUP"],
+    "eligible_stocks": ["KO", "PG", "PEP", "CAT"],
+    "notes": "Strong USD pressure on exporters"
+  },
+  {
+    "basket_key": "usd_weakness_multinationals",
+    "theme_keys": ["usd_weak", "weak_dollar"],
+    "theme_cluster": "fx",
+    "anchor_etf": "FXE",
+    "eligible_etfs": ["FXE"],
+    "eligible_stocks": ["AAPL", "MSFT", "DE", "HON"],
+    "notes": "USD weakness helps multinationals"
+  },
+  {
+    "basket_key": "oil_up_energy",
+    "theme_keys": ["oil_up", "crude", "energy"],
+    "theme_cluster": "energy",
+    "anchor_etf": "XLE",
+    "eligible_etfs": ["XLE", "USO"],
+    "eligible_stocks": ["XOM", "CVX", "COP", "SLB"],
+    "notes": "Oil / energy complex"
+  },
+  {
+    "basket_key": "oil_down_consumers",
+    "theme_keys": ["oil_down", "lower_oil"],
+    "theme_cluster": "energy",
+    "anchor_etf": "XLY",
+    "eligible_etfs": ["XLY"],
+    "eligible_stocks": ["DAL", "UAL", "UPS", "FDX"],
+    "notes": "Cheaper oil helps transports / discretionary"
+  },
+  {
+    "basket_key": "natgas_power_utilities",
+    "theme_keys": ["natural_gas", "utilities", "power"],
+    "theme_cluster": "energy",
+    "anchor_etf": "XLU",
+    "eligible_etfs": ["XLU"],
+    "eligible_stocks": ["NEE", "DUK", "SO", "AEP"],
+    "notes": "Utilities / power"
+  },
+  {
+    "basket_key": "gold_real_rates_down",
+    "theme_keys": ["gold", "real_rates"],
+    "theme_cluster": "commodities",
+    "anchor_etf": "GLD",
+    "eligible_etfs": ["GLD", "GDX"],
+    "eligible_stocks": ["NEM", "AEM", "GOLD"],
+    "notes": "Gold / miners"
+  },
+  {
+    "basket_key": "copper_industrials_china",
+    "theme_keys": ["copper", "china", "industrial"],
+    "theme_cluster": "commodities",
+    "anchor_etf": "COPX",
+    "eligible_etfs": ["COPX"],
+    "eligible_stocks": ["FCX", "RIO", "BHP", "CAT"],
+    "notes": "Copper / global cyclicals"
+  },
+  {
+    "basket_key": "semicap_ai_capex",
+    "theme_keys": ["ai", "semiconductor", "chips", "nvidia"],
+    "theme_cluster": "ai",
+    "anchor_etf": "SOXX",
+    "eligible_etfs": ["SOXX", "SMH"],
+    "eligible_stocks": ["NVDA", "AMD", "AVGO", "ASML", "AMAT"],
+    "notes": "Semis / AI capex"
+  },
+  {
+    "basket_key": "cloud_ai_power_demand",
+    "theme_keys": ["cloud", "datacenter", "power_ai"],
+    "theme_cluster": "ai",
+    "anchor_etf": "XLK",
+    "eligible_etfs": ["XLK"],
+    "eligible_stocks": ["MSFT", "AMZN", "VRT", "ETN"],
+    "notes": "Cloud / AI infrastructure"
+  },
+  {
+    "basket_key": "housing_rates_down",
+    "theme_keys": ["housing", "homebuilders", "mortgage"],
+    "theme_cluster": "housing",
+    "anchor_etf": "XHB",
+    "eligible_etfs": ["XHB"],
+    "eligible_stocks": ["DHI", "LEN", "PHM", "HD"],
+    "notes": "Housing / homebuilders"
+  },
+  {
+    "basket_key": "credit_stress_defensive",
+    "theme_keys": ["credit", "defensive", "recession", "stress"],
+    "theme_cluster": "credit",
+    "anchor_etf": "LQD",
+    "eligible_etfs": ["LQD", "IEF"],
+    "eligible_stocks": ["PG", "KO", "WMT", "COST"],
+    "notes": "Defensive / quality"
+  },
+  {
+    "basket_key": "regional_banks_credit_relief",
+    "theme_keys": ["regional_banks", "kre", "bank_stress_relief"],
+    "theme_cluster": "credit",
+    "anchor_etf": "KRE",
+    "eligible_etfs": ["KRE"],
+    "eligible_stocks": ["TFC", "FITB", "HBAN", "RF"],
+    "notes": "Regional banks"
+  },
+  {
+    "basket_key": "defense_spending",
+    "theme_keys": ["defense", "pentagon", "military"],
+    "theme_cluster": "fiscal",
+    "anchor_etf": "ITA",
+    "eligible_etfs": ["ITA"],
+    "eligible_stocks": ["LMT", "NOC", "RTX", "GD"],
+    "notes": "Defense primes"
+  },
+  {
+    "basket_key": "uranium_nuclear",
+    "theme_keys": ["uranium", "nuclear", "smr"],
+    "theme_cluster": "energy",
+    "anchor_etf": "URA",
+    "eligible_etfs": ["URA"],
+    "eligible_stocks": ["CCJ", "CEG", "VST"],
+    "notes": "Uranium / nuclear"
+  }
+]
