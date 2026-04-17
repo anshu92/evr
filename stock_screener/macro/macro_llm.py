@@ -210,20 +210,36 @@ def _ranked_to_screened(ranked: list[dict[str, Any]], tickers: set[str]) -> pd.D
     return pd.DataFrame(rows, index=idx)
 
 
+def _clip_meta_text(s: str, n: int) -> str:
+    t = str(s or "").strip()
+    if len(t) <= n:
+        return t
+    return t[: n - 1] + "…"
+
+
 def _decisions_to_meta(decisions: dict[str, Any]) -> dict[str, Any]:
     from stock_screener.agents.trading_agent import AgentDecision
 
     out: dict[str, dict[str, Any]] = {}
     for t, d in decisions.items():
         if isinstance(d, AgentDecision):
-            out[t] = {
+            row: dict[str, Any] = {
                 "rating": d.rating,
                 "score": d.score,
                 "reasoning": d.reasoning,
                 "position_size": getattr(d, "position_size", "MEDIUM"),
                 "target_weight": getattr(d, "target_weight", None),
                 "pm_model": getattr(d, "pm_model", ""),
+                "bull_thesis": _clip_meta_text(d.bull_thesis, 450),
+                "bear_thesis": _clip_meta_text(d.bear_thesis, 450),
+                "risk_assessment": _clip_meta_text(d.risk_assessment, 450),
             }
+            ar = getattr(d, "analyst_reports", None)
+            if isinstance(ar, dict) and ar:
+                facets = [f"{k}: {_clip_meta_text(str(v), 100)}" for k, v in ar.items() if str(v).strip()]
+                if facets:
+                    row["analyst_facets"] = " | ".join(facets[:6])
+            out[t] = row
     return out
 
 
@@ -353,6 +369,19 @@ def refine_macro_targets_with_llm(
     best_by = _best_ranked_row_per_ticker(all_ranked)
 
     if primary_mode:
+        has_conviction = any(
+            getattr(d, "rating", "") in ("BUY", "OVERWEIGHT") for d in decisions.values()
+        )
+        if not has_conviction:
+            _log.warning(
+                "Macro LLM-primary: no BUY/OVERWEIGHT in analyzed set; using rule targets "
+                "(LLM decisions retained in llm_agent meta). Set MACRO_LLM_PRIMARY=0 for "
+                "macro-only blend, or LLM_DECISION_PRIMARY=0 when MACRO_LLM_PRIMARY is unset."
+            )
+            llm_meta["status"] = "fallback"
+            llm_meta["reason"] = "no_buy_or_overweight_in_llm_primary"
+            return rule_targets, llm_meta, all_ranked
+
         selected = select_tickers_llm_primary(
             screened, decisions, max_positions=cfg.max_positions, log=_log
         )

@@ -150,7 +150,7 @@ Core flow:
 
 1. Checkout + Python setup.
 2. Restore caches for pip and macro state (`macro_portfolio_state.json`, `data_runtime/macro_memory.sqlite`, macro cache files).
-3. Run `python -m stock_screener.cli macro-insights --log-level INFO` (hybrid retrieval + rule targets; the workflow maps repository **`vars`** `LLM_AGENT_ENABLED`, `LLM_DECISION_PRIMARY`, `MACRO_LLM_*`, etc. into **`env`** so `MacroConfig` can read them — variables alone are not visible to Python otherwise). When those flags and `GROQ_API_KEY` / other agent keys are present, the **same** multi-agent stack as the daily screener scores names and can drive weights in primary mode.
+3. Run `python -m stock_screener.cli macro-insights --log-level INFO` (hybrid retrieval + rule targets; the workflow maps repository **`vars`** `LLM_AGENT_ENABLED`, `LLM_DECISION_PRIMARY`, `MACRO_LLM_*`, etc. into **`env`** so `MacroConfig` can read them — variables alone are not visible to Python otherwise). When those flags and `GROQ_API_KEY` / other agent keys are present, the **same** multi-agent stack as the daily screener scores names. **LLM-primary for macro** only applies weights if at least one analyzed name is **BUY** or **OVERWEIGHT**; otherwise the run **falls back to rule targets** (decisions still appear under `llm_agent` in artifacts). Optional **`MACRO_AGENT_THROTTLE_SLEEP`** (else **`AGENT_THROTTLE_SLEEP`**, else `3`) sets `AGENT_THROTTLE_SLEEP` on this job to limit rate-limit bursts.
 4. Save macro cache + upload artifacts (`reports/macro_email.html`, CSV/JSON exports, SQLite memory).
 5. Email `reports/macro_email.html` with macro attachments.
 

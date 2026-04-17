@@ -17,6 +17,112 @@ def _fmt_money(x: float | None) -> str:
     return f"{float(x):,.2f}"
 
 
+def _dedupe_ranked_by_ticker(ranked: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    """One row per ticker (best score) so the email table is not repeated LQD lines."""
+    best: dict[str, dict[str, Any]] = {}
+    for r in ranked:
+        t = str(r.get("ticker", "")).upper().strip()
+        if not t:
+            continue
+        sc = float(r.get("score", 0) or 0)
+        if t not in best or sc > float(best[t].get("score", 0) or 0):
+            best[t] = dict(r)
+    out = sorted(best.values(), key=lambda x: float(x.get("score", 0) or 0), reverse=True)
+    return out[:limit]
+
+
+def _collapse_ws(s: str) -> str:
+    return " ".join(str(s).split())
+
+
+def _trim_visible(s: str, max_len: int) -> str:
+    t = _collapse_ws(s)
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 1] + "…"
+
+
+def _decision_narrative_for_email(d: dict[str, Any]) -> str:
+    """PM REASON is often empty; fall back to bull/bear/risk text the models already produced."""
+    r = str(d.get("reasoning", "")).strip()
+    if r:
+        return _trim_visible(r, 900)
+    parts: list[str] = []
+    bull = str(d.get("bull_thesis", "")).strip()
+    bear = str(d.get("bear_thesis", "")).strip()
+    risk = str(d.get("risk_assessment", "")).strip()
+    facets = str(d.get("analyst_facets", "")).strip()
+    if facets:
+        parts.append("Analyst facets: " + _trim_visible(facets, 400))
+    if bull:
+        parts.append("Bull: " + _trim_visible(bull, 420))
+    if bear:
+        parts.append("Bear: " + _trim_visible(bear, 420))
+    if risk:
+        parts.append("Risk: " + _trim_visible(risk, 420))
+    if parts:
+        return "\n".join(parts)
+    return "No PM or debate narrative was returned for this name."
+
+
+def _portfolio_reasoning_html(pr: Any) -> str:
+    if not isinstance(pr, dict) or not pr:
+        return ""
+    blocks: list[str] = []
+    labels = [
+        ("overall", "Overall"),
+        ("adjustments", "Adjustments"),
+        ("concentration_risk", "Concentration risk"),
+        ("correlation_flag", "Correlation"),
+        ("regime_check", "Regime"),
+    ]
+    for key, title in labels:
+        v = pr.get(key)
+        if v and str(v).strip():
+            blocks.append(
+                f"<p style='margin:8px 0;font-size:12px;color:#374151;line-height:1.45;'>"
+                f"<b>{html_escape(title)}</b><br/>{html_escape(_trim_visible(str(v), 720))}</p>"
+            )
+    tw = pr.get("ticker_weights")
+    if isinstance(tw, dict) and tw:
+        blocks.append(
+            f"<p style='margin:8px 0;font-size:12px;color:#374151;'><b>Suggested weights</b><br/>"
+            f"{html_escape(_trim_visible(str(tw), 500))}</p>"
+        )
+    ex = pr.get("excluded")
+    if isinstance(ex, list) and ex:
+        blocks.append(
+            f"<p style='margin:8px 0;font-size:12px;color:#374151;'><b>Excluded</b> "
+            f"{html_escape(', '.join(str(x) for x in ex[:16]))}</p>"
+        )
+    raw = pr.get("raw_response")
+    if not blocks and raw and str(raw).strip():
+        blocks.append(
+            f"<p style='margin:8px 0;font-size:12px;color:#374151;'><b>Portfolio model (excerpt)</b><br/>"
+            f"{html_escape(_trim_visible(str(raw), 900))}</p>"
+        )
+    return "".join(blocks)
+
+
+def _target_weights_card_title(llm_agent: dict[str, Any] | None) -> str:
+    if not isinstance(llm_agent, dict) or llm_agent.get("status") in (None, "disabled"):
+        return "Target weights (rule book)"
+    st = str(llm_agent.get("status", ""))
+    primary = bool(llm_agent.get("primary_mode"))
+    if st == "skipped":
+        return "Target weights (rule book; LLM skipped)"
+    if st == "fallback":
+        reason = str(llm_agent.get("reason", ""))
+        if "no_buy_or_overweight" in reason:
+            return "Target weights (rule book; no LLM BUY/OVERWEIGHT)"
+        return "Target weights (rule book; LLM fallback)"
+    if st == "success" and primary:
+        return "Target weights (LLM-primary)"
+    if st == "success":
+        return "Target weights (LLM score blend + rule allocator)"
+    return "Target weights"
+
+
 def render_macro_reports(
     *,
     reports_dir: Path,
@@ -49,7 +155,7 @@ def render_macro_reports(
     lines.append("")
     lines.append("TOP RANKED NAMES")
     lines.append("-" * 72)
-    for r in ranked[:15]:
+    for r in _dedupe_ranked_by_ticker(ranked, limit=15):
         lines.append(
             f"- {r.get('ticker')} score={r.get('score')} basket={r.get('basket_key')} {r.get('match_reason', '')[:60]}"
         )
@@ -72,11 +178,19 @@ def render_macro_reports(
         if isinstance(dec, dict):
             for tk, d in list(dec.items())[:12]:
                 if isinstance(d, dict):
-                    lines.append(
-                        f"- {tk}: {d.get('rating')} score={d.get('score')} — {str(d.get('reasoning', ''))[:100]}"
-                    )
-        if llm_agent.get("portfolio_reasoning"):
-            lines.append(f"portfolio_reasoning: {str(llm_agent.get('portfolio_reasoning'))[:200]}...")
+                    lines.append(f"- {tk}: {d.get('rating')} score={d.get('score')}")
+                    nar = _decision_narrative_for_email(d)
+                    for ln in nar.split("\n"):
+                        lines.append(f"    {ln[:500]}")
+        pr = llm_agent.get("portfolio_reasoning")
+        if isinstance(pr, dict) and pr:
+            lines.append("")
+            lines.append("PORTFOLIO-LEVEL LLM")
+            lines.append("-" * 72)
+            for key in ("overall", "adjustments", "concentration_risk", "correlation_flag", "regime_check"):
+                v = pr.get(key)
+                if v and str(v).strip():
+                    lines.append(f"- {key}: {str(v)[:400]}")
     (reports_dir / "macro_insights.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     (reports_dir / "macro_trade_actions.json").write_text(
@@ -116,11 +230,12 @@ def render_macro_reports(
         f"<tr><td style='padding:4px 8px;font-size:12px;color:#374151;'>{html_escape(str(a.get('title',''))[:140])}</td></tr>"
         for a in articles[:10]
     )
+    ranked_display = _dedupe_ranked_by_ticker(ranked, limit=12)
     ranked_rows = "".join(
         f"<tr><td style='padding:4px 8px;font-weight:700;'>{html_escape(str(r.get('ticker','')))}</td>"
         f"<td style='padding:4px 8px;font-size:12px;'>{html_escape(str(r.get('basket_key','')))}</td>"
         f"<td style='padding:4px 8px;font-size:12px;'>{r.get('score')}</td></tr>"
-        for r in ranked[:12]
+        for r in ranked_display
     )
     tgt_rows = "".join(
         f"<tr><td style='padding:4px 8px;font-weight:700;'>{html_escape(str(t.get('ticker','')))}</td>"
@@ -143,20 +258,36 @@ def render_macro_reports(
     llm_block = ""
     if isinstance(llm_agent, dict) and llm_agent.get("status") not in (None, "disabled"):
         dec = llm_agent.get("decisions") or {}
-        llm_rows = ""
+        ticker_blocks: list[str] = []
         if isinstance(dec, dict):
             for tk, d in list(dec.items())[:10]:
                 if isinstance(d, dict):
-                    llm_rows += (
-                        f"<tr><td style='padding:4px 8px;font-weight:700;'>{html_escape(str(tk))}</td>"
-                        f"<td style='padding:4px 8px;'>{html_escape(str(d.get('rating','')))}</td>"
-                        f"<td style='padding:4px 8px;font-size:12px;'>{html_escape(str(d.get('reasoning',''))[:120])}</td></tr>"
+                    nar = html_escape(_decision_narrative_for_email(d))
+                    pm_m = html_escape(str(d.get("pm_model", "") or ""))
+                    pm_bit = f"<span style='color:#6b7280;font-size:11px;'>{pm_m}</span>" if pm_m else ""
+                    ticker_blocks.append(
+                        f"<div style='margin:0 0 14px 0;padding-bottom:12px;border-bottom:1px solid #e5e7eb;'>"
+                        f"<div style='font-size:13px;margin-bottom:6px;'>"
+                        f"<b>{html_escape(str(tk))}</b> "
+                        f"<span style='color:#92400e;font-weight:600;'>{html_escape(str(d.get('rating','')))}</span>"
+                        f" &nbsp;score {html_escape(str(d.get('score','')))} {pm_bit}</div>"
+                        f"<div style='font-size:12px;color:#374151;line-height:1.5;white-space:pre-wrap;'>{nar}</div>"
+                        f"</div>"
                     )
-        _llm_empty = "<tr><td colspan='3' style='padding:8px'>No per-ticker decisions recorded.</td></tr>"
+        pr_html = _portfolio_reasoning_html(llm_agent.get("portfolio_reasoning"))
+        pr_section = ""
+        if pr_html:
+            pr_section = (
+                f"<div style='margin-top:14px;padding-top:12px;border-top:1px solid #e5e7eb;'>"
+                f"<div style='font-size:13px;font-weight:700;margin-bottom:6px;color:#111827;'>Portfolio-level reasoning</div>"
+                f"{pr_html}</div>"
+            )
+        _llm_empty = "<div style='padding:8px;font-size:12px;color:#6b7280;'>No per-ticker decisions recorded.</div>"
         inner_llm = (
-            f"<p style='font-size:12px;color:#374151;margin:0 0 8px 0;'>status={html_escape(str(llm_agent.get('status')))} "
+            f"<p style='font-size:12px;color:#374151;margin:0 0 12px 0;'>status={html_escape(str(llm_agent.get('status')))} "
             f"&nbsp; primary_mode={html_escape(str(llm_agent.get('primary_mode')))}</p>"
-            f"<table style='width:100%;border-collapse:collapse;'>{llm_rows or _llm_empty}</table>"
+            f"{''.join(ticker_blocks) or _llm_empty}"
+            f"{pr_section}"
         )
         llm_block = card_wrap("LLM portfolio layer (Groq / Gemini)", inner_llm, accent="#b45309")
 
@@ -177,8 +308,8 @@ def render_macro_reports(
   {card_wrap("Portfolio snapshot", f"<div style='font-size:13px;color:#374151;'>Cash CAD: <b>{_fmt_money(cash)}</b><br/>"
               f"Estimated equity: <b>{_fmt_money(equity)}</b><br/>Open positions: <b>{len(open_positions)}</b></div>")}
   {card_wrap("Macro headlines", inner_head, accent="#2563eb")}
-  {card_wrap("Ranked exposures (hybrid retrieval)", inner_rank, accent="#7c3aed")}
-  {card_wrap("Target weights (after LLM if enabled)", inner_tgt, accent="#059669")}
+  {card_wrap("Ranked exposures (hybrid retrieval, best row per name)", inner_rank, accent="#7c3aed")}
+  {card_wrap(html_escape(_target_weights_card_title(llm_agent)), inner_tgt, accent="#059669")}
   {llm_block}
   {card_wrap("Today's macro actions", inner_act, accent="#dc2626")}
   <div style="text-align:center;padding:16px 0 8px 0;font-size:11px;color:#9ca3af;">

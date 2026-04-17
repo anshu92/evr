@@ -103,6 +103,8 @@ jobs:
           MACRO_LLM_MAX_TICKERS: ${{ vars.MACRO_LLM_MAX_TICKERS }}
           MACRO_LLM_PORTFOLIO_REASONING: ${{ vars.MACRO_LLM_PORTFOLIO_REASONING }}
           MACRO_LLM_PORTFOLIO_ENFORCE: ${{ vars.MACRO_LLM_PORTFOLIO_ENFORCE }}
+          # Slightly higher default than agent config (2s) to reduce Groq/OpenRouter 429s on 6 sequential tickers.
+          AGENT_THROTTLE_SLEEP: ${{ vars.MACRO_AGENT_THROTTLE_SLEEP || vars.AGENT_THROTTLE_SLEEP || '3' }}
         run: |
           mkdir -p data_runtime reports cache
           python -m stock_screener.cli macro-insights --log-level INFO
