@@ -28,6 +28,7 @@ def render_macro_reports(
     memory_path: str,
     run_utc: str,
     logger: Any,
+    llm_agent: dict[str, Any] | None = None,
 ) -> None:
     """Write macro_email.html, macro_insights.txt, macro_portfolio_weights.csv, macro_trade_actions.json."""
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -62,16 +63,30 @@ def render_macro_reports(
     lines.append("-" * 72)
     for ta in trade_actions:
         lines.append(f"- {ta.get('action')} {ta.get('ticker')} sh={ta.get('shares')} @ {ta.get('price_cad')}")
+    if isinstance(llm_agent, dict) and llm_agent.get("status") not in (None, "disabled"):
+        lines.append("")
+        lines.append("LLM AGENT (same stack as daily screener)")
+        lines.append("-" * 72)
+        lines.append(f"status={llm_agent.get('status')} primary_mode={llm_agent.get('primary_mode')}")
+        dec = llm_agent.get("decisions") or {}
+        if isinstance(dec, dict):
+            for tk, d in list(dec.items())[:12]:
+                if isinstance(d, dict):
+                    lines.append(
+                        f"- {tk}: {d.get('rating')} score={d.get('score')} — {str(d.get('reasoning', ''))[:100]}"
+                    )
+        if llm_agent.get("portfolio_reasoning"):
+            lines.append(f"portfolio_reasoning: {str(llm_agent.get('portfolio_reasoning'))[:200]}...")
     (reports_dir / "macro_insights.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     (reports_dir / "macro_trade_actions.json").write_text(
         json.dumps(trade_actions, indent=2),
         encoding="utf-8",
     )
-    (reports_dir / "macro_matches.json").write_text(
-        json.dumps({"run_utc": run_utc, "ranked": ranked[:40], "targets": targets}, indent=2),
-        encoding="utf-8",
-    )
+    _matches: dict[str, Any] = {"run_utc": run_utc, "ranked": ranked[:40], "targets": targets}
+    if isinstance(llm_agent, dict):
+        _matches["llm_agent"] = llm_agent
+    (reports_dir / "macro_matches.json").write_text(json.dumps(_matches, indent=2), encoding="utf-8")
 
     cash = float(getattr(portfolio_state, "cash_cad", 0.0) or 0.0)
     mkt = 0.0
@@ -125,6 +140,26 @@ def render_macro_reports(
     inner_tgt = f"<table style='width:100%;border-collapse:collapse;'>{tgt_rows}</table>"
     inner_act = f"<table style='width:100%;border-collapse:collapse;'>{act_rows}</table>" if act_rows else "<div style='font-size:12px;color:#6b7280;'>No trades this run.</div>"
 
+    llm_block = ""
+    if isinstance(llm_agent, dict) and llm_agent.get("status") not in (None, "disabled"):
+        dec = llm_agent.get("decisions") or {}
+        llm_rows = ""
+        if isinstance(dec, dict):
+            for tk, d in list(dec.items())[:10]:
+                if isinstance(d, dict):
+                    llm_rows += (
+                        f"<tr><td style='padding:4px 8px;font-weight:700;'>{html_escape(str(tk))}</td>"
+                        f"<td style='padding:4px 8px;'>{html_escape(str(d.get('rating','')))}</td>"
+                        f"<td style='padding:4px 8px;font-size:12px;'>{html_escape(str(d.get('reasoning',''))[:120])}</td></tr>"
+                    )
+        _llm_empty = "<tr><td colspan='3' style='padding:8px'>No per-ticker decisions recorded.</td></tr>"
+        inner_llm = (
+            f"<p style='font-size:12px;color:#374151;margin:0 0 8px 0;'>status={html_escape(str(llm_agent.get('status')))} "
+            f"&nbsp; primary_mode={html_escape(str(llm_agent.get('primary_mode')))}</p>"
+            f"<table style='width:100%;border-collapse:collapse;'>{llm_rows or _llm_empty}</table>"
+        )
+        llm_block = card_wrap("LLM portfolio layer (Groq / Gemini)", inner_llm, accent="#b45309")
+
     html = f"""<html>
 <body style="font-family:system-ui,-apple-system,Arial,sans-serif;line-height:1.5;color:#111827;
   max-width:900px;margin:0 auto;padding:0;background:#f0f2f5;">
@@ -143,7 +178,8 @@ def render_macro_reports(
               f"Estimated equity: <b>{_fmt_money(equity)}</b><br/>Open positions: <b>{len(open_positions)}</b></div>")}
   {card_wrap("Macro headlines", inner_head, accent="#2563eb")}
   {card_wrap("Ranked exposures (hybrid retrieval)", inner_rank, accent="#7c3aed")}
-  {card_wrap("Target weights (v1 policy)", inner_tgt, accent="#059669")}
+  {card_wrap("Target weights (after LLM if enabled)", inner_tgt, accent="#059669")}
+  {llm_block}
   {card_wrap("Today's macro actions", inner_act, accent="#dc2626")}
   <div style="text-align:center;padding:16px 0 8px 0;font-size:11px;color:#9ca3af;">
     Attachments: macro_insights.txt &bull; macro_portfolio_weights.csv &bull; macro_trade_actions.json

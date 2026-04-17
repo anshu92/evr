@@ -14,6 +14,7 @@ from stock_screener.macro.evaluate import update_theme_outcomes
 from stock_screener.macro.macro_sources import fetch_macro_headlines
 from stock_screener.macro.memory_store import connect, export_json_snapshot, init_schema, insert_surfaced_batch, insert_story, link_story_theme, upsert_theme
 from stock_screener.macro.paths import default_memory_sqlite, repo_root
+from stock_screener.macro.macro_llm import refine_macro_targets_with_llm
 from stock_screener.macro.portfolio_engine import apply_macro_trades, build_target_weights
 from stock_screener.macro.retrieve import retrieve_for_baskets
 from stock_screener.reporting.macro_render import render_macro_reports
@@ -146,7 +147,15 @@ def run_macro_insights(cfg: MacroConfig | None = None, logger: Any | None = None
     prior_path.write_text(json.dumps(sorted(prior_titles)[-400:]), encoding="utf-8")
 
     all_ranked.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
-    targets = build_target_weights(ranked=all_ranked, cfg=cfg)
+    rule_targets = build_target_weights(ranked=all_ranked, cfg=cfg)
+    targets, llm_agent_meta, ranked_for_reports = refine_macro_targets_with_llm(
+        cfg=cfg,
+        all_ranked=all_ranked,
+        articles=articles,
+        primary_theme_key=primary_theme_key,
+        rule_targets=rule_targets,
+        log=log,
+    )
     log.info("Macro targets: %s", [t["ticker"] for t in targets])
 
     state, trade_actions = apply_macro_trades(cfg=cfg, targets=targets, theme_key=primary_theme_key, logger=log)
@@ -161,20 +170,22 @@ def run_macro_insights(cfg: MacroConfig | None = None, logger: Any | None = None
     render_macro_reports(
         reports_dir=reports_dir,
         articles=articles,
-        ranked=all_ranked,
+        ranked=ranked_for_reports,
         targets=targets,
         trade_actions=trade_actions,
         portfolio_state=state,
         memory_path=str(mem_path),
         run_utc=datetime.now(tz=timezone.utc).isoformat(),
         logger=log,
+        llm_agent=llm_agent_meta,
     )
 
     meta = {
         "run_utc": datetime.now(tz=timezone.utc).isoformat(),
         "n_headlines": len(articles),
-        "n_ranked": len(all_ranked),
+        "n_ranked": len(ranked_for_reports),
         "targets": targets,
+        "llm_agent": llm_agent_meta,
     }
     (cache_dir / "last_macro_run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     conn.close()

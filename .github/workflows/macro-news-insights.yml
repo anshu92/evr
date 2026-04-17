@@ -90,6 +90,8 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MACRO_INSIGHTS_DRY_RUN: ${{ vars.MACRO_INSIGHTS_DRY_RUN || '0' }}
         run: |
           mkdir -p data_runtime reports cache

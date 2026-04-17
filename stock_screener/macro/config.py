@@ -63,6 +63,13 @@ class MacroConfig:
     max_runtime_minutes: float
     dry_run: bool
     min_adv_cad: float
+    llm_agent_enabled: bool
+    llm_decision_primary: bool
+    llm_ml_weight: float
+    llm_llm_weight: float
+    llm_max_tickers: int
+    llm_portfolio_reasoning: bool
+    llm_portfolio_enforce: bool
 
     @staticmethod
     def from_env() -> "MacroConfig":
@@ -88,4 +95,14 @@ class MacroConfig:
             max_runtime_minutes=_f("MAX_MACRO_RUNTIME_MINUTES", 12.0),
             dry_run=_b("MACRO_INSIGHTS_DRY_RUN", False),
             min_adv_cad=_f("MACRO_MIN_ADV_CAD", 5_000_000.0),
+            llm_agent_enabled=_b("MACRO_LLM_AGENT_ENABLED", _b("LLM_AGENT_ENABLED", False)),
+            llm_decision_primary=_b("MACRO_LLM_PRIMARY", _b("LLM_DECISION_PRIMARY", False)),
+            llm_ml_weight=_f("LLM_AGENT_ML_WEIGHT", 0.7),
+            llm_llm_weight=_f("LLM_AGENT_LLM_WEIGHT", 0.3),
+            llm_max_tickers=_i("MACRO_LLM_MAX_TICKERS", 6),
+            llm_portfolio_reasoning=_b(
+                "MACRO_LLM_PORTFOLIO_REASONING",
+                _b("AGENT_PORTFOLIO_REASONING", True),
+            ),
+            llm_portfolio_enforce=_b("MACRO_LLM_PORTFOLIO_ENFORCE", True),
         )
