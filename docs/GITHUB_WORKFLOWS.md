@@ -150,7 +150,7 @@ Core flow:
 
 1. Checkout + Python setup.
 2. Restore caches for pip and macro state (`macro_portfolio_state.json`, `data_runtime/macro_memory.sqlite`, macro cache files).
-3. Run `python -m stock_screener.cli macro-insights --log-level INFO` (hybrid retrieval + rule targets; when `LLM_AGENT_ENABLED` or `MACRO_LLM_AGENT_ENABLED` is set and `GROQ_API_KEY` / other agent keys are present, the **same** multi-agent stack as the daily screener scores names and can drive weights in `LLM_DECISION_PRIMARY` / `MACRO_LLM_PRIMARY` mode).
+3. Run `python -m stock_screener.cli macro-insights --log-level INFO` (hybrid retrieval + rule targets; the workflow maps repository **`vars`** `LLM_AGENT_ENABLED`, `LLM_DECISION_PRIMARY`, `MACRO_LLM_*`, etc. into **`env`** so `MacroConfig` can read them — variables alone are not visible to Python otherwise). When those flags and `GROQ_API_KEY` / other agent keys are present, the **same** multi-agent stack as the daily screener scores names and can drive weights in primary mode.
 4. Save macro cache + upload artifacts (`reports/macro_email.html`, CSV/JSON exports, SQLite memory).
 5. Email `reports/macro_email.html` with macro attachments.
 

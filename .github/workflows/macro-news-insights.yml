@@ -93,6 +93,16 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           MACRO_INSIGHTS_DRY_RUN: ${{ vars.MACRO_INSIGHTS_DRY_RUN || '0' }}
+          # Repository variables are not process env by default — mirror daily workflow so MacroConfig sees them.
+          LLM_AGENT_ENABLED: ${{ vars.LLM_AGENT_ENABLED || '0' }}
+          LLM_DECISION_PRIMARY: ${{ vars.LLM_DECISION_PRIMARY || '0' }}
+          LLM_AGENT_ML_WEIGHT: ${{ vars.LLM_AGENT_ML_WEIGHT || '0.7' }}
+          LLM_AGENT_LLM_WEIGHT: ${{ vars.LLM_AGENT_LLM_WEIGHT || '0.3' }}
+          MACRO_LLM_AGENT_ENABLED: ${{ vars.MACRO_LLM_AGENT_ENABLED }}
+          MACRO_LLM_PRIMARY: ${{ vars.MACRO_LLM_PRIMARY }}
+          MACRO_LLM_MAX_TICKERS: ${{ vars.MACRO_LLM_MAX_TICKERS }}
+          MACRO_LLM_PORTFOLIO_REASONING: ${{ vars.MACRO_LLM_PORTFOLIO_REASONING }}
+          MACRO_LLM_PORTFOLIO_ENFORCE: ${{ vars.MACRO_LLM_PORTFOLIO_ENFORCE }}
         run: |
           mkdir -p data_runtime reports cache
           python -m stock_screener.cli macro-insights --log-level INFO
