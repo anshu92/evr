@@ -142,6 +142,9 @@ cython_debug/
 # EVR Specific Files
 # ==================
 
+# Macro durable SQLite (local / CI; workflow uses Actions cache)
+data_runtime/
+
 # Data cache
 cache/*
 !cache/delisted_tickers.json

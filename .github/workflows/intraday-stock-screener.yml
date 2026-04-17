@@ -11,14 +11,11 @@ on:
     #
     #                          EST (winter)      EDT (summer)       Emails by
     # ────────────────────────────────────────────────────────────────────────
-    # INTRADAY-1  15:00 UTC    10:00 AM          11:00 AM          ~11:02 AM EDT
-    # INTRADAY-2  17:00 UTC    12:00 PM           1:00 PM          ~ 1:02 PM EDT
-    # INTRADAY-3  19:00 UTC     2:00 PM           3:00 PM          ~ 3:02 PM EDT
+    # INTRADAY (single slot): 19:00 UTC — former 15:00/17:00 slots run macro workflow instead.
+    # INTRADAY-1  19:00 UTC     2:00 PM           3:00 PM          ~ 3:02 PM EDT
     #
     # Triggers 30 min early so the ~1-2 min pipeline finishes on time.
 
-    - cron: '0 15 * * 1-5'
-    - cron: '0 17 * * 1-5'
     - cron: '0 19 * * 1-5'
   workflow_dispatch:
 

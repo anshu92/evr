@@ -1,0 +1,198 @@
+name: Macro News + Portfolio (CAD) + Email
+
+on:
+  schedule:
+    # Replaces former intraday slots at 15:00 UTC and 17:00 UTC (weekdays).
+    - cron: '0 15 * * 1-5'
+    - cron: '0 17 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: macro-portfolio-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
+jobs:
+  macro_insights:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Restore durable SQLite from macro-memory branch
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p data_runtime
+          git fetch origin macro-memory 2>/dev/null || true
+          if git rev-parse --verify "origin/macro-memory" >/dev/null 2>&1; then
+            if git cat-file -e "origin/macro-memory:data_runtime/macro_memory.sqlite" 2>/dev/null; then
+              git show "origin/macro-memory:data_runtime/macro_memory.sqlite" > data_runtime/macro_memory.sqlite
+              echo "Restored data_runtime/macro_memory.sqlite from origin/macro-memory"
+            fi
+            if git cat-file -e "origin/macro-memory:reports/macro_memory_export.json" 2>/dev/null; then
+              mkdir -p reports
+              git show "origin/macro-memory:reports/macro_memory_export.json" > reports/macro_memory_export.json
+              echo "Restored reports/macro_memory_export.json from origin/macro-memory"
+            fi
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-actions.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Restore macro state + memory cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            cache/macro_prior_titles.json
+            cache/last_macro_run_meta.json
+            data_runtime/macro_memory.sqlite
+            macro_portfolio_state.json
+            macro_portfolio_state.json.bak
+            macro_portfolio_state.json.events.jsonl
+          key: ${{ runner.os }}-macro-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/macro-news-insights.yml', 'data/macro_baskets.json', 'data/macro_exposure_universe.json') }}
+          restore-keys: |
+            ${{ runner.os }}-macro-data-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-actions.txt
+
+      - name: Run macro insights pipeline
+        env:
+          MACRO_PORTFOLIO_STATE_PATH: "macro_portfolio_state.json"
+          MACRO_PORTFOLIO_BUDGET_CAD: "500"
+          MACRO_MEMORY_SQLITE_PATH: "data_runtime/macro_memory.sqlite"
+          MACRO_REPORTS_DIR: "reports"
+          MACRO_CACHE_DIR: "cache"
+          MAX_MACRO_RUNTIME_MINUTES: "12"
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MACRO_INSIGHTS_DRY_RUN: ${{ vars.MACRO_INSIGHTS_DRY_RUN || '0' }}
+        run: |
+          mkdir -p data_runtime reports cache
+          python -m stock_screener.cli macro-insights --log-level INFO
+
+      - name: Save macro state + memory cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            cache/macro_prior_titles.json
+            cache/last_macro_run_meta.json
+            data_runtime/macro_memory.sqlite
+            macro_portfolio_state.json
+            macro_portfolio_state.json.bak
+            macro_portfolio_state.json.events.jsonl
+          key: ${{ runner.os }}-macro-data-${{ hashFiles('requirements-actions.txt', '.github/workflows/macro-news-insights.yml', 'data/macro_baskets.json', 'data/macro_exposure_universe.json') }}-${{ github.run_id }}
+
+      - name: Upload macro artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macro-insights-${{ github.run_number }}
+          path: |
+            reports/macro_email.html
+            reports/macro_insights.txt
+            reports/macro_portfolio_weights.csv
+            reports/macro_trade_actions.json
+            reports/macro_matches.json
+            reports/macro_memory_export.json
+            data_runtime/macro_memory.sqlite
+          retention-days: 14
+
+      - name: Build macro email attachment list
+        if: always()
+        id: attachments
+        run: |
+          files=""
+          for f in reports/macro_insights.txt reports/macro_portfolio_weights.csv reports/macro_trade_actions.json reports/macro_matches.json; do
+            [ -f "$f" ] && files="${files:+$files,}$f"
+          done
+          echo "list=${files:-reports/macro_insights.txt}" >> $GITHUB_OUTPUT
+
+      - name: Send macro email
+        if: always()
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "[Macro] News + Portfolio (CAD)"
+          to: ${{ secrets.EMAIL_TO || secrets.EMAIL_USERNAME }}
+          from: Stock Screener Bot <${{ secrets.EMAIL_USERNAME }}>
+          html_body: file://reports/macro_email.html
+          attachments: ${{ steps.attachments.outputs.list }}
+
+      - name: Sync durable memory to macro-memory branch
+        if: success() && (vars.MACRO_MEMORY_SYNC_ENABLED == '1')
+        continue-on-error: true
+        env:
+          SYNC_BRANCH: macro-memory
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/macro-sync-stash
+          if [ -f data_runtime/macro_memory.sqlite ]; then
+            cp -f data_runtime/macro_memory.sqlite /tmp/macro-sync-stash/
+          fi
+          if [ -f reports/macro_memory_export.json ]; then
+            cp -f reports/macro_memory_export.json /tmp/macro-sync-stash/
+          fi
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git fetch origin "${SYNC_BRANCH}" 2>/dev/null || true
+          if git rev-parse --verify "origin/${SYNC_BRANCH}" >/dev/null 2>&1; then
+            git checkout -B "${SYNC_BRANCH}" "origin/${SYNC_BRANCH}"
+          else
+            git checkout --orphan "${SYNC_BRANCH}"
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p data_runtime reports
+          if [ -f /tmp/macro-sync-stash/macro_memory.sqlite ]; then
+            cp -f /tmp/macro-sync-stash/macro_memory.sqlite data_runtime/macro_memory.sqlite
+          fi
+          if [ -f /tmp/macro-sync-stash/macro_memory_export.json ]; then
+            cp -f /tmp/macro-sync-stash/macro_memory_export.json reports/macro_memory_export.json
+          fi
+          git add data_runtime/macro_memory.sqlite reports/macro_memory_export.json
+          if git diff --staged --quiet; then
+            echo "No durable memory changes to commit."
+          else
+            git commit -m "chore(macro): sync durable memory [skip ci]"
+            git push origin "HEAD:${SYNC_BRANCH}"
+            echo "Pushed durable memory to ${SYNC_BRANCH}"
+          fi
+
+      - name: Create GitHub Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Macro insights workflow failed: ${context.runId}`,
+              body: `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })

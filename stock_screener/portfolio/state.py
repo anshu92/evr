@@ -118,6 +118,17 @@ def _atomic_write_text(path: Path, payload: str) -> None:
             pass
 
 
+def _macro_meta_from_event(event: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    mk = event.get("macro_theme_key")
+    mb = event.get("macro_basket_key")
+    mc = event.get("macro_theme_cluster")
+    return (
+        str(mk).strip() if mk else None,
+        str(mb).strip() if mb else None,
+        str(mc).strip() if mc else None,
+    )
+
+
 def append_portfolio_events(
     event_log_path: str | Path,
     events: list[dict[str, Any]],
@@ -217,6 +228,7 @@ def rebuild_portfolio_state_from_events(
         if action == "BUY":
             cost = float(price_cad) * float(shares)
             cash_cad -= cost
+            m_theme, m_basket, m_cluster = _macro_meta_from_event(event)
             pos = open_positions.get(ticker)
             if pos is None:
                 open_positions[ticker] = Position(
@@ -224,6 +236,9 @@ def rebuild_portfolio_state_from_events(
                     entry_price=float(price_cad),
                     entry_date=ts,
                     shares=float(shares),
+                    macro_theme_key=m_theme,
+                    macro_basket_key=m_basket,
+                    macro_theme_cluster=m_cluster,
                 )
                 continue
 
@@ -237,6 +252,12 @@ def rebuild_portfolio_state_from_events(
             pos.shares = total_shares
             if ts < pos.entry_date:
                 pos.entry_date = ts
+            if m_theme and not pos.macro_theme_key:
+                pos.macro_theme_key = m_theme
+            if m_basket and not pos.macro_basket_key:
+                pos.macro_basket_key = m_basket
+            if m_cluster and not pos.macro_theme_cluster:
+                pos.macro_theme_cluster = m_cluster
             continue
 
         pos = open_positions.get(ticker)
@@ -278,6 +299,9 @@ class Position:
     entry_price: float
     entry_date: datetime
     shares: float  # Fractional shares supported for expensive stocks
+    macro_theme_key: str | None = None
+    macro_basket_key: str | None = None
+    macro_theme_cluster: str | None = None
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
     status: str = "OPEN"  # OPEN | CLOSED:<reason>
@@ -348,6 +372,15 @@ def load_portfolio_state(path: str | Path, initial_cash_cad: float = 500.0) -> P
             entry_price=float(entry_price),
             entry_date=_dt_from_iso(entry_date) or _utcnow(),
             shares=float(shares),  # Fractional shares supported
+            macro_theme_key=(str(raw["macro_theme_key"]).strip() or None)
+            if raw.get("macro_theme_key")
+            else None,
+            macro_basket_key=(str(raw["macro_basket_key"]).strip() or None)
+            if raw.get("macro_basket_key")
+            else None,
+            macro_theme_cluster=(str(raw["macro_theme_cluster"]).strip() or None)
+            if raw.get("macro_theme_cluster")
+            else None,
             stop_loss_pct=_opt_float(raw.get("stop_loss_pct")),
             take_profit_pct=_opt_float(raw.get("take_profit_pct")),
             status=str(raw.get("status", "OPEN")),

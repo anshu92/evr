@@ -1,8 +1,9 @@
 ## GitHub Workflows
 
-This repository currently uses five GitHub Actions workflows:
+This repository currently uses six GitHub Actions workflows:
 
 - `daily-stock-screener.yml`: weekday daily portfolio run and email
+- `macro-news-insights.yml`: weekday macro news + standalone macro portfolio (replaces two former intraday slots)
 - `train-stock-screener-model.yml`: weekly model training/promotion
 - `reset-portfolio-state.yml`: manual cache/state reset utility
 - `prune-actions-caches.yml`: weekly cache GC for run-unique daily data keys
@@ -136,8 +137,40 @@ Important:
 - Daily cache restore keys are hash-based and stable; save keys include run-unique suffixes.
 - Detailed design and remaining risks are documented in `docs/PORTFOLIO_PIPELINE_AUDIT.md`.
 
+## Macro Workflow
+
+File: `.github/workflows/macro-news-insights.yml`
+
+Schedule:
+
+- Weekdays at `15:00 UTC` and `17:00 UTC` (macro synthesis; replaces two former intraday runs)
+- Manual trigger via `workflow_dispatch`
+
+Core flow:
+
+1. Checkout + Python setup.
+2. Restore caches for pip and macro state (`macro_portfolio_state.json`, `data_runtime/macro_memory.sqlite`, macro cache files).
+3. Run `python -m stock_screener.cli macro-insights --log-level INFO`.
+4. Save macro cache + upload artifacts (`reports/macro_email.html`, CSV/JSON exports, SQLite memory).
+5. Email `reports/macro_email.html` with macro attachments.
+
+Macro portfolio state (isolated from the daily screener):
+
+- `macro_portfolio_state.json` (+ `.bak`, `.events.jsonl`)
+- `data_runtime/macro_memory.sqlite` (durable memory; also exported to `reports/macro_memory_export.json`). The workflow persists via **Actions cache** and **artifacts**. Optional **Git branch durability**: set repository variable `MACRO_MEMORY_SYNC_ENABLED` to `1` to push `data_runtime/macro_memory.sqlite` and `reports/macro_memory_export.json` to branch `macro-memory` after each successful run (restore step reads that branch at the start when it exists). The macro workflow uses `contents: write` so the default `GITHUB_TOKEN` can push that branch.
+
+## Intraday Workflow (reduced)
+
+File: `.github/workflows/intraday-stock-screener.yml`
+
+Schedule:
+
+- Weekdays at `19:00 UTC` only (single intraday risk monitor run)
+
 ## Required Secrets
 
 - `EMAIL_USERNAME`
 - `EMAIL_PASSWORD`
 - Optional `EMAIL_TO` (defaults to `EMAIL_USERNAME`)
+- Optional `FINNHUB_API_KEY` (macro + daily Finnhub news)
+- Optional `OPENAI_API_KEY` / `OPENROUTER_API_KEY` (reserved for future macro LLM/embeddings expansion)

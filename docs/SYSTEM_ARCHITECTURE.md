@@ -34,7 +34,7 @@
 │                        EXECUTION ENVIRONMENT                         │
 │                        GitHub Actions (free)                         │
 │  Daily: 9 PM EST post-close + 7:30 AM EST pre-market (weekdays)     │
-│  Intraday: 10 AM / 12 PM / 2 PM EST (weekdays)                      │
+│  Intraday: 3 PM EST (weekdays) · Macro: 10 AM / 12 PM EST (weekdays) │
 │  Training: Sunday 9 PM ET weekly                                     │
 └─────────────────────────────────────────────────────────────────────┘
                               │

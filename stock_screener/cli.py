@@ -4,8 +4,6 @@ import argparse
 from datetime import datetime, timezone
 
 from stock_screener.config import Config
-from stock_screener.pipeline.daily import run_daily
-from stock_screener.modeling.train import evaluate_model, train_and_save
 from stock_screener.utils import get_logger
 
 
@@ -23,6 +21,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     intraday = sub.add_parser("intraday", help="Lightweight intraday portfolio monitoring")
     intraday.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+
+    macro = sub.add_parser("macro-insights", help="Macro news + standalone macro portfolio + reports")
+    macro.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
 
@@ -31,6 +32,8 @@ def main() -> int:
     logger = get_logger(level=args.log_level)
 
     if args.cmd == "daily":
+        from stock_screener.pipeline.daily import run_daily
+
         cfg = Config.from_env()
         started = datetime.now(tz=timezone.utc)
         logger.info("Starting daily pipeline at %s", started.isoformat())
@@ -40,6 +43,8 @@ def main() -> int:
         return 0
 
     if args.cmd == "train-model":
+        from stock_screener.modeling.train import train_and_save
+
         cfg = Config.from_env()
         started = datetime.now(tz=timezone.utc)
         logger.info("Starting model training at %s", started.isoformat())
@@ -50,6 +55,8 @@ def main() -> int:
         return 0
 
     if args.cmd == "eval-model":
+        from stock_screener.modeling.train import evaluate_model
+
         cfg = Config.from_env()
         started = datetime.now(tz=timezone.utc)
         logger.info("Starting model evaluation at %s", started.isoformat())
@@ -79,6 +86,18 @@ def main() -> int:
         finished = datetime.now(tz=timezone.utc)
         elapsed = (finished - started).total_seconds()
         logger.info("Finished intraday trading pipeline in %.1fs", elapsed)
+        return 0
+
+    if args.cmd == "macro-insights":
+        from stock_screener.macro.config import MacroConfig as MacroCfg
+        from stock_screener.pipeline.macro_insights import run_macro_insights
+
+        mcfg = MacroCfg.from_env()
+        started = datetime.now(tz=timezone.utc)
+        logger.info("Starting macro insights pipeline at %s", started.isoformat())
+        run_macro_insights(cfg=mcfg, logger=logger)
+        finished = datetime.now(tz=timezone.utc)
+        logger.info("Finished macro insights pipeline at %s", finished.isoformat())
         return 0
 
     raise RuntimeError(f"Unknown cmd: {args.cmd}")
