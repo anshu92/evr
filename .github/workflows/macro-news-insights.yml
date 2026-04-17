@@ -20,6 +20,9 @@ jobs:
   macro_insights:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Opt Actions (checkout/cache/send-mail/etc.) into Node 24 before the Node 20 runner default is removed.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
