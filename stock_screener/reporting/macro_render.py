@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from stock_screener.macro.portfolio_engine import compute_macro_book_metrics
 from stock_screener.macro.prices import fetch_usdcad_last, last_close_cad
 from stock_screener.reporting.email_style import card_wrap, html_escape
 
@@ -123,6 +124,90 @@ def _target_weights_card_title(llm_agent: dict[str, Any] | None) -> str:
     return "Target weights"
 
 
+def _fmt_signed_cad(x: float) -> str:
+    return f"{float(x):+,.2f}"
+
+
+def _macro_performance_txt_lines(book: dict[str, Any], *, n_hist: int) -> list[str]:
+    lines = [
+        "PAPER PORTFOLIO PERFORMANCE (vs initial budget)",
+        "-" * 72,
+        f"Initial budget CAD: {_fmt_money(book['initial_budget_cad'])}",
+        f"Equity (mark-to-market) CAD: {_fmt_money(book['equity_cad'])}",
+        f"Net P/L CAD: {_fmt_signed_cad(float(book['net_pl_cad']))}  ({float(book['total_return_pct']):+.2f}%)",
+        f"Unrealized on open names CAD: {_fmt_signed_cad(float(book['unrealized_pl_cad']))}",
+        f"Residual (realized + cash drag) CAD: {_fmt_signed_cad(float(book['realized_pl_cad']))}",
+        f"Cash CAD: {_fmt_money(book['cash_cad'])}  |  Open positions MTM CAD: {_fmt_money(book['open_market_value_cad'])}",
+        f"Open cost basis CAD: {_fmt_money(book['open_cost_basis_cad'])}",
+        f"PnL snapshots stored: {n_hist} (one per macro run when not dry-run)",
+    ]
+    de = book.get("delta_vs_prior_equity_cad")
+    if de is not None:
+        lines.append(f"Δ equity vs prior snapshot CAD: {_fmt_signed_cad(float(de))}")
+    rows = book.get("position_rows") or []
+    if rows:
+        lines.append("")
+        lines.append("OPEN POSITIONS (MTM)")
+        lines.append("-" * 72)
+        for r in rows:
+            lines.append(
+                f"- {r.get('ticker')}  value={_fmt_money(float(r.get('value_cad', 0)))}  "
+                f"uPnL={_fmt_signed_cad(float(r.get('unrealized_pl_cad', 0)))}  "
+                f"({float(r.get('unrealized_pct', 0)):+.1f}%)  days={r.get('days_held')}"
+            )
+    return lines
+
+
+def _macro_performance_html(book: dict[str, Any], *, n_hist: int) -> str:
+    de = book.get("delta_vs_prior_equity_cad")
+    delta_html = ""
+    if de is not None:
+        c = "#059669" if float(de) >= 0 else "#dc2626"
+        delta_html = (
+            f"<div style='font-size:13px;margin:6px 0;'>Δ vs prior snapshot: "
+            f"<b style='color:{c};'>{html_escape(_fmt_signed_cad(float(de)))}</b> CAD</div>"
+        )
+    pos_rows = book.get("position_rows") or []
+    pos_table = ""
+    if pos_rows:
+        parts = [
+            "<tr style='background:#f9fafb;'>"
+            "<th style='text-align:left;padding:6px 8px;font-size:11px;'>Ticker</th>"
+            "<th style='text-align:right;padding:6px 8px;font-size:11px;'>Value</th>"
+            "<th style='text-align:right;padding:6px 8px;font-size:11px;'>uPnL</th>"
+            "<th style='text-align:right;padding:6px 8px;font-size:11px;'>%</th>"
+            "<th style='text-align:right;padding:6px 8px;font-size:11px;'>Days</th></tr>"
+        ]
+        for r in pos_rows:
+            up = float(r.get("unrealized_pl_cad", 0))
+            col = "#059669" if up >= 0 else "#dc2626"
+            parts.append(
+                f"<tr><td style='padding:6px 8px;font-weight:700;'>{html_escape(str(r.get('ticker','')))}</td>"
+                f"<td style='padding:6px 8px;text-align:right;font-size:12px;'>{html_escape(_fmt_money(float(r.get('value_cad',0))))}</td>"
+                f"<td style='padding:6px 8px;text-align:right;font-size:12px;color:{col};'>"
+                f"{html_escape(_fmt_signed_cad(up))}</td>"
+                f"<td style='padding:6px 8px;text-align:right;font-size:12px;color:{col};'>"
+                f"{float(r.get('unrealized_pct', 0)):+.1f}%</td>"
+                f"<td style='padding:6px 8px;text-align:right;font-size:12px;'>{html_escape(str(r.get('days_held','')))}</td></tr>"
+            )
+        pos_table = f"<table style='width:100%;border-collapse:collapse;margin-top:10px;'>{''.join(parts)}</table>"
+    net = float(book["net_pl_cad"])
+    nc = "#059669" if net >= 0 else "#dc2626"
+    unr = float(book["unrealized_pl_cad"])
+    urc = "#059669" if unr >= 0 else "#dc2626"
+    return f"""<div style='font-size:13px;color:#374151;line-height:1.55;'>
+  <div>Initial budget: <b>{html_escape(_fmt_money(float(book['initial_budget_cad'])))}</b> CAD</div>
+  <div>Equity (MTM): <b>{html_escape(_fmt_money(float(book['equity_cad'])))}</b> CAD</div>
+  <div>Net P/L: <b style='color:{nc};'>{html_escape(_fmt_signed_cad(net))}</b> CAD
+    &nbsp;(<b style='color:{nc};'>{float(book['total_return_pct']):+.2f}%</b> vs budget)</div>
+  <div>Unrealized (open): <b style='color:{urc};'>{html_escape(_fmt_signed_cad(unr))}</b> CAD</div>
+  <div style='font-size:12px;color:#6b7280;'>Cash {_fmt_money(float(book['cash_cad']))} · Open MTM {_fmt_money(float(book['open_market_value_cad']))} · Cost basis {_fmt_money(float(book['open_cost_basis_cad']))}</div>
+  <div style='font-size:12px;color:#6b7280;'>Stored PnL snapshots: {n_hist}</div>
+  {delta_html}
+  {pos_table}
+  </div>"""
+
+
 def render_macro_reports(
     *,
     reports_dir: Path,
@@ -135,11 +220,25 @@ def render_macro_reports(
     run_utc: str,
     logger: Any,
     llm_agent: dict[str, Any] | None = None,
+    initial_cash_cad: float = 500.0,
 ) -> None:
     """Write macro_email.html, macro_insights.txt, macro_portfolio_weights.csv, macro_trade_actions.json."""
     reports_dir.mkdir(parents=True, exist_ok=True)
     now_local = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     fx = fetch_usdcad_last()
+    hist_pre = list(getattr(portfolio_state, "pnl_history", None) or [])
+    prior_eq: float | None = None
+    if len(hist_pre) >= 2:
+        try:
+            prior_eq = float(hist_pre[-2].get("equity_cad", 0) or 0)
+        except (TypeError, ValueError):
+            prior_eq = None
+    book = compute_macro_book_metrics(
+        portfolio_state,
+        fx=fx,
+        initial_cash_cad=float(initial_cash_cad),
+        prior_equity_for_delta=prior_eq,
+    )
 
     lines: list[str] = []
     lines.append("=" * 72)
@@ -147,6 +246,8 @@ def render_macro_reports(
     lines.append("=" * 72)
     lines.append(f"Generated: {now_local}")
     lines.append(f"Memory DB: {memory_path}")
+    lines.append("")
+    lines.extend(_macro_performance_txt_lines(book, n_hist=len(hist_pre)))
     lines.append("")
     lines.append("HEADLINES (sample)")
     lines.append("-" * 72)
@@ -197,32 +298,31 @@ def render_macro_reports(
         json.dumps(trade_actions, indent=2),
         encoding="utf-8",
     )
-    _matches: dict[str, Any] = {"run_utc": run_utc, "ranked": ranked[:40], "targets": targets}
+    _matches: dict[str, Any] = {
+        "run_utc": run_utc,
+        "ranked": ranked[:40],
+        "targets": targets,
+        "performance": book,
+        "pnl_history_tail": hist_pre[-14:] if len(hist_pre) > 14 else list(hist_pre),
+    }
     if isinstance(llm_agent, dict):
         _matches["llm_agent"] = llm_agent
     (reports_dir / "macro_matches.json").write_text(json.dumps(_matches, indent=2), encoding="utf-8")
 
-    cash = float(getattr(portfolio_state, "cash_cad", 0.0) or 0.0)
-    mkt = 0.0
-    rows_csv: list[str] = ["ticker,weight,theme_cluster,basket_key,position_value_cad,macro_theme_key"]
-    open_positions = [p for p in portfolio_state.positions if str(p.status) == "OPEN" and float(p.shares) > 0]
-    equity = cash
-    for p in open_positions:
-        px = last_close_cad(p.ticker, fx_usdcad=fx)
-        if px is None:
-            continue
-        v = float(p.shares) * px
-        mkt += v
-        equity += v
-    for p in open_positions:
-        px = last_close_cad(p.ticker, fx_usdcad=fx)
-        if px is None:
-            continue
-        v = float(p.shares) * px
+    equity = float(book["equity_cad"])
+    cash = float(book["cash_cad"])
+    n_open = int(book["n_open"])
+    rows_csv: list[str] = [
+        "ticker,weight,theme_cluster,basket_key,position_value_cad,macro_theme_key,unrealized_pl_cad,pct_vs_entry"
+    ]
+    for r in book.get("position_rows") or []:
+        v = float(r.get("value_cad", 0))
         w = (v / equity) if equity > 0 else 0.0
         rows_csv.append(
-            f"{p.ticker},{w:.4f},{str(p.macro_theme_cluster or '').replace(',', ';')},"
-            f"{str(p.macro_basket_key or '').replace(',', ';')},{v:.2f},{str(p.macro_theme_key or '').replace(',', ';')}"
+            f"{r.get('ticker')},{w:.4f},{str(r.get('macro_theme_cluster', '') or '').replace(',', ';')},"
+            f"{str(r.get('macro_basket_key', '') or '').replace(',', ';')},{v:.2f},"
+            f"{str(r.get('macro_theme_key', '') or '').replace(',', ';')},"
+            f"{float(r.get('unrealized_pl_cad', 0)):.2f},{float(r.get('unrealized_pct', 0)):.2f}"
         )
     (reports_dir / "macro_portfolio_weights.csv").write_text("\n".join(rows_csv) + "\n", encoding="utf-8")
 
@@ -291,6 +391,8 @@ def render_macro_reports(
         )
         llm_block = card_wrap("LLM portfolio layer (Groq / Gemini)", inner_llm, accent="#b45309")
 
+    inner_perf = _macro_performance_html(book, n_hist=len(hist_pre))
+
     html = f"""<html>
 <body style="font-family:system-ui,-apple-system,Arial,sans-serif;line-height:1.5;color:#111827;
   max-width:900px;margin:0 auto;padding:0;background:#f0f2f5;">
@@ -306,7 +408,8 @@ def render_macro_reports(
   </div>
   <div style="padding:16px 16px 0 16px;">
   {card_wrap("Portfolio snapshot", f"<div style='font-size:13px;color:#374151;'>Cash CAD: <b>{_fmt_money(cash)}</b><br/>"
-              f"Estimated equity: <b>{_fmt_money(equity)}</b><br/>Open positions: <b>{len(open_positions)}</b></div>")}
+              f"Estimated equity: <b>{_fmt_money(equity)}</b><br/>Open positions: <b>{n_open}</b></div>")}
+  {card_wrap("Paper portfolio performance (vs initial budget)", inner_perf, accent="#0f766e")}
   {card_wrap("Macro headlines", inner_head, accent="#2563eb")}
   {card_wrap("Ranked exposures (hybrid retrieval, best row per name)", inner_rank, accent="#7c3aed")}
   {card_wrap(html_escape(_target_weights_card_title(llm_agent)), inner_tgt, accent="#059669")}

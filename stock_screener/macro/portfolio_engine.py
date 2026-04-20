@@ -36,6 +36,92 @@ def _equity_cad(state: Any, fx: float) -> float:
     return cash + mkt
 
 
+def compute_macro_book_metrics(
+    state: Any,
+    *,
+    fx: float,
+    initial_cash_cad: float,
+    prior_equity_for_delta: float | None = None,
+) -> dict[str, Any]:
+    """Mark-to-market book vs initial budget; used for reports and pnl_history snapshots."""
+    cash = float(getattr(state, "cash_cad", 0.0) or 0.0)
+    open_positions = _open_positions(state)
+    mkt = 0.0
+    cost_open = 0.0
+    unrealized = 0.0
+    n_priced = 0
+    position_rows: list[dict[str, Any]] = []
+    for p in open_positions:
+        sh = float(p.shares)
+        ep = float(p.entry_price)
+        cost_open += sh * ep
+        px = last_close_cad(p.ticker, fx_usdcad=fx)
+        if px is None or px <= 0:
+            px = ep
+        else:
+            n_priced += 1
+        mv = sh * px
+        mkt += mv
+        u = (px - ep) * sh
+        unrealized += u
+        position_rows.append(
+            {
+                "ticker": p.ticker,
+                "shares": sh,
+                "entry_price_cad": ep,
+                "last_cad": px,
+                "value_cad": mv,
+                "unrealized_pl_cad": u,
+                "unrealized_pct": 100.0 * (px / ep - 1.0) if ep > 0 else 0.0,
+                "days_held": p.days_held(),
+                "macro_theme_cluster": str(p.macro_theme_cluster or ""),
+                "macro_basket_key": str(p.macro_basket_key or ""),
+                "macro_theme_key": str(p.macro_theme_key or ""),
+            }
+        )
+    equity = cash + mkt
+    ini = float(initial_cash_cad)
+    net_pl = equity - ini
+    total_return_pct = 100.0 * net_pl / ini if ini > 0 else 0.0
+    realized_residual = net_pl - unrealized
+    delta_vs_prior: float | None = None
+    if prior_equity_for_delta is not None and prior_equity_for_delta > 0:
+        delta_vs_prior = equity - float(prior_equity_for_delta)
+    return {
+        "asof_utc": _utcnow().isoformat(),
+        "equity_cad": equity,
+        "cash_cad": cash,
+        "open_market_value_cad": mkt,
+        "open_cost_basis_cad": cost_open,
+        "unrealized_pl_cad": unrealized,
+        "realized_pl_cad": realized_residual,
+        "net_pl_cad": net_pl,
+        "total_return_pct": total_return_pct,
+        "initial_budget_cad": ini,
+        "n_open": len(open_positions),
+        "n_open_priced": n_priced,
+        "delta_vs_prior_equity_cad": delta_vs_prior,
+        "position_rows": position_rows,
+    }
+
+
+def macro_pnl_history_row(book: dict[str, Any]) -> dict[str, Any]:
+    """Subset persisted on PortfolioState.pnl_history (no per-ticker rows)."""
+    keys = (
+        "asof_utc",
+        "equity_cad",
+        "cash_cad",
+        "open_market_value_cad",
+        "open_cost_basis_cad",
+        "unrealized_pl_cad",
+        "realized_pl_cad",
+        "net_pl_cad",
+        "n_open",
+        "n_open_priced",
+    )
+    return {k: book[k] for k in keys if k in book}
+
+
 def build_target_weights(
     *,
     ranked: list[dict[str, Any]],
@@ -254,6 +340,24 @@ def apply_macro_trades(
 
     state = replace(state, last_updated=_utcnow())
     if not cfg.dry_run:
+        prior_hist = list(getattr(state, "pnl_history", None) or [])
+        prior_eq: float | None = None
+        if prior_hist:
+            try:
+                prior_eq = float(prior_hist[-1].get("equity_cad", 0) or 0)
+            except (TypeError, ValueError):
+                prior_eq = None
+        book = compute_macro_book_metrics(
+            state,
+            fx=fx,
+            initial_cash_cad=cfg.portfolio_budget_cad,
+            prior_equity_for_delta=prior_eq,
+        )
+        row = macro_pnl_history_row(book)
+        new_hist = prior_hist + [row]
+        if len(new_hist) > 366:
+            new_hist = new_hist[-366:]
+        state = replace(state, pnl_history=new_hist, last_updated=_utcnow())
         save_portfolio_state(cfg.portfolio_state_path, state)
 
     return state, actions

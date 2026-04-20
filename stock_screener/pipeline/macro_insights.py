@@ -178,6 +178,7 @@ def run_macro_insights(cfg: MacroConfig | None = None, logger: Any | None = None
         run_utc=datetime.now(tz=timezone.utc).isoformat(),
         logger=log,
         llm_agent=llm_agent_meta,
+        initial_cash_cad=cfg.portfolio_budget_cad,
     )
 
     meta = {

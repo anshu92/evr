@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from stock_screener.macro.classify import classify_article
 from stock_screener.macro.memory_store import connect, init_schema, insert_story
@@ -8,12 +11,14 @@ from stock_screener.macro.config import MacroConfig
 from stock_screener.macro.macro_llm import refine_macro_targets_with_llm
 from stock_screener.macro.retrieve import retrieve_for_baskets
 from stock_screener.reporting.email_style import html_escape
+from stock_screener.macro.portfolio_engine import compute_macro_book_metrics, macro_pnl_history_row
 from stock_screener.reporting.macro_render import (
     _decision_narrative_for_email,
     _dedupe_ranked_by_ticker,
     _portfolio_reasoning_html,
     _target_weights_card_title,
 )
+from stock_screener.portfolio.state import PortfolioState, Position
 
 
 def test_html_escape():
@@ -53,6 +58,38 @@ def test_portfolio_reasoning_html():
     html = _portfolio_reasoning_html({"overall": "Stay balanced.", "ticker_weights": {"XLF": 0.1}})
     assert "Stay balanced" in html
     assert "XLF" in html
+
+
+def test_compute_macro_book_metrics(monkeypatch):
+    now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    st = PortfolioState(
+        cash_cad=400.0,
+        positions=[
+            Position(
+                ticker="ZZZ",
+                entry_price=10.0,
+                entry_date=now,
+                shares=10.0,
+                macro_theme_key="t1",
+                macro_basket_key="b1",
+                macro_theme_cluster="c1",
+            )
+        ],
+        last_updated=now,
+        pnl_history=[],
+    )
+    monkeypatch.setattr(
+        "stock_screener.macro.portfolio_engine.last_close_cad",
+        lambda *a, **k: 11.0,
+    )
+    book = compute_macro_book_metrics(st, fx=1.35, initial_cash_cad=500.0, prior_equity_for_delta=None)
+    assert book["n_open"] == 1
+    assert book["equity_cad"] == pytest.approx(510.0)
+    assert book["net_pl_cad"] == pytest.approx(10.0)
+    assert book["unrealized_pl_cad"] == pytest.approx(10.0)
+    row = macro_pnl_history_row(book)
+    assert "equity_cad" in row
+    assert "position_rows" not in row
 
 
 def test_classify_article_oil():
