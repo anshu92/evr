@@ -14,7 +14,19 @@ _BASE_URL = "https://api.collective2.com/world/apiv3"
 
 
 def _to_bool(value: Any) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "stock", "stocks", "equity", "equities"}
+
+
+def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in raw and raw.get(key) not in {None, ""}:
+            return raw.get(key)
+    return None
+
+
+def _bool_any(raw: dict[str, Any], keys: tuple[str, ...], *, default: bool = False) -> bool:
+    value = _first_present(raw, keys)
+    return default if value is None else _to_bool(value)
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -174,26 +186,53 @@ class Collective2Client:
 
 
 def _response_list(data: dict[str, Any]) -> list[Any]:
-    response = data.get("response", [])
-    return response if isinstance(response, list) else []
+    for key in ("response", "systems", "trades", "signals", "results", "data"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = _response_list(value)
+            if nested:
+                return nested
+    for value in data.values():
+        if isinstance(value, list):
+            return value
+    return []
 
 
 def parse_system(raw: dict[str, Any]) -> C2System:
     sid = str(raw.get("system_id") or raw.get("systemid") or "").strip()
+    asset_keys = (
+        "trades_stocks",
+        "tradesStocks",
+        "stocks",
+        "stock",
+        "equities",
+        "trades_equities",
+        "tradesEquities",
+    )
+    has_asset_metadata = any(k in raw for k in asset_keys + (
+        "trades_options",
+        "tradesOptions",
+        "trades_futures",
+        "tradesFutures",
+        "trades_forex",
+        "tradesForex",
+    ))
     return C2System(
         system_id=sid,
         system_name=str(raw.get("system_name") or raw.get("systemName") or "").strip(),
         owner_screenname=str(raw.get("owner_screenname") or raw.get("creatorScreenName") or "").strip(),
-        trades_stocks=_to_bool(raw.get("trades_stocks")),
-        trades_stocks_short=_to_bool(raw.get("trades_stocks_short") or raw.get("shorts_stocks")),
-        trades_options=_to_bool(raw.get("trades_options") or raw.get("trades_options_short")),
-        trades_futures=_to_bool(raw.get("trades_futures")),
-        trades_forex=_to_bool(raw.get("trades_forex")),
-        minimum_portfolio_size_required=_to_float(raw.get("minimum_portfolio_size_required")),
-        monthly_fee=_to_float(raw.get("monthlyFee")),
-        free_trial_days=_to_int(raw.get("freeTrialPeriodDays")),
+        trades_stocks=_bool_any(raw, asset_keys, default=not has_asset_metadata),
+        trades_stocks_short=_bool_any(raw, ("trades_stocks_short", "shorts_stocks", "tradesStocksShort", "shortStocks")),
+        trades_options=_bool_any(raw, ("trades_options", "trades_options_short", "tradesOptions", "options")),
+        trades_futures=_bool_any(raw, ("trades_futures", "tradesFutures", "futures")),
+        trades_forex=_bool_any(raw, ("trades_forex", "tradesForex", "forex", "fx")),
+        minimum_portfolio_size_required=_to_float(_first_present(raw, ("minimum_portfolio_size_required", "minimumPortfolioSizeRequired", "minimum_portfolio_size", "minPortfolioSize", "mincapital"))),
+        monthly_fee=_to_float(_first_present(raw, ("monthlyFee", "monthly_fee", "monthlyCost"))),
+        free_trial_days=_to_int(_first_present(raw, ("freeTrialPeriodDays", "free_trial_days"))),
         created_when=str(raw.get("created_when") or raw.get("createdWhen") or "").strip(),
-        is_alive=_to_bool(raw.get("isAlive")),
+        is_alive=_bool_any(raw, ("isAlive", "is_alive", "alive", "active"), default=True),
         raw=dict(raw),
     )
 
@@ -205,10 +244,9 @@ def is_long_stock_system(system: C2System, *, max_minimum_portfolio_usd: float) 
         return False
     if not system.trades_stocks:
         return False
-    if system.trades_stocks_short or system.trades_options or system.trades_futures or system.trades_forex:
+    if system.trades_stocks_short:
         return False
-    min_required = float(system.minimum_portfolio_size_required or 0.0)
-    return min_required <= float(max_minimum_portfolio_usd)
+    return True
 
 
 def parse_signal(system_id: str, raw: Any) -> C2Signal | None:

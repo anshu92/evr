@@ -47,6 +47,125 @@ def test_collective2_parses_and_filters_long_stock_signals():
     assert not is_supported_long_stock_signal(option_sig)
 
 
+def test_collective2_system_parser_tolerates_missing_asset_flags():
+    system = parse_system({
+        "systemid": "abc",
+        "systemName": "Unknown Asset Metadata",
+        "creatorScreenName": "owner",
+    })
+    assert system.system_id == "abc"
+    assert system.trades_stocks
+    assert system.is_alive
+    assert c2p._system_rejection_reason(system, c2p.Collective2CopyConfig(api_key="dummy")) == "eligible"
+
+
+def test_collective2_system_filter_allows_mixed_assets_and_any_budget_but_rejects_stock_shorts():
+    mixed = parse_system({
+        "systemid": "mixed",
+        "systemName": "Mixed But Stocks",
+        "trades_stocks": "1",
+        "trades_options": "1",
+        "trades_futures": "1",
+        "trades_stocks_short": "0",
+        "minimum_portfolio_size_required": "250000",
+        "isAlive": "1",
+    })
+    short = parse_system({
+        "systemid": "short",
+        "systemName": "Short Stocks",
+        "trades_stocks": "1",
+        "trades_stocks_short": "1",
+        "minimum_portfolio_size_required": "25000",
+        "isAlive": "1",
+    })
+    cfg = c2p.Collective2CopyConfig(api_key="dummy")
+    from stock_screener.data.collective2 import is_long_stock_system
+
+    assert is_long_stock_system(mixed, max_minimum_portfolio_usd=cfg.max_minimum_portfolio_usd)
+    assert not is_long_stock_system(short, max_minimum_portfolio_usd=cfg.max_minimum_portfolio_usd)
+    assert c2p._system_rejection_reason(short, cfg) == "has_stock_short_flag"
+
+
+def test_target_weight_scales_from_source_portfolio_percentage():
+    system = parse_system({
+        "system_id": "s1",
+        "system_name": "Large Portfolio",
+        "trades_stocks": "1",
+        "minimum_portfolio_size_required": "100000",
+        "isAlive": "1",
+    })
+    signal = parse_signal("s1", {
+        "signal_id": "sig1",
+        "symbol": "MSFT",
+        "action": "BTO",
+        "quant": "25",
+        "instrument": "stock",
+    })
+    perf = c2p._empty_performance(system)
+    candidate = c2p.SignalCandidate(
+        signal=signal,  # type: ignore[arg-type]
+        system=system,
+        system_score=0.7,
+        deterministic_score=0.9,
+        latest_price_usd=100.0,
+        recent_trades=[],
+        performance=perf,
+        source_trade_notional_usd=2500.0,
+        source_trade_pct_of_portfolio=0.025,
+        consensus_count=1,
+        consensus_sources=[],
+        reason="test",
+    )
+    decision = c2p._rule_decision(candidate, c2p.Collective2CopyConfig(api_key="dummy"), llm_used=False)
+    assert decision.target_weight == 0.025
+
+
+def test_collective2_response_list_handles_nested_systems():
+    data = {"response": {"systems": [{"systemId": "nested"}]}}
+    from stock_screener.data.collective2 import _response_list
+
+    assert _response_list(data) == [{"systemId": "nested"}]
+
+
+def test_collective2_access_audit_includes_diagnostics(tmp_path, monkeypatch):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_system_roster(self, *, filter_value):
+            return [parse_system({"systemid": "s1", "systemName": "System One", "creatorScreenName": "owner"})]
+
+        def list_all_systems(self):
+            return [{"systemId": "s1"}]
+
+        def get_system_details(self, system_id):
+            return {}
+
+        def retrieve_signals_all(self, *args, **kwargs):
+            return []
+
+        def retrieve_signals_working(self, *args, **kwargs):
+            return []
+
+        def request_trades(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(c2p, "Collective2Client", FakeClient)
+    monkeypatch.setattr(c2p, "fetch_latest_usd_prices", lambda tickers, logger=None: {})
+    cfg = c2p.Collective2CopyConfig(
+        api_key="dummy",
+        state_path=str(tmp_path / "collective2_usd_portfolio_state.json"),
+        cache_dir=str(tmp_path / "cache"),
+        reports_dir=str(tmp_path / "reports"),
+    )
+    c2p.run_collective2_copy(cfg, logger=_Logger())
+    audit = c2p.read_json(tmp_path / "cache" / "collective2_access_audit.json")
+    assert audit["eligible_count"] == 1
+    assert audit["accessible_count"] == 1
+    assert audit["roster_rejection_counts"]["eligible"] == 1
+    assert audit["roster_sample"][0]["raw_keys"]
+
+
 def test_normalize_signals_drops_seen_stale_and_unsupported():
     now = int(datetime.now(tz=timezone.utc).timestamp())
     fresh = parse_signal("1", {

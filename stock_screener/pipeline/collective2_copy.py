@@ -47,7 +47,7 @@ class Collective2CopyConfig:
     stop_loss_pct: float = 0.08
     take_profit_pct: float = 0.12
     deterministic_accept_threshold: float = 0.58
-    max_minimum_portfolio_usd: float = 4000.0
+    max_minimum_portfolio_usd: float = 100000.0
 
     @staticmethod
     def from_env() -> "Collective2CopyConfig":
@@ -84,7 +84,7 @@ class Collective2CopyConfig:
             stop_loss_pct=_f("COLLECTIVE2_STOP_LOSS_PCT", 0.08),
             take_profit_pct=_f("COLLECTIVE2_TAKE_PROFIT_PCT", 0.12),
             deterministic_accept_threshold=_f("COLLECTIVE2_ACCEPT_THRESHOLD", 0.58),
-            max_minimum_portfolio_usd=_f("COLLECTIVE2_MAX_MINIMUM_PORTFOLIO_USD", 4000.0),
+            max_minimum_portfolio_usd=_f("COLLECTIVE2_MAX_MINIMUM_PORTFOLIO_USD", 100000.0),
         )
 
 
@@ -184,7 +184,7 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
         if is_long_stock_system(s, max_minimum_portfolio_usd=cfg.max_minimum_portfolio_usd)
     ]
     access_rows = client.list_all_systems()
-    accessible_ids = {str(x.get("system_id") or x.get("systemid") or "").strip() for x in access_rows}
+    accessible_ids = {_system_id_from_row(x) for x in access_rows}
     accessible_ids.discard("")
 
     ranked = rank_systems(eligible)
@@ -194,6 +194,10 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
         "eligible_count": len(eligible),
         "accessible_count": len(accessible_ids),
         "accessible_system_ids": sorted(accessible_ids),
+        "roster_rejection_counts": _roster_rejection_counts(roster, cfg),
+        "roster_sample": [_system_audit_sample(s) for s in roster[:10]],
+        "access_row_count": len(access_rows),
+        "access_row_sample": access_rows[:5],
     })
 
     ranked_payload: list[dict[str, Any]] = []
@@ -308,6 +312,59 @@ def rank_systems(systems: list[C2System]) -> list[tuple[C2System, float]]:
         ranked.append((s, min(1.0, score)))
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
+
+
+def _system_id_from_row(row: dict[str, Any]) -> str:
+    return str(
+        row.get("system_id")
+        or row.get("systemid")
+        or row.get("systemId")
+        or row.get("id")
+        or row.get("c2systemid")
+        or ""
+    ).strip()
+
+
+def _roster_rejection_counts(roster: list[C2System], cfg: Collective2CopyConfig) -> dict[str, int]:
+    counts = {
+        "missing_system_id": 0,
+        "not_alive": 0,
+        "not_stock_capable": 0,
+        "has_stock_short_flag": 0,
+        "eligible": 0,
+    }
+    for system in roster:
+        reason = _system_rejection_reason(system, cfg)
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
+def _system_rejection_reason(system: C2System, cfg: Collective2CopyConfig) -> str:
+    if not system.system_id:
+        return "missing_system_id"
+    if not system.is_alive:
+        return "not_alive"
+    if not system.trades_stocks:
+        return "not_stock_capable"
+    if system.trades_stocks_short:
+        return "has_stock_short_flag"
+    return "eligible"
+
+
+def _system_audit_sample(system: C2System) -> dict[str, Any]:
+    return {
+        "system_id": system.system_id,
+        "system_name": system.system_name,
+        "owner_screenname": system.owner_screenname,
+        "trades_stocks": system.trades_stocks,
+        "trades_stocks_short": system.trades_stocks_short,
+        "trades_options": system.trades_options,
+        "trades_futures": system.trades_futures,
+        "trades_forex": system.trades_forex,
+        "minimum_portfolio_size_required": system.minimum_portfolio_size_required,
+        "is_alive": system.is_alive,
+        "raw_keys": sorted(system.raw.keys())[:40],
+    }
 
 
 def normalize_signals(raw_signals: list[C2Signal], seen: set[str], *, max_age_minutes: int) -> list[C2Signal]:
@@ -517,7 +574,7 @@ def select_with_llm_or_rules(
             system_id=c.signal.system_id,
             ticker=c.signal.symbol,
             decision=decision,
-            target_weight=max(0.0, min(cfg.max_ticker_weight, _float(d.get("target_weight"), 0.0))),
+            target_weight=_scaled_target_weight(c, _float(d.get("target_weight"), 0.0), cfg),
             confidence=max(0.0, min(1.0, _float(d.get("confidence"), 0.0))),
             reason=str(d.get("reason") or "").strip()[:500],
             explanation=str(d.get("explanation") or d.get("reason") or "").strip()[:1500],
@@ -535,7 +592,8 @@ def select_with_llm_or_rules(
 def _rule_decision(candidate: SignalCandidate, cfg: Collective2CopyConfig, *, llm_used: bool) -> SignalDecision:
     action = candidate.signal.action
     decision = "EXIT" if action == "STC" else "ACCEPT"
-    weight = min(cfg.max_ticker_weight, max(cfg.min_trade_notional_usd / cfg.initial_cash_usd, candidate.deterministic_score * 0.20))
+    fallback_weight = max(cfg.min_trade_notional_usd / cfg.initial_cash_usd, candidate.deterministic_score * 0.20)
+    weight = _scaled_target_weight(candidate, fallback_weight, cfg)
     return SignalDecision(
         signal_id=candidate.signal.signal_id,
         system_id=candidate.signal.system_id,
@@ -557,6 +615,13 @@ def _rule_decision(candidate: SignalCandidate, cfg: Collective2CopyConfig, *, ll
         source_trade_pct_of_portfolio=candidate.source_trade_pct_of_portfolio,
         consensus_count=candidate.consensus_count,
     )
+
+
+def _scaled_target_weight(candidate: SignalCandidate, requested_weight: float, cfg: Collective2CopyConfig) -> float:
+    source_weight = candidate.source_trade_pct_of_portfolio
+    if source_weight is not None and source_weight > 0:
+        return max(0.0, min(cfg.max_ticker_weight, float(source_weight)))
+    return max(0.0, min(cfg.max_ticker_weight, float(requested_weight)))
 
 
 def apply_decisions(
