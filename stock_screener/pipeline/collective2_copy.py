@@ -278,9 +278,6 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
         except Exception as e:
             logger.warning("Could not poll C2 signals for %s: %s", system.system_id, e)
 
-    # Hard Roster Sync: If we hold it but the source system doesn't, we exit.
-    sync_events = apply_roster_sync_exits(state, open_trades_by_system, latest_prices, started, logger)
-    
     # Infer BTO signals from current rosters (primary source)
     inferred_signals = infer_signals_from_trades(
         open_trades_by_system,
@@ -301,6 +298,10 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
 
     tickers = sorted({s.symbol for s in normalized} | {p.ticker for p in state.positions})
     latest_prices = fetch_latest_usd_prices(tickers, logger=logger)
+
+    # Hard Roster Sync: If we hold it but the source system doesn't, we exit.
+    sync_events = apply_roster_sync_exits(state, open_trades_by_system, latest_prices, started, logger)
+    
     stop_events = apply_mechanical_exits(state, latest_prices, cfg, started)
     performance_by_system = build_performance_profiles(
         systems_by_id=systems_by_id,
