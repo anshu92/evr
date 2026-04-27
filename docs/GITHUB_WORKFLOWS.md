@@ -214,6 +214,7 @@ Purpose:
 - Use deterministic filters and the existing LLM provider chain to select paper trades.
 - Email portfolio state, new trades, source C2 portfolio, source historical performance, same-ticker consensus, and LLM explanations.
 - Maintain an isolated USD model portfolio starting at `$4,000`.
+- Emit a separate public-roster research report even when no systems are accessible for real-time polling.
 
 Core flow:
 

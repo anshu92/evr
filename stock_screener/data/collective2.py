@@ -85,6 +85,7 @@ class C2Trade:
     trade_id: str
     symbol: str
     instrument: str
+    quantity: float
     long_or_short: str
     open_or_closed: str
     opened_when: str
@@ -288,6 +289,7 @@ def parse_trade(system_id: str, raw: Any) -> C2Trade | None:
         trade_id=trade_id,
         symbol=symbol,
         instrument=str(raw.get("instrument") or "").strip().lower(),
+        quantity=abs(_to_float(_first_present(raw, ("quant", "quantity", "shares", "qty")))),
         long_or_short=str(raw.get("long_or_short") or "").strip().lower(),
         open_or_closed=str(raw.get("open_or_closed") or "").strip().lower(),
         opened_when=str(raw.get("openedWhen") or "").strip(),

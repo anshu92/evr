@@ -118,6 +118,9 @@ def test_collective2_copy_workflow_is_paper_only_and_secret_scoped():
     assert "setDesiredPositions" not in text
     assert "collective2_usd_portfolio_state.json" in text
     assert "collective2_copy_trades.json" in text
+    assert "collective2_public_roster_report.txt" in text
+    assert "collective2_public_roster_report.html" in text
+    assert "collective2_public_roster_report.json" in text
     assert "COLLECTIVE2_MAX_MINIMUM_PORTFOLIO_USD: ${{ vars.COLLECTIVE2_MAX_MINIMUM_PORTFOLIO_USD || '100000' }}" in text
     assert "actions/cache/restore@v4" in text
     assert "actions/cache/save@v4" in text

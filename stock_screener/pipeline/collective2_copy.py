@@ -228,13 +228,42 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
         "run_utc": started.isoformat(),
         "systems": ranked_payload,
     })
+    _write_public_roster_report(
+        reports_dir,
+        started=started,
+        access_summary={
+            "roster_count": len(roster),
+            "eligible_count": len(eligible),
+            "accessible_count": len(accessible_ids),
+            "accessible_ranked_count": len(accessible_ranked),
+        },
+        ranked_payload=ranked_payload,
+        audit={
+            "roster_rejection_counts": _roster_rejection_counts(roster, cfg),
+            "access_row_count": len(access_rows),
+        },
+    )
 
     raw_signals: list[C2Signal] = []
     start_ny, end_ny = _ny_time_window(cfg.signal_lookback_minutes)
     systems_by_id = {s.system_id: s for s, _ in ranked}
     scores_by_id = {s.system_id: score for s, score in ranked}
-    for system, _score in accessible_ranked:
+    
+    # Ensure we fetch open trades for EVERY system we currently hold, 
+    # even if it dropped out of the top ranked accessible list.
+    held_system_ids = {p.system_id for p in state.positions}
+    fetch_targets = list(accessible_ranked)
+    for sid in held_system_ids:
+        if sid not in {s.system_id for s, _ in accessible_ranked} and sid in accessible_ids:
+            # Re-fetch metadata if we can, otherwise use a placeholder
+            sys_obj = systems_by_id.get(sid)
+            if sys_obj:
+                fetch_targets.append((sys_obj, scores_by_id.get(sid, 0.5)))
+
+    for system, _score in fetch_targets:
         try:
+            # For the roster-diff approach, we still poll signals to catch 
+            # intraday events quickly, but requestTradesOpen is the source of truth.
             raw_signals.extend(client.retrieve_signals_all(
                 system.system_id,
                 filter_type="time_posted",
@@ -249,7 +278,27 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
         except Exception as e:
             logger.warning("Could not poll C2 signals for %s: %s", system.system_id, e)
 
-    normalized = normalize_signals(raw_signals, seen, max_age_minutes=cfg.stale_signal_minutes)
+    # Hard Roster Sync: If we hold it but the source system doesn't, we exit.
+    sync_events = apply_roster_sync_exits(state, open_trades_by_system, latest_prices, started, logger)
+    
+    # Infer BTO signals from current rosters (primary source)
+    inferred_signals = infer_signals_from_trades(
+        open_trades_by_system,
+        state,
+        max_age_minutes=cfg.stale_signal_minutes,
+        logger=logger,
+    )
+    
+    # We still use polled signals as a supplement (may catch very fresh signals 
+    # that haven't appeared in requestTradesOpen cache yet).
+    polled_signals = normalize_signals(raw_signals, seen, max_age_minutes=cfg.stale_signal_minutes)
+    
+    # Combine signals, prioritizing polled (usually have more detail) over inferred
+    combined_signals_dict: dict[str, C2Signal] = {s.signal_id: s for s in inferred_signals}
+    for s in polled_signals:
+        combined_signals_dict[s.signal_id] = s
+    normalized = sorted(combined_signals_dict.values(), key=lambda s: s.posted_time_unix, reverse=True)
+
     tickers = sorted({s.symbol for s in normalized} | {p.ticker for p in state.positions})
     latest_prices = fetch_latest_usd_prices(tickers, logger=logger)
     stop_events = apply_mechanical_exits(state, latest_prices, cfg, started)
@@ -271,7 +320,7 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
     )
     decisions = select_with_llm_or_rules(candidates, state, latest_prices, cfg, logger)
     trade_events = apply_decisions(state, decisions, candidates, latest_prices, cfg, started)
-    all_events = stop_events + trade_events
+    all_events = sync_events + stop_events + trade_events
     for sig in normalized:
         seen.add(sig.signal_id)
     _save_seen(seen_path, seen)
@@ -365,6 +414,119 @@ def _system_audit_sample(system: C2System) -> dict[str, Any]:
         "is_alive": system.is_alive,
         "raw_keys": sorted(system.raw.keys())[:40],
     }
+
+
+def apply_roster_sync_exits(
+    state: CopyPortfolioState,
+    open_trades_by_system: dict[str, list[dict[str, Any]]],
+    latest_prices: dict[str, float],
+    now: datetime,
+    logger,
+) -> list[dict[str, Any]]:
+    """Exit positions that are no longer present in the source system's roster."""
+    events: list[dict[str, Any]] = []
+    sync_count = 0
+    
+    # We only sync systems for which we successfully fetched the current roster
+    active_roster_system_ids = set(open_trades_by_system.keys())
+    
+    for pos in list(state.positions):
+        if pos.system_id not in active_roster_system_ids:
+            continue
+            
+        system_roster = open_trades_by_system[pos.system_id]
+        is_held_by_source = any(
+            str(t.get("symbol") or "").strip().upper() == pos.ticker.upper()
+            for t in system_roster
+        )
+        
+        if not is_held_by_source:
+            px = latest_prices.get(pos.ticker, pos.entry_price_usd)
+            logger.info("ROSTER SYNC: Exiting %s (no longer held by source system %s)", pos.ticker, pos.system_id)
+            events.extend(_sell_position(state, pos, float(px), "ROSTER_SYNC_EXIT", now))
+            sync_count += 1
+            
+    if sync_count > 0:
+        logger.warning("ROSTER SYNC: closed %d position(s) that were missing from source rosters", sync_count)
+    return events
+
+
+def infer_signals_from_trades(
+    open_trades_by_system: dict[str, list[dict[str, Any]]],
+    state: CopyPortfolioState,
+    *,
+    max_age_minutes: int,
+    logger,
+) -> list[C2Signal]:
+    """Synthesize BTO signals from recently opened trades in source rosters."""
+    inferred: list[C2Signal] = []
+    now = datetime.now(tz=timezone.utc)
+    
+    # Track what we already hold to avoid duplicate BUY signals
+    held_tickers_by_system = {(p.ticker.upper(), p.system_id) for p in state.positions}
+    
+    for system_id, trades in open_trades_by_system.items():
+        for t in trades:
+            symbol = str(t.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+                
+            # Skip if we already hold it from this system
+            if (symbol, system_id) in held_tickers_by_system:
+                continue
+                
+            # Filter for long stocks only
+            instrument = str(t.get("instrument") or "").lower()
+            if instrument not in {"", "stock"}:
+                continue
+            if str(t.get("long_or_short") or "").lower() != "long":
+                continue
+                
+            # Check if it was opened recently
+            opened_at_str = str(t.get("opened_when") or "")
+            opened_at: datetime | None = None
+            if opened_at_str:
+                try:
+                    # C2 usually provides "YYYY-MM-DD HH:MM:SS" in New York time
+                    # We treat it as UTC if no TZ is provided, or try to parse
+                    opened_at = datetime.fromisoformat(opened_at_str.replace(" ", "T"))
+                    if opened_at.tzinfo is None:
+                        # Assume NY time as that is C2's default, but for robustness
+                        # we compare using a generous window.
+                        opened_at = opened_at.replace(tzinfo=ZoneInfo("America/New_York"))
+                except Exception:
+                    logger.warning("Could not parse opened_when for trade %s: %s", t.get("trade_id"), opened_at_str)
+            
+            if opened_at is None:
+                continue
+                
+            # Normalize to UTC for reliable age comparison
+            opened_at_utc = opened_at.astimezone(timezone.utc)
+            age_seconds = (now - opened_at_utc).total_seconds()
+            if age_seconds > max_age_minutes * 60:
+                continue
+                
+            # Synthesize a C2Signal
+            inferred.append(C2Signal(
+                system_id=system_id,
+                signal_id=f"inferred_{t.get('trade_id')}_{int(opened_at_utc.timestamp())}",
+                symbol=symbol,
+                action="BTO",
+                quantity=float(t.get("quantity") or 0.0),
+                status="filled",
+                instrument=instrument,
+                posted_time=opened_at_utc.isoformat(),
+                posted_time_unix=int(opened_at_utc.timestamp()),
+                traded_time_unix=int(opened_at_utc.timestamp()),
+                is_market_order=True,
+                is_limit_order=False,
+                is_stop_order=False,
+                raw=dict(t),
+            ))
+            
+    if inferred:
+        logger.info("ROSTER SYNC: Inferred %d BTO signal(s) from current rosters", len(inferred))
+    return inferred
 
 
 def normalize_signals(raw_signals: list[C2Signal], seen: set[str], *, max_age_minutes: int) -> list[C2Signal]:
@@ -897,6 +1059,53 @@ def render_reports(
         access_summary=access_summary,
     )
     (reports_dir / "collective2_copy_email.html").write_text(html, encoding="utf-8")
+
+
+def _write_public_roster_report(
+    reports_dir: Path,
+    *,
+    started: datetime,
+    access_summary: dict[str, Any],
+    ranked_payload: list[dict[str, Any]],
+    audit: dict[str, Any],
+) -> None:
+    lines = [
+        "COLLECTIVE2 PUBLIC ROSTER RESEARCH",
+        f"Run UTC: {started.isoformat()}",
+        f"Roster count: {access_summary.get('roster_count')}",
+        f"Eligible count: {access_summary.get('eligible_count')}",
+        f"Accessible count: {access_summary.get('accessible_count')}",
+        f"Accessible ranked count: {access_summary.get('accessible_ranked_count')}",
+        f"Access row count: {audit.get('access_row_count')}",
+        "",
+        "REJECTION COUNTS",
+    ]
+    for key, value in sorted((audit.get("roster_rejection_counts") or {}).items()):
+        lines.append(f"- {key}: {value}")
+    lines.extend(["", "TOP RANKED PUBLIC SYSTEMS"])
+    if ranked_payload:
+        for row in ranked_payload[:50]:
+            lines.append(
+                f"- {row.get('system_name')} ({row.get('system_id')}) "
+                f"score={float(row.get('score') or 0.0):.3f} "
+                f"stocks={row.get('minimum_portfolio_size_required')} "
+                f"trial={row.get('free_trial_days')} fee=${float(row.get('monthly_fee') or 0.0):.2f} "
+                f"accessible={row.get('accessible')}"
+            )
+    else:
+        lines.append("- No eligible systems found.")
+    text = "\n".join(lines) + "\n"
+    (reports_dir / "collective2_public_roster_report.txt").write_text(text, encoding="utf-8")
+    (reports_dir / "collective2_public_roster_report.html").write_text(
+        "<html><body><pre>" + _html_escape(text) + "</pre></body></html>",
+        encoding="utf-8",
+    )
+    write_json(reports_dir / "collective2_public_roster_report.json", {
+        "run_utc": started.isoformat(),
+        "access_summary": access_summary,
+        "audit": audit,
+        "ranked_systems": ranked_payload,
+    })
 
 
 def _candidate_report(candidate: SignalCandidate) -> dict[str, Any]:

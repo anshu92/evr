@@ -164,6 +164,47 @@ def test_collective2_access_audit_includes_diagnostics(tmp_path, monkeypatch):
     assert audit["accessible_count"] == 1
     assert audit["roster_rejection_counts"]["eligible"] == 1
     assert audit["roster_sample"][0]["raw_keys"]
+    assert (tmp_path / "reports" / "collective2_public_roster_report.txt").exists()
+    assert (tmp_path / "reports" / "collective2_public_roster_report.html").exists()
+    assert (tmp_path / "reports" / "collective2_public_roster_report.json").exists()
+
+
+def test_public_roster_report_writes_when_no_accessible_systems(tmp_path, monkeypatch):
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_system_roster(self, *, filter_value):
+            return [parse_system({"systemid": "s1", "systemName": "System One", "creatorScreenName": "owner"})]
+
+        def list_all_systems(self):
+            return []
+
+        def get_system_details(self, system_id):
+            return {}
+
+        def retrieve_signals_all(self, *args, **kwargs):
+            return []
+
+        def retrieve_signals_working(self, *args, **kwargs):
+            return []
+
+        def request_trades(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(c2p, "Collective2Client", FakeClient)
+    monkeypatch.setattr(c2p, "fetch_latest_usd_prices", lambda tickers, logger=None: {})
+    cfg = c2p.Collective2CopyConfig(
+        api_key="dummy",
+        state_path=str(tmp_path / "collective2_usd_portfolio_state.json"),
+        cache_dir=str(tmp_path / "cache"),
+        reports_dir=str(tmp_path / "reports"),
+    )
+    c2p.run_collective2_copy(cfg, logger=_Logger())
+    text = (tmp_path / "reports" / "collective2_public_roster_report.txt").read_text(encoding="utf-8")
+    assert "COLLECTIVE2 PUBLIC ROSTER RESEARCH" in text
+    assert "Eligible count: 1" in text
+    assert "Accessible count: 0" in text
 
 
 def test_normalize_signals_drops_seen_stale_and_unsupported():

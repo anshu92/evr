@@ -100,6 +100,9 @@ jobs:
             reports/collective2_copy_report.txt
             reports/collective2_copy_email.html
             reports/collective2_should_email.txt
+            reports/collective2_public_roster_report.txt
+            reports/collective2_public_roster_report.html
+            reports/collective2_public_roster_report.json
             reports/collective2_copy_trades.json
             reports/collective2_copy_portfolio.json
             cache/collective2_access_audit.json
