@@ -9,6 +9,11 @@ This repository currently uses six GitHub Actions workflows:
 - `prune-actions-caches.yml`: weekly cache GC for run-unique daily data keys
 - `verify-daily-session-coverage.yml`: weekday self-check for missed daily session windows
 
+Proposed next workflow:
+
+- `copy-trade-signals.yml`: real-time opt-in provider/signal materialization, with public disclosures only as lagged fallback research. Research and implementation design: `docs/COPY_TRADE_WORKFLOW_RESEARCH.md`
+- `collective2-copy-trades.yml`: enabled USD paper portfolio workflow for Collective2 real-time signal access audit, LLM filtering, and $4,000 model portfolio simulation.
+
 Detailed pipeline audit: `docs/PORTFOLIO_PIPELINE_AUDIT.md`
 Complete daily flow chart: `docs/DAILY_RUN_FLOW_CHART.md`
 
@@ -166,6 +171,69 @@ File: `.github/workflows/intraday-stock-screener.yml`
 Schedule:
 
 - Weekdays at `19:00 UTC` only (single intraday risk monitor run)
+
+## Proposed Copy-Trade Signal Workflow
+
+File: `.github/workflows/copy-trade-signals.yml` (not yet implemented)
+
+Purpose:
+
+- Discover real-time or near-real-time opt-in portfolio trades from copy-trading platforms, signal marketplaces, or internal creator portfolios.
+- Normalize provider events into freshness-aware signals.
+- Export `copy_trade_score` data for the daily screener.
+
+Recommended v1 sources:
+
+- API-accessible signal marketplaces, such as Collective2, when terms and account permissions allow.
+- Internal opt-in creator/model portfolio JSON feed.
+- Licensed market-flow feeds as a separate `flow_score`, not as identified portfolio copying.
+- SEC 13F/13D/Form 4 only as lagged fallback/research inputs.
+
+Guardrails:
+
+- Default to report-only/dry-run mode.
+- Do not bypass existing liquidity, volatility, position-size, sector, exposure, or rebalance controls.
+- Keep copy-trade contribution capped as an overlay, not a replacement for model scoring.
+- Do not scrape logged-in copy-trading apps or redistribute trades unless the provider terms explicitly allow it.
+
+## Collective2 Copy-Trade Workflow
+
+File: `.github/workflows/collective2-copy-trades.yml`
+
+Status:
+
+- Enabled. Runs as a paper-only workflow; review artifacts before using output for live decisions.
+- Paper-only; it does not call Collective2 order-submission or broker-execution APIs.
+- Scheduled every 90 minutes across broad U.S. market-hour UTC coverage; email is gated to regular New York market hours or manual dispatch.
+
+Purpose:
+
+- Discover active Collective2 long stock/ETF systems.
+- Audit which systems `COLLECTIVE2_API_KEY` can access in real time.
+- Pull recent accessible `BTO`/`STC` stock signals.
+- Use deterministic filters and the existing LLM provider chain to select paper trades.
+- Email portfolio state, new trades, source C2 portfolio, source historical performance, same-ticker consensus, and LLM explanations.
+- Maintain an isolated USD model portfolio starting at `$4,000`.
+
+Core flow:
+
+1. Checkout + Python setup + dependency install.
+2. Restore `cache/collective2_*` and `collective2_usd_portfolio_state.json`.
+3. Run `python -m stock_screener.cli collective2-copy --log-level INFO`.
+4. Save state/cache and upload reports/artifacts.
+5. Send email when existing email secrets are configured.
+6. Open an issue if the workflow fails.
+
+Required secret:
+
+- `COLLECTIVE2_API_KEY`
+
+Optional LLM secrets:
+
+- `GROQ_API_KEY`
+- `OPENROUTER_API_KEY`
+- `GEMINI_API_KEY`
+- `OPENAI_API_KEY`
 
 ## Required Secrets
 

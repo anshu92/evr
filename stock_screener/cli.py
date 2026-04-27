@@ -24,6 +24,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     macro = sub.add_parser("macro-insights", help="Macro news + standalone macro portfolio + reports")
     macro.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    c2 = sub.add_parser("collective2-copy", help="Run Collective2 USD paper copy-trade workflow")
+    c2.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
 
@@ -100,9 +102,22 @@ def main() -> int:
         logger.info("Finished macro insights pipeline at %s", finished.isoformat())
         return 0
 
+    if args.cmd == "collective2-copy":
+        from stock_screener.pipeline.collective2_copy import (
+            Collective2CopyConfig,
+            run_collective2_copy,
+        )
+
+        ccfg = Collective2CopyConfig.from_env()
+        started = datetime.now(tz=timezone.utc)
+        logger.info("Starting Collective2 copy-trade paper pipeline at %s", started.isoformat())
+        run_collective2_copy(cfg=ccfg, logger=logger)
+        finished = datetime.now(tz=timezone.utc)
+        logger.info("Finished Collective2 copy-trade paper pipeline at %s", finished.isoformat())
+        return 0
+
     raise RuntimeError(f"Unknown cmd: {args.cmd}")
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

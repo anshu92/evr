@@ -1,0 +1,151 @@
+name: Collective2 Copy Trades (USD Paper)
+
+on:
+  schedule:
+    # Every 90 minutes across broad U.S. market-hour UTC coverage.
+    - cron: '30 13,16,19 * * 1-5'
+    - cron: '0 15,18,21 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: collective2-copy-trades
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  collective2_copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-actions.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Restore Collective2 paper state
+        id: cache_c2_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            cache/collective2_access_audit.json
+            cache/collective2_system_rankings.json
+            cache/collective2_seen_signals.json
+            collective2_usd_portfolio_state.json
+            collective2_usd_portfolio_state.json.events.jsonl
+          key: ${{ runner.os }}-collective2-copy-${{ hashFiles('requirements-actions.txt', '.github/workflows/collective2-copy-trades.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-collective2-copy-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-actions.txt
+
+      - name: Run Collective2 copy-trade paper pipeline
+        env:
+          COLLECTIVE2_API_KEY: ${{ secrets.COLLECTIVE2_API_KEY }}
+          COLLECTIVE2_INITIAL_CASH_USD: "4000"
+          COLLECTIVE2_PORTFOLIO_STATE_PATH: "collective2_usd_portfolio_state.json"
+          COLLECTIVE2_MAX_ROSTER_SYSTEMS: ${{ vars.COLLECTIVE2_MAX_ROSTER_SYSTEMS || '200' }}
+          COLLECTIVE2_MAX_RANKED_SYSTEMS: ${{ vars.COLLECTIVE2_MAX_RANKED_SYSTEMS || '25' }}
+          COLLECTIVE2_MAX_ACCESSIBLE_SYSTEMS: ${{ vars.COLLECTIVE2_MAX_ACCESSIBLE_SYSTEMS || '15' }}
+          COLLECTIVE2_SIGNAL_LOOKBACK_MINUTES: ${{ vars.COLLECTIVE2_SIGNAL_LOOKBACK_MINUTES || '45' }}
+          COLLECTIVE2_STALE_SIGNAL_MINUTES: ${{ vars.COLLECTIVE2_STALE_SIGNAL_MINUTES || '90' }}
+          COLLECTIVE2_THROTTLE_SECONDS: ${{ vars.COLLECTIVE2_THROTTLE_SECONDS || '1.0' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AGENT_MAX_LLM_TICKERS: "5"
+          AGENT_THROTTLE_SLEEP: ${{ vars.AGENT_THROTTLE_SLEEP || '2' }}
+        run: |
+          mkdir -p cache reports
+          python -m stock_screener.cli collective2-copy --log-level INFO
+
+      - name: Save Collective2 paper state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            cache/collective2_access_audit.json
+            cache/collective2_system_rankings.json
+            cache/collective2_seen_signals.json
+            collective2_usd_portfolio_state.json
+            collective2_usd_portfolio_state.json.events.jsonl
+          key: ${{ runner.os }}-collective2-copy-${{ hashFiles('requirements-actions.txt', '.github/workflows/collective2-copy-trades.yml') }}-${{ github.run_id }}
+
+      - name: Upload Collective2 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collective2-copy-${{ github.run_number }}
+          path: |
+            reports/collective2_copy_report.txt
+            reports/collective2_copy_email.html
+            reports/collective2_should_email.txt
+            reports/collective2_copy_trades.json
+            reports/collective2_copy_portfolio.json
+            cache/collective2_access_audit.json
+            cache/collective2_system_rankings.json
+            cache/collective2_seen_signals.json
+            collective2_usd_portfolio_state.json
+            collective2_usd_portfolio_state.json.events.jsonl
+          retention-days: 14
+
+      - name: Check Collective2 email gate
+        if: always()
+        id: c2_email_gate
+        shell: bash
+        env:
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: |
+          if [ -n "$EMAIL_USERNAME" ] && [ -n "$EMAIL_PASSWORD" ] && [ -f reports/collective2_should_email.txt ] && [ "$(tr -d '[:space:]' < reports/collective2_should_email.txt)" = "true" ]; then
+            echo "should_email=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_email=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Collective2 email
+        if: always() && steps.c2_email_gate.outputs.should_email == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "[Collective2] Copy Trades USD Paper"
+          to: ${{ secrets.EMAIL_TO || secrets.EMAIL_USERNAME }}
+          from: Stock Screener Bot <${{ secrets.EMAIL_USERNAME }}>
+          html_body: file://reports/collective2_copy_email.html
+          attachments: reports/collective2_copy_report.txt,reports/collective2_copy_trades.json,reports/collective2_copy_portfolio.json
+
+      - name: Create GitHub Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Collective2 copy-trade workflow failed: ${context.runId}`,
+              body: `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            })

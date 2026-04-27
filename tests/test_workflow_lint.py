@@ -106,3 +106,27 @@ def test_actions_minutes_estimate_within_private_free_tier():
 
     total_estimated = monthly_daily_minutes + monthly_train_minutes
     assert total_estimated <= 2000
+
+
+def test_collective2_copy_workflow_is_paper_only_and_secret_scoped():
+    workflow_path = Path(".github/workflows/collective2-copy-trades.yml")
+    assert workflow_path.exists()
+    text = workflow_path.read_text(encoding="utf-8")
+    assert "collective2-copy" in text
+    assert "COLLECTIVE2_API_KEY: ${{ secrets.COLLECTIVE2_API_KEY }}" in text
+    assert "submitSignal" not in text
+    assert "setDesiredPositions" not in text
+    assert "collective2_usd_portfolio_state.json" in text
+    assert "collective2_copy_trades.json" in text
+    assert "actions/cache/restore@v4" in text
+    assert "actions/cache/save@v4" in text
+    assert "concurrency:" in text
+    assert "github-script@v7" in text
+    assert "cron: '*/15 13-21 * * 1-5'" not in text
+    assert "cron: '30 13,16,19 * * 1-5'" in text
+    assert "cron: '0 15,18,21 * * 1-5'" in text
+    assert "id: c2_email_gate" in text
+    assert "reports/collective2_should_email.txt" in text
+    assert "EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}" in text
+    assert "EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}" in text
+    assert "steps.c2_email_gate.outputs.should_email == 'true'" in text
