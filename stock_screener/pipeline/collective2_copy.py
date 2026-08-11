@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,7 @@ from stock_screener.agents.trading_agent import _call_llm
 from stock_screener.data.collective2 import (
     C2Signal,
     C2System,
+    C2Trade,
     Collective2Client,
     is_long_stock_system,
     is_supported_long_stock_signal,
@@ -48,6 +50,7 @@ class Collective2CopyConfig:
     take_profit_pct: float = 0.12
     deterministic_accept_threshold: float = 0.58
     max_minimum_portfolio_usd: float = 100000.0
+    mock_mode: bool = False
 
     @staticmethod
     def from_env() -> "Collective2CopyConfig":
@@ -62,6 +65,12 @@ class Collective2CopyConfig:
         def _f(name: str, default: float) -> float:
             raw = os.getenv(name)
             return float(raw) if raw not in {None, ""} else default
+
+        def _b(name: str, default: bool) -> bool:
+            raw = os.getenv(name).strip().lower() if os.getenv(name) else None
+            if raw in ("1", "true", "yes"): return True
+            if raw in ("0", "false", "no"): return False
+            return default
 
         return Collective2CopyConfig(
             api_key=_s("COLLECTIVE2_API_KEY", ""),
@@ -85,6 +94,7 @@ class Collective2CopyConfig:
             take_profit_pct=_f("COLLECTIVE2_TAKE_PROFIT_PCT", 0.12),
             deterministic_accept_threshold=_f("COLLECTIVE2_ACCEPT_THRESHOLD", 0.58),
             max_minimum_portfolio_usd=_f("COLLECTIVE2_MAX_MINIMUM_PORTFOLIO_USD", 100000.0),
+            mock_mode=_b("COLLECTIVE2_MOCK_MODE", False),
         )
 
 
@@ -186,6 +196,11 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
     access_rows = client.list_all_systems()
     accessible_ids = {_system_id_from_row(x) for x in access_rows}
     accessible_ids.discard("")
+    
+    if cfg.mock_mode and not accessible_ids:
+        logger.warning("MOCK_MODE: listAllSystems is empty; simulating access to top-ranked systems")
+        # Treat top 5 eligible systems as accessible for testing
+        accessible_ids = {s.system_id for s in eligible[:5]}
 
     ranked = rank_systems(eligible)
     write_json(cache_dir / "collective2_access_audit.json", {
@@ -276,7 +291,13 @@ def run_collective2_copy(cfg: Collective2CopyConfig, logger) -> None:
             trades_by_system[system.system_id] = [asdict(t) for t in trades]
             open_trades_by_system[system.system_id] = [asdict(t) for t in open_trades]
         except Exception as e:
-            logger.warning("Could not poll C2 signals for %s: %s", system.system_id, e)
+            if cfg.mock_mode:
+                logger.info("MOCK_MODE: Injecting fake trades/signals for system %s", system.system_id)
+                fake_trades = _generate_mock_trades(system.system_id)
+                open_trades_by_system[system.system_id] = [asdict(t) for t in fake_trades if t.open_or_closed == "open"]
+                trades_by_system[system.system_id] = [asdict(t) for t in fake_trades]
+            else:
+                logger.warning("Could not poll C2 signals for %s: %s", system.system_id, e)
 
     # Infer BTO signals from current rosters (primary source)
     inferred_signals = infer_signals_from_trades(
@@ -1370,6 +1391,36 @@ def _parse_llm_decisions(raw: str) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         data = data.get("decisions", [])
     return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+
+
+def _generate_mock_trades(system_id: str) -> list[C2Trade]:
+    """Generate fake trades for a system for testing when access is denied."""
+    tz = ZoneInfo("America/New_York")
+    now_ny = datetime.now(tz=tz)
+    # Use some blue-chip tickers for mock trades
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+    idx = int(hashlib.md5(system_id.encode()).hexdigest(), 16) % len(tickers)
+    
+    trades = []
+    for i in range(3):
+        ticker = tickers[(idx + i) % len(tickers)]
+        opened_at = now_ny - timedelta(minutes=10 * (i + 1))
+        trades.append(C2Trade(
+            system_id=system_id,
+            trade_id=f"mock_{system_id}_{ticker}_{i}",
+            symbol=ticker,
+            instrument="stock",
+            quantity=100.0,
+            long_or_short="long",
+            open_or_closed="open",
+            opened_when=opened_at.strftime("%Y-%m-%d %H:%M:%S"),
+            closed_when="",
+            opening_price=150.0 + i,
+            closing_price=0.0,
+            pl=0.0,
+            raw={},
+        ))
+    return trades
 
 
 def _float(value: Any, default: float) -> float:

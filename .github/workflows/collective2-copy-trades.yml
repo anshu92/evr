@@ -91,25 +91,76 @@ jobs:
             collective2_usd_portfolio_state.json.events.jsonl
           key: ${{ runner.os }}-collective2-copy-${{ hashFiles('requirements-actions.txt', '.github/workflows/collective2-copy-trades.yml') }}-${{ github.run_id }}
 
-      - name: Upload Collective2 artifacts
+      - name: Stage Collective2 artifacts within size limit
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: collective2-copy-${{ github.run_number }}
-          path: |
+        id: c2_artifact_size
+        shell: bash
+        env:
+          # Leave 12 MiB of headroom for archive metadata and compression overhead.
+          MAX_ARTIFACT_SOURCE_BYTES: "524288000"
+          ARTIFACT_STAGING_DIR: "_collective2_artifact"
+        run: |
+          # Ordered from highest to lowest diagnostic value. Files that would
+          # exceed the budget are omitted without altering the originals.
+          artifact_paths=(
             reports/collective2_copy_report.txt
             reports/collective2_copy_email.html
             reports/collective2_should_email.txt
+            reports/collective2_copy_trades.json
+            reports/collective2_copy_portfolio.json
+            collective2_usd_portfolio_state.json
             reports/collective2_public_roster_report.txt
             reports/collective2_public_roster_report.html
             reports/collective2_public_roster_report.json
-            reports/collective2_copy_trades.json
-            reports/collective2_copy_portfolio.json
             cache/collective2_access_audit.json
             cache/collective2_system_rankings.json
             cache/collective2_seen_signals.json
-            collective2_usd_portfolio_state.json
             collective2_usd_portfolio_state.json.events.jsonl
+          )
+
+          mkdir -p "$ARTIFACT_STAGING_DIR"
+          total_bytes=0
+          included_count=0
+          dropped_count=0
+          dropped_paths=()
+          for artifact_path in "${artifact_paths[@]}"; do
+            if [ -f "$artifact_path" ]; then
+              file_bytes=$(stat --format='%s' "$artifact_path")
+              if [ $((total_bytes + file_bytes)) -lt "$MAX_ARTIFACT_SOURCE_BYTES" ]; then
+                cp --parents "$artifact_path" "$ARTIFACT_STAGING_DIR"
+                total_bytes=$((total_bytes + file_bytes))
+                included_count=$((included_count + 1))
+              else
+                dropped_paths+=("$artifact_path ($file_bytes bytes)")
+                dropped_count=$((dropped_count + 1))
+              fi
+            fi
+          done
+
+          {
+            echo "Collective2 artifact staging manifest"
+            echo "Included files: $included_count"
+            echo "Included source bytes: $total_bytes"
+            echo "Source-byte budget: $MAX_ARTIFACT_SOURCE_BYTES"
+            echo "Dropped files: $dropped_count"
+            for dropped_path in "${dropped_paths[@]}"; do
+              echo "- $dropped_path"
+            done
+          } > "$ARTIFACT_STAGING_DIR/artifact_manifest.txt"
+
+          echo "source_bytes=$total_bytes" >> "$GITHUB_OUTPUT"
+          echo "dropped_count=$dropped_count" >> "$GITHUB_OUTPUT"
+          if [ "$dropped_count" -gt 0 ]; then
+            echo "::warning::Dropped $dropped_count lower-priority Collective2 artifact file(s) to stay below 512 MiB."
+          fi
+
+      - name: Upload Collective2 artifacts
+        if: always() && steps.c2_artifact_size.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: collective2-copy-${{ github.run_number }}
+          path: _collective2_artifact/
+          compression-level: 9
           retention-days: 14
 
       - name: Check Collective2 email gate

@@ -134,3 +134,10 @@ def test_collective2_copy_workflow_is_paper_only_and_secret_scoped():
     assert "EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}" in text
     assert "EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}" in text
     assert "steps.c2_email_gate.outputs.should_email == 'true'" in text
+    assert 'MAX_ARTIFACT_SOURCE_BYTES: "524288000"' in text
+    assert "id: c2_artifact_size" in text
+    assert "dropped_paths" in text
+    assert "artifact_manifest.txt" in text
+    assert "steps.c2_artifact_size.outcome == 'success'" in text
+    assert "path: _collective2_artifact/" in text
+    assert "compression-level: 9" in text
